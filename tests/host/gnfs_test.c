@@ -631,9 +631,9 @@ static void test_object_layer_end_to_end(void) {
     check(root_node.size == GNFS_BLOCK_SIZE,
          "a freshly formatted root's directory data is exactly one block");
 
-    rc = v->ops->create(v, "/hello.txt");
+    rc = v->ops->create(v, "/hello.txt", NULL);
     check(rc == 0, "creating a file must succeed");
-    rc = v->ops->create(v, "/hello.txt");
+    rc = v->ops->create(v, "/hello.txt", NULL);
     check(rc == -17, "creating the same name twice must be -EEXIST");
 
     rc = v->ops->lookup(v, "/hello.txt", &file_node);
@@ -684,13 +684,13 @@ static void test_object_layer_end_to_end(void) {
         }
     }
 
-    rc = v->ops->mkdir(v, "/sub");
+    rc = v->ops->mkdir(v, "/sub", NULL);
     check(rc == 0, "creating a directory must succeed");
     rc = v->ops->lookup(v, "/sub", &dir_node);
     check(rc == 0 && dir_node.is_dir,
          "the new directory must resolve as a directory");
 
-    rc = v->ops->create(v, "/sub/inner.txt");
+    rc = v->ops->create(v, "/sub/inner.txt", NULL);
     check(rc == 0, "creating a file inside the new directory must succeed");
     {
         fs_node_t inner;
@@ -770,7 +770,7 @@ static void test_acl_end_to_end(void) {
         return;
     }
 
-    rc = v->ops->create(v, "/plain.txt");
+    rc = v->ops->create(v, "/plain.txt", NULL);
     check(rc == 0, "creating a plain file must succeed");
     rc = v->ops->lookup(v, "/plain.txt", &plain_node);
     check(rc == 0, "the plain file must resolve");
@@ -781,7 +781,7 @@ static void test_acl_end_to_end(void) {
          "follows; fs_getacl one layer up is what actually projects the "
          "mode for a caller, not tested again here");
 
-    rc = v->ops->mkdir(v, "/secure");
+    rc = v->ops->mkdir(v, "/secure", NULL);
     check(rc == 0, "creating the directory to hold an inheritable ACL must "
          "succeed");
     rc = v->ops->lookup(v, "/secure", &secure_node);
@@ -817,7 +817,7 @@ static void test_acl_end_to_end(void) {
     check(acl_out.ace[3].who == 1001, "including the inheritable entry "
          "itself");
 
-    rc = v->ops->create(v, "/secure/child.txt");
+    rc = v->ops->create(v, "/secure/child.txt", NULL);
     check(rc == 0, "creating a file inside the secured directory must "
          "succeed");
     rc = v->ops->lookup(v, "/secure/child.txt", &child_node);
@@ -835,7 +835,7 @@ static void test_acl_end_to_end(void) {
           (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) == 0,
          "and, being a FILE, does not itself propagate any further");
 
-    rc = v->ops->mkdir(v, "/secure/subdir");
+    rc = v->ops->mkdir(v, "/secure/subdir", NULL);
     check(rc == 0, "creating a directory inside the secured directory must "
          "succeed");
     rc = v->ops->lookup(v, "/secure/subdir", &grandchild_node);
@@ -907,7 +907,7 @@ static void test_chown_end_to_end(void) {
     owner.ngroups = 1;
 
     /* A file with no stored ACL: only the onode's copy exists. */
-    check(v->ops->create(v, "/plain.txt") == 0, "create /plain.txt");
+    check(v->ops->create(v, "/plain.txt", NULL) == 0, "create /plain.txt");
     check(v->ops->lookup(v, "/plain.txt", &plain) == 0, "and resolve it");
     plain.vol = v;               /* fs_lookup_on would stamp this */
 
@@ -929,7 +929,7 @@ static void test_chown_end_to_end(void) {
     check(rc == -1, "and not into a group it is not in");
 
     /* A file WITH a stored ACL: both copies must move. */
-    check(v->ops->create(v, "/secured.txt") == 0, "create /secured.txt");
+    check(v->ops->create(v, "/secured.txt", NULL) == 0, "create /secured.txt");
     check(v->ops->lookup(v, "/secured.txt", &secured) == 0, "resolve it");
     secured.vol = v;
     acl_from_mode(0100600u, 0, 0, &a);
@@ -978,6 +978,101 @@ static void test_chown_end_to_end(void) {
     free(image);
 }
 
+/* The creator owns what it creates. Before fs_ops_t::create/mkdir took a
+ * credential, every gnfs object belonged to uid 0, so an ordinary user
+ * could not even chmod a file it had just made. That last thing is the
+ * real check here, through the real gate (fs_setacl), and the stranger
+ * refusals are its controls. */
+static void test_creator_owns(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t file, dir, kfile;
+    cred_t user, stranger;
+    acl_t old_acl, new_acl;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the creator test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+
+    cred_init_nobody(&user);
+    user.euid = 1000;
+    user.egid = 100;
+    cred_init_nobody(&stranger);
+    stranger.euid = 2000;
+    stranger.egid = 200;
+
+    check(v->ops->create(v, "/mine.txt", (const struct cred *)&user) == 0,
+         "uid 1000 creates /mine.txt");
+    check(v->ops->lookup(v, "/mine.txt", &file) == 0 &&
+         file.uid == 1000 && file.gid == 100,
+         "and it is owned by uid 1000, group 100 - the creator's euid and "
+         "egid, not root's");
+    file.vol = v;
+
+    check(v->ops->mkdir(v, "/mydir", (const struct cred *)&user) == 0,
+         "uid 1000 makes /mydir");
+    check(v->ops->lookup(v, "/mydir", &dir) == 0 &&
+         dir.uid == 1000 && dir.gid == 100,
+         "and owns that too");
+
+    check(v->ops->create(v, "/kernel.txt", NULL) == 0 &&
+         v->ops->lookup(v, "/kernel.txt", &kfile) == 0 &&
+         kfile.uid == 0 && kfile.gid == 0,
+         "a NULL creator is the kernel, which is root");
+
+    check(fs_access(&file, (const struct cred *)&user, ACE_WRITE_DATA) == 0,
+         "the owner can write its new 0644 file");
+    check(fs_access(&file, (const struct cred *)&stranger,
+                    ACE_WRITE_DATA) == -13,
+         "a stranger cannot - the control");
+
+    /* chmod, exactly as sys_chmod_node does it. */
+    check(fs_getacl(&file, (struct acl *)&old_acl) == 0,
+         "read the new file's ACL");
+    acl_apply_chmod(&old_acl, 0100600u, &new_acl);
+    check(fs_setacl(&file, (const struct cred *)&stranger,
+                    (const struct acl *)&new_acl) == -13,
+         "a stranger may not chmod it");
+    check(fs_setacl(&file, (const struct cred *)&user,
+                    (const struct acl *)&new_acl) == 0,
+         "but its non-root creator can - impossible before, when gnfs made "
+         "every file root's");
+    check((file.mode & 0777) == 0600u, "and the mode really changed");
+
+    /* On the medium, not just in memory. */
+    {
+        device_t dev2;
+        dev_stub_t stub2;
+        fs_volume_t *v2;
+        fs_node_t n2;
+
+        v->ops->unmount(v);
+        dev_stub_attach(&dev2, &stub2, image, image_bytes);
+        v2 = gnfs_probe(&dev2);
+        check(v2 != NULL, "the volume remounts");
+        if (v2 != NULL) {
+            check(v2->ops->lookup(v2, "/mine.txt", &n2) == 0 &&
+                 n2.uid == 1000 && n2.gid == 100,
+                 "the creator's ownership survived a remount");
+            v2->ops->unmount(v2);
+        }
+    }
+
+    free(image);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -997,6 +1092,7 @@ int gnfs_run_tests(void) {
     test_object_layer_end_to_end();
     test_acl_end_to_end();
     test_chown_end_to_end();
+    test_creator_owns();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

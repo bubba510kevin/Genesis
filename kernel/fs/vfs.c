@@ -418,7 +418,7 @@ static int fs_is_mount_point(const char *abs_path) {
  * a filesystem sees mkdir("/x") whether it is mounted at / or at /mnt/usb.
  */
 
-int fs_mkdir(const char *abs_path) {
+int fs_mkdir(const char *abs_path, const struct cred *c) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -433,7 +433,7 @@ int fs_mkdir(const char *abs_path) {
     if (v->ops->mkdir == NULL) {
         return -30;                     /* -EROFS */
     }
-    return v->ops->mkdir(v, rel);
+    return v->ops->mkdir(v, rel, c);
 }
 
 int fs_statfs(const char *abs_path, fs_statfs_t *out) {
@@ -473,7 +473,7 @@ int fs_statfs(const char *abs_path, fs_statfs_t *out) {
     return v->ops->statfs(v, out);
 }
 
-int fs_create(const char *abs_path) {
+int fs_create(const char *abs_path, const struct cred *c) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -488,7 +488,7 @@ int fs_create(const char *abs_path) {
     if (v->ops->create == NULL) {
         return -30;                     /* -EROFS */
     }
-    return v->ops->create(v, rel);
+    return v->ops->create(v, rel, c);
 }
 
 int fs_truncate(fs_node_t *n, uint64 size) {

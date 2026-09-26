@@ -809,11 +809,29 @@ static int gnfs_op_setowner(fs_volume_t *v, fs_node_t *n, uint32 uid,
     return 0;
 }
 
-static int gnfs_op_create(fs_volume_t *v, const char *abs_path) {
+/* Who owns a new object: whoever created it - the creator's euid and egid.
+ * NULL `c` is the kernel creating something for itself, which is root's.
+ *
+ * The System V setgid-directory rule (a new object takes a setgid parent's
+ * group) is deliberately absent, not forgotten: nothing on gnfs can SET a
+ * directory's setgid bit yet - chmod rewrites only rwx through
+ * acl_apply_chmod, and gnfs_store_acl carries the special bits over from
+ * the old mode - so the rule would be code no caller could reach. It lands
+ * with chmod learning the special bits. */
+static void gnfs_creator_ids(const struct cred *c, uint32 *uid, uint32 *gid) {
+    const cred_t *cr = (const cred_t *)c;
+
+    *uid = (cr != NULL) ? cr->euid : 0;
+    *gid = (cr != NULL) ? cr->egid : 0;
+}
+
+static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
+                          const struct cred *c) {
     gnfs_mount_t *m = (gnfs_mount_t *)v->body;
     uint64 parent_objnum, leaf_len, new_objnum;
     const char *leaf;
     gnfs_onode_t *new_onode;
+    uint32 uid, gid;
     int rc;
 
     rc = gnfs_resolve_parent(m, abs_path, &parent_objnum, &leaf, &leaf_len);
@@ -825,7 +843,8 @@ static int gnfs_op_create(fs_volume_t *v, const char *abs_path) {
         return rc;
     }
     new_onode = gnfs_onode_at(m->obj_table, new_objnum);
-    gnfs_onode_init(new_onode, 0100644u /* S_IFREG | rw-r--r-- */, 0, 0);
+    gnfs_creator_ids(c, &uid, &gid);
+    gnfs_onode_init(new_onode, 0100644u /* S_IFREG | rw-r--r-- */, uid, gid);
     gnfs_apply_inheritance(m, parent_objnum, new_onode, 0);
 
     rc = gnfs_dir_mutate(m, parent_objnum, leaf, leaf_len, 1, new_objnum, 0);
@@ -839,12 +858,14 @@ static int gnfs_op_create(fs_volume_t *v, const char *abs_path) {
     return gnfs_commit(m);
 }
 
-static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path) {
+static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path,
+                         const struct cred *c) {
     gnfs_mount_t *m = (gnfs_mount_t *)v->body;
     uint64 parent_objnum, leaf_len, new_objnum, new_block;
     const char *leaf;
     uint8 block[GNFS_BLOCK_SIZE];
     gnfs_onode_t *new_onode;
+    uint32 uid, gid;
     int rc;
 
     rc = gnfs_resolve_parent(m, abs_path, &parent_objnum, &leaf, &leaf_len);
@@ -861,7 +882,8 @@ static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path) {
         return rc;
     }
     new_onode = gnfs_onode_at(m->obj_table, new_objnum);
-    gnfs_onode_init(new_onode, 0040755u /* S_IFDIR | rwxr-xr-x */, 0, 0);
+    gnfs_creator_ids(c, &uid, &gid);
+    gnfs_onode_init(new_onode, 0040755u /* S_IFDIR | rwxr-xr-x */, uid, gid);
     new_onode->direct[0] = new_block;
     new_onode->nblocks   = 1;
     new_onode->size      = GNFS_BLOCK_SIZE;

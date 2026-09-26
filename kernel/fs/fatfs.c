@@ -241,9 +241,11 @@ static int fatfs_statfs(fs_volume_t *v, fs_statfs_t *out) {
     return 0;
 }
 
-static int fatfs_create(fs_volume_t *v, const char *abs_path) {
+static int fatfs_create(fs_volume_t *v, const char *abs_path,
+                        const struct cred *c) {
     fat_volume_t *vol = (fat_volume_t *)v->body;
 
+    (void)c;                             /* FAT records no owner */
     return fat_to_errno(fat_create(vol, abs_path));
 }
 
@@ -270,7 +272,9 @@ static int fatfs_truncate(fs_volume_t *v, fs_node_t *n, uint64 size) {
     return 0;
 }
 
-static int fatfs_mkdir(fs_volume_t *v, const char *abs_path) {
+static int fatfs_mkdir(fs_volume_t *v, const char *abs_path,
+                       const struct cred *c) {
+    (void)c;                             /* FAT records no owner */
     return fat_to_errno(fat_mkdir((fat_volume_t *)v->body, abs_path));
 }
 

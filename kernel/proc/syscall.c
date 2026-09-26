@@ -629,7 +629,11 @@ static uint64 sys_openat(uint64 dirfd, uint64 path_ptr, uint64 flags, uint64 mod
      * plain O_CREAT means "make it if it is missing", and the file being
      * there already is the ordinary case. */
     if ((flags & O_CREAT) && !is_dev_path(resolved)) {
-        int crc = fs_create(resolved);
+        cred_t cc;
+        int crc;
+
+        proc_cred(proc_current(), &cc);
+        crc = fs_create(resolved, (const struct cred *)&cc);
 
         if (crc == -17) {                    /* -EEXIST */
             if (flags & O_EXCL) {
@@ -4988,17 +4992,21 @@ static uint64 sys_fchown(uint64 fd, uint64 uid, uint64 gid) {
 
 static uint64 sys_mkdir(uint64 path_ptr, uint64 mode) {
     char resolved[PATH_MAX_LEN];
+    cred_t c;
     int rc = resolve_user_path(path_ptr, resolved, sizeof(resolved));
 
     /* mode is accepted and ignored: FAT has no permission bits to store it
-     * in. Ignoring it is not the same as refusing - every caller passes one
+     * in, and gnfs, which does, is not handed one yet (fs_ops_t::mkdir takes
+     * the creator but no mode; gnfs uses a fixed 0755). Ignoring it is not
+     * the same as refusing - every caller passes one
      * and none can observe it here, and returning an error for a mode that
      * cannot be honoured would break mkdir(1). */
     (void)mode;
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
-    return (uint64)(int64)fs_mkdir(resolved);
+    proc_cred(proc_current(), &c);
+    return (uint64)(int64)fs_mkdir(resolved, (const struct cred *)&c);
 }
 
 static uint64 sys_rmdir(uint64 path_ptr) {

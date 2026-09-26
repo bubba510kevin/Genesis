@@ -176,8 +176,15 @@ typedef struct fs_ops {
      * volume is. Collapsing them would make O_CREAT|O_WRONLY report one
      * error for both.
      *
-     * NULL for a filesystem that cannot, like every slot here. */
-    int (*create)(fs_volume_t *v, const char *abs_path);
+     * NULL for a filesystem that cannot, like every slot here.
+     *
+     * `c` is the creator, so a filesystem that records owners can record
+     * the right one - without it, every object gnfs made belonged to root
+     * and chown was the only way a non-root user ever came to own a file.
+     * NULL means the kernel itself, which is root's. A filesystem with no
+     * owners (FAT) ignores it. The same goes for mkdir below. */
+    int (*create)(fs_volume_t *v, const char *abs_path,
+                  const struct cred *c);
 
     /* Set a file's length - shorter or longer. Growing must make the new
      * bytes read as ZERO, which on a filesystem with no holes means really
@@ -189,7 +196,7 @@ typedef struct fs_ops {
      * wrapper for truncate(2). */
     int (*truncate)(fs_volume_t *v, fs_node_t *n, uint64 size);
 
-    int (*mkdir)(fs_volume_t *v, const char *abs_path);
+    int (*mkdir)(fs_volume_t *v, const char *abs_path, const struct cred *c);
     int (*rmdir)(fs_volume_t *v, const char *abs_path);
     int (*unlink)(fs_volume_t *v, const char *abs_path);
     int (*rename)(fs_volume_t *v, const char *old_path, const char *new_path);
@@ -397,8 +404,9 @@ int64 fs_write(fs_node_t *n, uint64 offset, const void *buf, uint64 max);
 
 /* Create an empty regular file at an absolute path. Returns 0, -EEXIST,
  * -EROFS if the filesystem has no create slot, or whatever the filesystem
- * says. The parent must exist; this creates one name, not a path. */
-int fs_create(const char *abs_path);
+ * says. The parent must exist; this creates one name, not a path. `c` is
+ * the creator (see fs_ops_t::create); NULL means the kernel. */
+int fs_create(const char *abs_path, const struct cred *c);
 
 /* Set the length of an already-resolved file. */
 int fs_truncate(fs_node_t *n, uint64 size);
@@ -461,7 +469,7 @@ int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a);
  * acl_chown_permitted refuses. The one place fs_ops_t::setowner is called. */
 int fs_setowner(fs_node_t *n, const struct cred *c, uint32 uid, uint32 gid);
 
-int fs_mkdir(const char *abs_path);
+int fs_mkdir(const char *abs_path, const struct cred *c);
 int fs_rmdir(const char *abs_path);
 int fs_unlink(const char *abs_path);
 int fs_rename(const char *old_path, const char *new_path);
