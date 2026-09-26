@@ -244,6 +244,17 @@ void acl_inherit(const acl_t *parent, int child_is_dir, uint32 default_mode,
  * acl_from_mode does. */
 void acl_apply_chmod(const acl_t *old, uint32 mode, acl_t *out);
 
+/* The full mode a chmod(2) to `requested` should actually store, for an
+ * object of type `type_bits` whose effective ACL is `a`: the type, plus
+ * `requested`'s permission AND special bits (S_ISUID/S_ISGID/S_ISVTX) - with
+ * one silent adjustment, Linux's: a caller that is neither supreme nor a
+ * member of the object's group has S_ISGID dropped, with no error. Without
+ * that, anyone could chmod g+s their own file and have it run with the
+ * privileges of a group they do not belong to. Pure; see acl_apply_chmod
+ * for what then becomes of the rwx half. */
+uint32 acl_chmod_mode(const acl_t *a, const cred_t *c, uint32 type_bits,
+                      uint32 requested);
+
 /* chown(2)'s "leave this one alone" - the (uid_t)-1 / (gid_t)-1 POSIX
  * callers pass for the half of the pair they are not changing. */
 #define ACL_CHOWN_KEEP 0xFFFFFFFFu

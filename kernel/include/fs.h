@@ -107,6 +107,9 @@ typedef struct fs_statfs {
     uint64 name_max;      /* longest filename this filesystem can hold     */
 } fs_statfs_t;
 
+/* fs_ops_t::setacl's "leave the special mode bits as they are". */
+#define FS_SPECIAL_KEEP 0xFFFFFFFFu
+
 typedef struct fs_ops {
     const char *name;
 
@@ -268,8 +271,16 @@ typedef struct fs_ops {
      * re-invent the same ordering logic on every filesystem that implements
      * this slot instead of once, in acl.c.
      *
+     * `special` is the S_ISUID|S_ISGID|S_ISVTX bits to store alongside, or
+     * FS_SPECIAL_KEEP to leave them as they are. They ride on this slot
+     * rather than a slot of their own because chmod changes both halves at
+     * once, and two slots would be two commits - a crash between them would
+     * leave a chmod half-applied. No ACE can express them, so only the
+     * filesystem's own mode word holds them.
+     *
      * Returns 0, or a negative errno. */
-    int (*setacl)(fs_volume_t *v, fs_node_t *n, const struct acl *a);
+    int (*setacl)(fs_volume_t *v, fs_node_t *n, const struct acl *a,
+                  uint32 special);
 
     /* Make (uid, gid) this object's owner and owning group - both real ids,
      * never ACL_CHOWN_KEEP; fs_setowner resolves those first. NULL for a
@@ -469,6 +480,13 @@ int fs_access(const fs_node_t *n, const struct cred *c, uint32 wanted);
  * see the definition in kernel/fs/vfs.c for why this is the one place that
  * check and the one place fs_ops_t::setacl is called. */
 int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a);
+
+/* chmod: set `n`'s permission and special bits from `mode` (its S_IFMT
+ * bits, if any, are ignored - the type is the object's). Gated exactly as
+ * fs_setacl is, on ACE_WRITE_ACL; acl_chmod_mode decides what becomes of
+ * S_ISGID and acl_apply_chmod what becomes of the ACL, and both reach the
+ * filesystem in one setacl call. */
+int fs_chmod(fs_node_t *n, const struct cred *c, uint32 mode);
 
 /* chown: make (uid, gid) `n`'s owner and group, either of which may be
  * ACL_CHOWN_KEEP. -EROFS on a read-only volume, -EPERM when

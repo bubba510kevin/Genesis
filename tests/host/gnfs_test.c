@@ -806,7 +806,7 @@ static void test_acl_end_to_end(void) {
         custom.count++;
         custom.trivial = 0;
 
-        rc = v->ops->setacl(v, &secure_node, &custom);
+        rc = v->ops->setacl(v, &secure_node, &custom, FS_SPECIAL_KEEP);
         check(rc == 0, "setacl on the directory must succeed");
     }
 
@@ -939,7 +939,7 @@ static void test_chown_end_to_end(void) {
     a.ace[a.count].who   = 9001;
     a.count++;
     a.trivial = 0;
-    check(v->ops->setacl(v, &secured, &a) == 0, "give it a stored ACL");
+    check(v->ops->setacl(v, &secured, &a, FS_SPECIAL_KEEP) == 0, "give it a stored ACL");
 
     rc = fs_setowner(&secured, (const struct cred *)&root, 1000, 1000);
     check(rc == 0, "root chowns the ACL-bearing file");
@@ -1348,6 +1348,142 @@ static void test_delete_and_rename_check(void) {
     free(image);
 }
 
+/* acl_chmod_mode's one silent rule, as pure logic. */
+static void test_acl_chmod_mode(void) {
+    acl_t a;
+    cred_t member, outsider, supreme;
+
+    acl_from_mode(0100755u, 10, 50, &a);          /* group 50 */
+    cred_init_nobody(&member);
+    member.euid = 10;
+    member.egid = 7;
+    member.groups[0] = 50;
+    member.ngroups = 1;
+    cred_init_nobody(&outsider);
+    outsider.euid = 10;
+    outsider.egid = 7;
+    cred_init_nobody(&supreme);
+    supreme.euid = 99;
+    supreme.supreme = 1;
+
+    check(acl_chmod_mode(&a, &outsider, 0100000u, 04755u) == 0104755u,
+         "setuid is kept for anyone chmod lets through at all");
+    check(acl_chmod_mode(&a, &outsider, 0100000u, 02755u) == 0100755u,
+         "setgid is silently dropped for a caller not in the file's group");
+    check(acl_chmod_mode(&a, &member, 0100000u, 02755u) == 0102755u,
+         "and kept for one who is - through a SUPPLEMENTARY group here");
+    check(acl_chmod_mode(&a, &supreme, 0100000u, 02755u) == 0102755u,
+         "and kept for supreme, who is in no group at all");
+    check(acl_chmod_mode(&a, &outsider, 0040000u, 01777u) == 0041777u,
+         "sticky on a directory is kept");
+    check(acl_chmod_mode(&a, &outsider, 0100000u, 0170755u) == 0100755u,
+         "type bits in the request are ignored - the type is the object's");
+}
+
+/* chmod's special bits, end to end through fs_chmod on a mounted volume -
+ * before, gnfs carried them over from the old mode and no chmod could
+ * change them in either direction. */
+static void test_chmod_special_bits(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t f, d;
+    cred_t root, user, stranger;
+    const struct cred *R, *U, *S;
+    acl_t a;
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+    R = (const struct cred *)&root;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the chmod test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+    check(fs_mount_at("/gc", v) == 0, "and it goes into the mount table");
+
+    cred_init_nobody(&user);
+    user.euid = 1000;
+    user.egid = 1000;
+    cred_init_nobody(&stranger);
+    stranger.euid = 2000;
+    stranger.egid = 2000;
+    U = (const struct cred *)&user;
+    S = (const struct cred *)&stranger;
+
+    /* Made by the kernel, then given to uid 1000: /gc itself is root's
+     * 0755, and uid 1000 may not create in it. */
+    if (fs_create("/gc/prog", NULL) != 0 || fs_lookup("/gc/prog", &f) != 0 ||
+        fs_setowner(&f, R, 1000, 1000) != 0 ||
+        fs_mkdir("/gc/shared", NULL) != 0 || fs_lookup("/gc/shared", &d) != 0 ||
+        fs_setowner(&d, R, 1000, 1000) != 0) {
+        check(0, "setting up /gc/prog and /gc/shared for uid 1000");
+        fs_unmount_volume(v);
+        free(image);
+        return;
+    }
+    check(fs_chmod(&f, S, 04755u) == -13, "a stranger may not chmod it");
+    check(fs_chmod(&f, U, 04755u) == 0 && (f.mode & 07777) == 04755u,
+         "its owner sets setuid - the bit is really there now");
+    check(fs_chmod(&f, U, 0755u) == 0 && (f.mode & 07777) == 0755u,
+         "and clears it again");
+    check(fs_chmod(&f, U, 02755u) == 0 && (f.mode & 07777) == 02755u,
+         "setgid, into the owner's own group, is kept");
+
+    check(fs_chmod(&d, U, 03777u) == 0 && (d.mode & 07777) == 03777u,
+         "a directory takes setgid and sticky together");
+
+    {
+        fs_node_t g;
+
+        check(fs_create("/gc/other", NULL) == 0 &&
+             fs_lookup("/gc/other", &g) == 0 &&
+             fs_setowner(&g, R, 1000, 50) == 0,
+             "root makes /gc/other, owned by uid 1000 but in group 50");
+        check(fs_chmod(&g, U, 02755u) == 0 && (g.mode & 07777) == 0755u,
+             "its owner's chmod 02755 SUCCEEDS but without setgid - uid "
+             "1000 is not in group 50");
+    }
+
+    /* A plain ACL write leaves them alone. */
+    check(fs_getacl(&d, (struct acl *)&a) == 0 &&
+         fs_setacl(&d, U, (const struct acl *)&a) == 0 &&
+         (d.mode & 07000) == 03000u,
+         "fs_setacl, which carries no mode, keeps the special bits");
+
+    {
+        device_t dev2;
+        dev_stub_t stub2;
+        fs_volume_t *v2;
+        fs_node_t n2;
+
+        fs_unmount_volume(v);
+        dev_stub_attach(&dev2, &stub2, image, image_bytes);
+        v2 = gnfs_probe(&dev2);
+        check(v2 != NULL, "the volume remounts");
+        if (v2 != NULL) {
+            check(v2->ops->lookup(v2, "/prog", &n2) == 0 &&
+                 (n2.mode & 07777) == 02755u,
+                 "the file's setgid survived a remount");
+            check(v2->ops->lookup(v2, "/shared", &n2) == 0 &&
+                 (n2.mode & 07777) == 03777u,
+                 "and so did the directory's setgid+sticky");
+            v2->ops->unmount(v2);
+        }
+    }
+    free(image);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -1371,6 +1507,8 @@ int gnfs_run_tests(void) {
     test_parent_write_check();
     test_dir_write_grants_delete_child();
     test_delete_and_rename_check();
+    test_acl_chmod_mode();
+    test_chmod_special_bits();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

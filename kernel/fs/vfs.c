@@ -894,7 +894,8 @@ int fs_access(const fs_node_t *n, const struct cred *c, uint32 wanted) {
  * acl_inherit, and both call this to make it durable. Keeping that split
  * means this function never has to know which shape of change is being
  * made, only that the caller was allowed to make it. */
-int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a) {
+static int fs_setacl_special(fs_node_t *n, const struct cred *c,
+                             const struct acl *a, uint32 special) {
     int rc;
 
     if (n == NULL || c == NULL || a == NULL) {
@@ -909,7 +910,34 @@ int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a) {
                                                * filesystem with no write
                                                * slot at all already answers */
     }
-    return n->vol->ops->setacl(n->vol, n, a);
+    return n->vol->ops->setacl(n->vol, n, a, special);
+}
+
+int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a) {
+    return fs_setacl_special(n, c, a, FS_SPECIAL_KEEP);
+}
+
+/* chmod(2) in full: the rwx half through acl_apply_chmod (rewriting only
+ * owner@/group@/everyone@, leaving named and inherited entries alone), the
+ * special half through acl_chmod_mode, and both in ONE setacl call so a
+ * chmod is never half-applied. Before this, the special bits could not be
+ * changed at all - the filesystem carried them over from the old mode. */
+int fs_chmod(fs_node_t *n, const struct cred *c, uint32 mode) {
+    acl_t old_acl, new_acl;
+    uint32 full;
+    int rc;
+
+    if (n == NULL || c == NULL) {
+        return -22;                            /* -EINVAL */
+    }
+    rc = fs_getacl(n, (struct acl *)&old_acl);
+    if (rc != 0) {
+        return rc;
+    }
+    full = acl_chmod_mode(&old_acl, (const cred_t *)c, n->mode, mode);
+    acl_apply_chmod(&old_acl, full, &new_acl);
+    return fs_setacl_special(n, c, (const struct acl *)&new_acl,
+                             full & (S_ISUID | S_ISGID | S_ISVTX));
 }
 
 /* chown's counterpart to fs_setacl, and deliberately NOT built on it:

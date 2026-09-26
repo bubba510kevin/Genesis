@@ -565,3 +565,20 @@ int acl_chown_permitted(const acl_t *a, const cred_t *c, uint32 new_uid,
     }
     return 0;
 }
+
+/* --- chmod's special bits -------------------------------------------------
+ *
+ * See acl.h. The group tested is the OBJECT's (a->group), not the caller's
+ * egid alone: cred_in_group covers the supplementary list too, which is what
+ * Linux's in_group_p does. */
+uint32 acl_chmod_mode(const acl_t *a, const cred_t *c, uint32 type_bits,
+                      uint32 requested) {
+    uint32 mode = (type_bits & S_IFMT) |
+                  (requested & (S_ISUID | S_ISGID | S_ISVTX | 0777u));
+
+    if ((mode & S_ISGID) && !cred_is_supreme(c) &&
+        (a == NULL || !cred_in_group(c, a->group))) {
+        mode &= ~S_ISGID;
+    }
+    return mode;
+}

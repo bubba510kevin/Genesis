@@ -4872,12 +4872,14 @@ static uint64 sys_ftruncate(uint64 fd, uint64 length) {
     return (uint64)(int64)fileobj_truncate(f->obj, length);
 }
 
-/* chmod(2) and fchmod(2): rewrite exactly the owner@/group@/everyone@
- * entries of the object's ACL to match `mode` - acl_apply_chmod
- * (kernel/fs/acl.c) - leaving everything else (a named grant, a deny, an
- * inherited entry) untouched, and commit the result through fs_setacl.
+/* chmod(2) and fchmod(2), both fs_chmod (kernel/fs/vfs.c): rewrite exactly
+ * the owner@/group@/everyone@ entries of the object's ACL to match `mode` -
+ * acl_apply_chmod - leaving everything else (a named grant, a deny, an
+ * inherited entry) untouched, and set the setuid/setgid/sticky bits from
+ * it, subject to acl_chmod_mode's silent S_ISGID rule.
  *
- * fs_setacl is what actually decides whether this caller may: it checks
+ * fs_chmod's gate is fs_setacl's, and it is what actually decides whether
+ * this caller may: it checks
  * ACE_WRITE_ACL, which acl_from_mode already grants the owner
  * unconditionally (POSIX gives the owner chmod regardless of the mode bits)
  * and which cred_is_supreme's bypass covers the same way it covers every
@@ -4889,23 +4891,10 @@ static uint64 sys_ftruncate(uint64 fd, uint64 length) {
  * unconditionally, and an owner must not thereby be able to give a file
  * away. */
 static uint64 sys_chmod_node(fs_node_t *n, uint64 mode) {
-    process_t *p = proc_current();
     cred_t c;
-    acl_t old_acl, new_acl;
-    int rc;
 
-    rc = fs_getacl(n, (struct acl *)&old_acl);
-    if (rc != 0) {
-        return (uint64)(int64)rc;
-    }
-    /* The TYPE comes from the object, never from the caller - chmod(2)'s
-     * mode is permission bits only, and acl_apply_chmod needs to know a
-     * directory is one (its w also grants ACE_DELETE_CHILD). */
-    acl_apply_chmod(&old_acl, (n->mode & S_IFMT) | ((uint32)mode & 07777u),
-                    &new_acl);
-    proc_cred(p, &c);
-    rc = fs_setacl(n, (const struct cred *)&c, (const struct acl *)&new_acl);
-    return (uint64)(int64)rc;
+    proc_cred(proc_current(), &c);
+    return (uint64)(int64)fs_chmod(n, (const struct cred *)&c, (uint32)mode);
 }
 
 static uint64 sys_chmod(uint64 path_ptr, uint64 mode) {

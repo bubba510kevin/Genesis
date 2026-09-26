@@ -685,8 +685,11 @@ static int gnfs_effective_acl(gnfs_mount_t *m, const gnfs_onode_t *o,
  * Also refreshes `o->mode` from the new ACL (acl_to_mode), so a caller that
  * stats the object without going through getacl still sees a mode that
  * agrees with what was just set, rather than a stale projection of the old
- * one. */
-static int gnfs_store_acl(gnfs_mount_t *m, gnfs_onode_t *o, const acl_t *a) {
+ * one. The special bits are `special` when it is not FS_SPECIAL_KEEP, and
+ * otherwise carried over - acl_to_mode keeps them from its type_bits
+ * argument, since no ACE can say anything about them. */
+static int gnfs_store_acl(gnfs_mount_t *m, gnfs_onode_t *o, const acl_t *a,
+                          uint32 special) {
     uint8 block[GNFS_BLOCK_SIZE];
     uint64 old_block = o->acl_block;
     uint64 new_block;
@@ -703,6 +706,10 @@ static int gnfs_store_acl(gnfs_mount_t *m, gnfs_onode_t *o, const acl_t *a) {
     }
     o->acl_block = new_block;
     o->mode = acl_to_mode(a, o->mode);
+    if (special != FS_SPECIAL_KEEP) {
+        o->mode = (o->mode & ~(S_ISUID | S_ISGID | S_ISVTX)) |
+                  (special & (S_ISUID | S_ISGID | S_ISVTX));
+    }
     gnfs_cow_free_block(m, old_block);
     return 0;
 }
@@ -733,7 +740,7 @@ static void gnfs_apply_inheritance(gnfs_mount_t *m, uint64 parent_objnum,
     if (child_acl.trivial) {
         return;             /* nothing inherited - acl_block stays 0 */
     }
-    gnfs_store_acl(m, child, &child_acl);
+    gnfs_store_acl(m, child, &child_acl, FS_SPECIAL_KEEP);
 }
 
 static int gnfs_op_getacl(fs_volume_t *v, const fs_node_t *n,
@@ -748,7 +755,7 @@ static int gnfs_op_getacl(fs_volume_t *v, const fs_node_t *n,
 }
 
 static int gnfs_op_setacl(fs_volume_t *v, fs_node_t *n,
-                          const struct acl *a) {
+                          const struct acl *a, uint32 special) {
     gnfs_mount_t *m = (gnfs_mount_t *)v->body;
     gnfs_onode_t *o = gnfs_onode_at(m->obj_table, node_objnum(n));
     const acl_t *acl = (const acl_t *)a;
@@ -760,7 +767,7 @@ static int gnfs_op_setacl(fs_volume_t *v, fs_node_t *n,
     if (acl->count > ACL_ACE_MAX) {
         return -EINVAL;
     }
-    rc = gnfs_store_acl(m, o, acl);
+    rc = gnfs_store_acl(m, o, acl, special);
     if (rc != 0) {
         return rc;
     }
@@ -791,7 +798,7 @@ static int gnfs_op_setowner(fs_volume_t *v, fs_node_t *n, uint32 uid,
     if (rc == 0) {
         stored.owner = uid;
         stored.group = gid;
-        rc = gnfs_store_acl(m, o, &stored);
+        rc = gnfs_store_acl(m, o, &stored, FS_SPECIAL_KEEP);
         if (rc != 0) {
             return rc;
         }
