@@ -152,10 +152,20 @@ right where the work stopped):
      DELETE_CHILD+EXECUTE on the parent; rename = remove + add + remove
      replaced. Also fixed: directory w never granted ACE_DELETE_CHILD, so
      `access(dir, W_OK)` failed for non-root owners.
-   - Sticky bit not modelled (can't be set on gnfs yet — see chmod gap).
-   - chmod can't set/clear suid/sgid/sticky on gnfs (carried from old mode).
-   - open(O_CREAT)/mkdir(2) mode argument still ignored (fixed 0644/0755).
-   - setgid-directory group inheritance waits on the chmod fix.
+   - ~~chmod special bits~~ — **DONE**: `fs_chmod` (vfs.c) sets/clears
+     suid/sgid/sticky in the same commit as the ACL (`setacl` gained a
+     `special` arg); sgid silently dropped for non-members, as Linux.
+   - ~~setgid directories~~ / ~~sticky directories~~ — **DONE**: new objects
+     take a setgid parent's group (subdirs inherit sgid); in a sticky dir
+     only the entry's/dir's owner or supreme may remove (-EPERM).
+   - ~~create mode ignored~~ — **DONE**: open(O_CREAT)/mkdir honour
+     `mode & ~umask` (perm bits; +sticky for mkdir). Default umask now 022.
+   - **Still open:** chown should clear suid/sgid (POSIX) — harmless until
+     exec honours those bits, must land with that; moving a directory to a
+     new parent should need write on the directory itself (".." changes);
+     none of this is exercised from ring 3 yet (systest doesn't touch gnfs
+     and doesn't run at boot) — the umask path in particular is only
+     reasoned about.
 2. Snapshot-aware allocation (Unit 2) — the allocator needs to know about
    every *retained* root record's bitmap, not just the live one.
 3. The dataset directory (Unit 2) — multiple named filesystems in one gnfs

@@ -572,8 +572,6 @@ static uint64 sys_openat(uint64 dirfd, uint64 path_ptr, uint64 flags, uint64 mod
     int err = 0;
     int fd;
 
-    (void)mode;
-
     /* Only AT_FDCWD is supported: resolving against an arbitrary directory
      * descriptor needs the path of the directory that fd names, and an open
      * file object stores an entry rather than a path. Worth doing when
@@ -633,7 +631,8 @@ static uint64 sys_openat(uint64 dirfd, uint64 path_ptr, uint64 flags, uint64 mod
         int crc;
 
         proc_cred(proc_current(), &cc);
-        crc = fs_create(resolved, (const struct cred *)&cc);
+        crc = fs_create(resolved, (const struct cred *)&cc,
+                        (uint32)(mode & ~p->umask));
 
         if (crc == -17) {                    /* -EEXIST */
             if (flags & O_EXCL) {
@@ -3349,10 +3348,10 @@ static uint64 sys_madvise(void) {
     return 0;
 }
 
-/* umask: stored and reported, not enforced. FAT has no permission bits for
- * it to mask, so a process that sets one and reads it back gets its own
- * value - which is all any caller can observe here. Recorded as a per-
- * process value rather than a global because that is what it is. */
+/* umask: the bits open(O_CREAT) and mkdir(2) clear from the mode they are
+ * asked for - applied in sys_openat and sys_mkdir, enforced by whichever
+ * filesystem has permission bits to store (gnfs; FAT has none). Per-process,
+ * inherited across fork, 022 for a process the kernel creates. */
 static uint64 sys_umask(uint64 mask) {
     process_t *p = proc_current();
     uint64 old = p->umask;
@@ -4988,18 +4987,15 @@ static uint64 sys_mkdir(uint64 path_ptr, uint64 mode) {
     cred_t c;
     int rc = resolve_user_path(path_ptr, resolved, sizeof(resolved));
 
-    /* mode is accepted and ignored: FAT has no permission bits to store it
-     * in, and gnfs, which does, is not handed one yet (fs_ops_t::mkdir takes
-     * the creator but no mode; gnfs uses a fixed 0755). Ignoring it is not
-     * the same as refusing - every caller passes one
-     * and none can observe it here, and returning an error for a mode that
-     * cannot be honoured would break mkdir(1). */
-    (void)mode;
+    /* `mode`, masked by this process's umask - fs_mkdir decides which bits
+     * of it can survive at all. FAT still has nowhere to store any of it;
+     * gnfs stores it. */
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
     proc_cred(proc_current(), &c);
-    return (uint64)(int64)fs_mkdir(resolved, (const struct cred *)&c);
+    return (uint64)(int64)fs_mkdir(resolved, (const struct cred *)&c,
+                                   (uint32)(mode & ~proc_current()->umask));
 }
 
 static uint64 sys_rmdir(uint64 path_ptr) {

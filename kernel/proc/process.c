@@ -324,12 +324,12 @@ process_t *proc_alloc(int ppid) {
             p->gid           = 0;
             p->sid           = 0;
             p->ngroups       = 0;
-            /* Zero, not 022. 022 is the conventional default and is what
-             * this should become, but nothing creates a file with a mode
-             * yet, so changing it now would alter no behaviour except to
-             * make the first thing that does behave differently from every
-             * test written against today. */
-            p->umask         = 0;
+            /* 022, the conventional default and what Linux gives init. It
+             * was 0 while nothing created a file with a mode; now that
+             * open(O_CREAT) and mkdir(2) honour theirs (masked by this),
+             * 0 would turn busybox's ordinary open(..., 0666) into a
+             * world-writable file. */
+            p->umask         = 022;
             {
                 int g;
                 for (g = 0; g < CRED_NGROUPS; g++) {

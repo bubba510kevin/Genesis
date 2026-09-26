@@ -529,7 +529,7 @@ static int fs_may_remove_entry(const char *abs_path, const fs_node_t *victim,
     return 0;
 }
 
-int fs_mkdir(const char *abs_path, const struct cred *c) {
+int fs_mkdir(const char *abs_path, const struct cred *c, uint32 mode) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -556,7 +556,7 @@ int fs_mkdir(const char *abs_path, const struct cred *c) {
             return rc;
         }
     }
-    return v->ops->mkdir(v, rel, c);
+    return v->ops->mkdir(v, rel, c, mode & (0777u | S_ISVTX));
 }
 
 int fs_statfs(const char *abs_path, fs_statfs_t *out) {
@@ -596,7 +596,7 @@ int fs_statfs(const char *abs_path, fs_statfs_t *out) {
     return v->ops->statfs(v, out);
 }
 
-int fs_create(const char *abs_path, const struct cred *c) {
+int fs_create(const char *abs_path, const struct cred *c, uint32 mode) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -623,7 +623,7 @@ int fs_create(const char *abs_path, const struct cred *c) {
             return rc;
         }
     }
-    return v->ops->create(v, rel, c);
+    return v->ops->create(v, rel, c, mode & 0777u);
 }
 
 int fs_truncate(fs_node_t *n, uint64 size) {

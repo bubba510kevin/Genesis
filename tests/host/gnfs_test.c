@@ -631,9 +631,9 @@ static void test_object_layer_end_to_end(void) {
     check(root_node.size == GNFS_BLOCK_SIZE,
          "a freshly formatted root's directory data is exactly one block");
 
-    rc = v->ops->create(v, "/hello.txt", NULL);
+    rc = v->ops->create(v, "/hello.txt", NULL, 0644u);
     check(rc == 0, "creating a file must succeed");
-    rc = v->ops->create(v, "/hello.txt", NULL);
+    rc = v->ops->create(v, "/hello.txt", NULL, 0644u);
     check(rc == -17, "creating the same name twice must be -EEXIST");
 
     rc = v->ops->lookup(v, "/hello.txt", &file_node);
@@ -684,13 +684,13 @@ static void test_object_layer_end_to_end(void) {
         }
     }
 
-    rc = v->ops->mkdir(v, "/sub", NULL);
+    rc = v->ops->mkdir(v, "/sub", NULL, 0755u);
     check(rc == 0, "creating a directory must succeed");
     rc = v->ops->lookup(v, "/sub", &dir_node);
     check(rc == 0 && dir_node.is_dir,
          "the new directory must resolve as a directory");
 
-    rc = v->ops->create(v, "/sub/inner.txt", NULL);
+    rc = v->ops->create(v, "/sub/inner.txt", NULL, 0644u);
     check(rc == 0, "creating a file inside the new directory must succeed");
     {
         fs_node_t inner;
@@ -770,7 +770,7 @@ static void test_acl_end_to_end(void) {
         return;
     }
 
-    rc = v->ops->create(v, "/plain.txt", NULL);
+    rc = v->ops->create(v, "/plain.txt", NULL, 0644u);
     check(rc == 0, "creating a plain file must succeed");
     rc = v->ops->lookup(v, "/plain.txt", &plain_node);
     check(rc == 0, "the plain file must resolve");
@@ -781,7 +781,7 @@ static void test_acl_end_to_end(void) {
          "follows; fs_getacl one layer up is what actually projects the "
          "mode for a caller, not tested again here");
 
-    rc = v->ops->mkdir(v, "/secure", NULL);
+    rc = v->ops->mkdir(v, "/secure", NULL, 0755u);
     check(rc == 0, "creating the directory to hold an inheritable ACL must "
          "succeed");
     rc = v->ops->lookup(v, "/secure", &secure_node);
@@ -817,7 +817,7 @@ static void test_acl_end_to_end(void) {
     check(acl_out.ace[3].who == 1001, "including the inheritable entry "
          "itself");
 
-    rc = v->ops->create(v, "/secure/child.txt", NULL);
+    rc = v->ops->create(v, "/secure/child.txt", NULL, 0644u);
     check(rc == 0, "creating a file inside the secured directory must "
          "succeed");
     rc = v->ops->lookup(v, "/secure/child.txt", &child_node);
@@ -835,7 +835,7 @@ static void test_acl_end_to_end(void) {
           (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) == 0,
          "and, being a FILE, does not itself propagate any further");
 
-    rc = v->ops->mkdir(v, "/secure/subdir", NULL);
+    rc = v->ops->mkdir(v, "/secure/subdir", NULL, 0755u);
     check(rc == 0, "creating a directory inside the secured directory must "
          "succeed");
     rc = v->ops->lookup(v, "/secure/subdir", &grandchild_node);
@@ -907,7 +907,7 @@ static void test_chown_end_to_end(void) {
     owner.ngroups = 1;
 
     /* A file with no stored ACL: only the onode's copy exists. */
-    check(v->ops->create(v, "/plain.txt", NULL) == 0, "create /plain.txt");
+    check(v->ops->create(v, "/plain.txt", NULL, 0644u) == 0, "create /plain.txt");
     check(v->ops->lookup(v, "/plain.txt", &plain) == 0, "and resolve it");
     plain.vol = v;               /* fs_lookup_on would stamp this */
 
@@ -929,7 +929,7 @@ static void test_chown_end_to_end(void) {
     check(rc == -1, "and not into a group it is not in");
 
     /* A file WITH a stored ACL: both copies must move. */
-    check(v->ops->create(v, "/secured.txt", NULL) == 0, "create /secured.txt");
+    check(v->ops->create(v, "/secured.txt", NULL, 0644u) == 0, "create /secured.txt");
     check(v->ops->lookup(v, "/secured.txt", &secured) == 0, "resolve it");
     secured.vol = v;
     acl_from_mode(0100600u, 0, 0, &a);
@@ -1013,7 +1013,7 @@ static void test_creator_owns(void) {
     stranger.euid = 2000;
     stranger.egid = 200;
 
-    check(v->ops->create(v, "/mine.txt", (const struct cred *)&user) == 0,
+    check(v->ops->create(v, "/mine.txt", (const struct cred *)&user, 0644u) == 0,
          "uid 1000 creates /mine.txt");
     check(v->ops->lookup(v, "/mine.txt", &file) == 0 &&
          file.uid == 1000 && file.gid == 100,
@@ -1021,13 +1021,13 @@ static void test_creator_owns(void) {
          "egid, not root's");
     file.vol = v;
 
-    check(v->ops->mkdir(v, "/mydir", (const struct cred *)&user) == 0,
+    check(v->ops->mkdir(v, "/mydir", (const struct cred *)&user, 0755u) == 0,
          "uid 1000 makes /mydir");
     check(v->ops->lookup(v, "/mydir", &dir) == 0 &&
          dir.uid == 1000 && dir.gid == 100,
          "and owns that too");
 
-    check(v->ops->create(v, "/kernel.txt", NULL) == 0 &&
+    check(v->ops->create(v, "/kernel.txt", NULL, 0644u) == 0 &&
          v->ops->lookup(v, "/kernel.txt", &kfile) == 0 &&
          kfile.uid == 0 && kfile.gid == 0,
          "a NULL creator is the kernel, which is root");
@@ -1114,10 +1114,10 @@ static void test_parent_write_check(void) {
     U = (const struct cred *)&user;
     S = (const struct cred *)&stranger;
 
-    check(fs_mkdir("/gp/pub", R) == 0, "root makes /gp/pub - root's, 0755");
-    check(fs_create("/gp/pub/a", U) == -13,
+    check(fs_mkdir("/gp/pub", R, 0755u) == 0, "root makes /gp/pub - root's, 0755");
+    check(fs_create("/gp/pub/a", U, 0644u) == -13,
          "uid 1000 may not create in a directory it cannot write");
-    check(fs_mkdir("/gp/pub/d", U) == -13,
+    check(fs_mkdir("/gp/pub/d", U, 0755u) == -13,
          "nor make a subdirectory there");
     check(fs_lookup("/gp/pub/a", &n) == -2,
          "and the refused create really left nothing behind");
@@ -1125,39 +1125,39 @@ static void test_parent_write_check(void) {
     check(fs_lookup("/gp/pub", &n) == 0 &&
          fs_setowner(&n, R, 1000, 1000) == 0,
          "root gives /gp/pub to uid 1000");
-    check(fs_create("/gp/pub/a", U) == 0,
+    check(fs_create("/gp/pub/a", U, 0644u) == 0,
          "now its owner may create in it - the control for the refusal");
-    check(fs_mkdir("/gp/pub/d", U) == 0, "and make a subdirectory");
-    check(fs_create("/gp/pub/b", S) == -13,
+    check(fs_mkdir("/gp/pub/d", U, 0755u) == 0, "and make a subdirectory");
+    check(fs_create("/gp/pub/b", S, 0644u) == -13,
          "a stranger still may not - write on the parent is per-caller");
 
-    check(fs_create("/gp/pub/a", S) == -17,
+    check(fs_create("/gp/pub/a", S, 0644u) == -17,
          "but O_CREAT on a name that already EXISTS answers -EEXIST, not "
          "-EACCES - opening an existing file never needed the parent's "
          "write bit");
-    check(fs_mkdir("/gp/pub/d", S) == -17,
+    check(fs_mkdir("/gp/pub/d", S, 0755u) == -17,
          "and mkdir of an existing name is -EEXIST too, as on Linux");
 
-    check(fs_create("/gp/pub/k", NULL) == 0,
+    check(fs_create("/gp/pub/k", NULL, 0644u) == 0,
          "the kernel (NULL cred) is not asked");
-    check(fs_create("/gp/rootfile", R) == 0,
+    check(fs_create("/gp/rootfile", R, 0644u) == 0,
          "root creates in a root-owned 0755 directory - acl_access's bypass");
-    check(fs_create("/gp/nope/x", U) == -2,
+    check(fs_create("/gp/nope/x", U, 0644u) == -2,
          "a missing parent is -ENOENT, not a permission answer");
 
     /* Write without search: -w- on a directory is not enough. */
-    check(fs_mkdir("/gp/nox", R) == 0 && fs_lookup("/gp/nox", &n) == 0 &&
+    check(fs_mkdir("/gp/nox", R, 0755u) == 0 && fs_lookup("/gp/nox", &n) == 0 &&
          fs_setowner(&n, R, 1000, 1000) == 0,
          "root makes /gp/nox and gives it to uid 1000");
     check(fs_getacl(&n, (struct acl *)&old_acl) == 0, "read its ACL");
     acl_apply_chmod(&old_acl, 0040200u, &new_acl);  /* d-w------- */
     check(fs_setacl(&n, U, (const struct acl *)&new_acl) == 0,
          "its owner chmods it to 0200 - write, no search");
-    check(fs_create("/gp/nox/f", U) == -13,
+    check(fs_create("/gp/nox/f", U, 0644u) == -13,
          "and then cannot create in it - POSIX wants w AND x");
     acl_apply_chmod(&old_acl, 0040300u, &new_acl);  /* d-wx------ */
     check(fs_setacl(&n, U, (const struct acl *)&new_acl) == 0 &&
-         fs_create("/gp/nox/f", U) == 0,
+         fs_create("/gp/nox/f", U, 0644u) == 0,
          "with 0300 it can - the control");
 
     fs_unmount_volume(v);
@@ -1254,7 +1254,7 @@ static void test_delete_and_rename_check(void) {
     T = (const struct cred *)&third;
 
     /* A file uid 1000 OWNS, in a directory it does not. */
-    check(fs_mkdir("/gd/pub", R) == 0 && fs_create("/gd/pub/f", R) == 0 &&
+    check(fs_mkdir("/gd/pub", R, 0755u) == 0 && fs_create("/gd/pub/f", R, 0644u) == 0 &&
          fs_lookup("/gd/pub/f", &n) == 0 &&
          fs_setowner(&n, R, 1000, 1000) == 0,
          "root makes /gd/pub/f and gives the FILE to uid 1000");
@@ -1274,14 +1274,14 @@ static void test_delete_and_rename_check(void) {
     check(fs_unlink("/gd/pub/f", U) == -2,
          "unlinking it again is -ENOENT, not a permission answer");
 
-    check(fs_mkdir("/gd/pub/sub", R) == 0,
+    check(fs_mkdir("/gd/pub/sub", R, 0755u) == 0,
          "root makes a subdirectory in uid 1000's directory");
     check(fs_rmdir("/gd/pub/sub", S) == -13, "a stranger may not rmdir it");
     check(fs_rmdir("/gd/pub/sub", U) == 0,
          "the parent's owner may, though root made it");
 
     /* ACE_DELETE on the object alone - no right on the parent at all. */
-    check(fs_create("/gd/locked", R) == 0 &&
+    check(fs_create("/gd/locked", R, 0644u) == 0 &&
          fs_lookup("/gd/locked", &n) == 0,
          "root makes /gd/locked in root's own 0755 directory");
     acl_from_mode(0100644u, 0, 0, &a);
@@ -1305,7 +1305,7 @@ static void test_delete_and_rename_check(void) {
     v->ops = &ops_with_rename;
     fake_rename_calls = 0;
 
-    check(fs_create("/gd/pub/r", U) == 0, "uid 1000 creates /gd/pub/r");
+    check(fs_create("/gd/pub/r", U, 0644u) == 0, "uid 1000 creates /gd/pub/r");
     check(fs_rename("/gd/pub/r", "/gd/pub/r2", S) == -13 &&
          fake_rename_calls == 0,
          "a stranger may not rename in uid 1000's directory, and the "
@@ -1313,7 +1313,7 @@ static void test_delete_and_rename_check(void) {
     check(fs_rename("/gd/pub/r", "/gd/r3", U) == -13 &&
          fake_rename_calls == 0,
          "nor may the owner move it INTO root's directory - the add half");
-    check(fs_create("/gd/pub/victim", R) == 0,
+    check(fs_create("/gd/pub/victim", R, 0644u) == 0,
          "root puts /gd/pub/victim in uid 1000's directory");
     check(fs_rename("/gd/pub/r", "/gd/pub/r2", U) == 0 &&
          fake_rename_calls == 1,
@@ -1321,7 +1321,7 @@ static void test_delete_and_rename_check(void) {
     /* Replacing is deleting. A mode word cannot separate the two halves
      * (a directory's w grants add AND delete-child together), so this
      * needs a drop-box ACL: uid 1000 may ADD to /gd/drop, not delete. */
-    check(fs_mkdir("/gd/drop", R) == 0 && fs_lookup("/gd/drop", &n) == 0,
+    check(fs_mkdir("/gd/drop", R, 0755u) == 0 && fs_lookup("/gd/drop", &n) == 0,
          "root makes /gd/drop");
     acl_from_mode(0040755u, 0, 0, &a);
     a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
@@ -1331,7 +1331,7 @@ static void test_delete_and_rename_check(void) {
     a.count++;
     a.trivial = 0;
     check(fs_setacl(&n, R, (const struct acl *)&a) == 0 &&
-         fs_create("/gd/drop/existing", R) == 0,
+         fs_create("/gd/drop/existing", R, 0644u) == 0,
          "grants uid 1000 add-but-not-delete, and holds a file of root's");
     check(fs_rename("/gd/pub/r", "/gd/drop/new", U) == 0 &&
          fake_rename_calls == 2,
@@ -1423,9 +1423,9 @@ static void test_chmod_special_bits(void) {
 
     /* Made by the kernel, then given to uid 1000: /gc itself is root's
      * 0755, and uid 1000 may not create in it. */
-    if (fs_create("/gc/prog", NULL) != 0 || fs_lookup("/gc/prog", &f) != 0 ||
+    if (fs_create("/gc/prog", NULL, 0644u) != 0 || fs_lookup("/gc/prog", &f) != 0 ||
         fs_setowner(&f, R, 1000, 1000) != 0 ||
-        fs_mkdir("/gc/shared", NULL) != 0 || fs_lookup("/gc/shared", &d) != 0 ||
+        fs_mkdir("/gc/shared", NULL, 0755u) != 0 || fs_lookup("/gc/shared", &d) != 0 ||
         fs_setowner(&d, R, 1000, 1000) != 0) {
         check(0, "setting up /gc/prog and /gc/shared for uid 1000");
         fs_unmount_volume(v);
@@ -1446,7 +1446,7 @@ static void test_chmod_special_bits(void) {
     {
         fs_node_t g;
 
-        check(fs_create("/gc/other", NULL) == 0 &&
+        check(fs_create("/gc/other", NULL, 0644u) == 0 &&
              fs_lookup("/gc/other", &g) == 0 &&
              fs_setowner(&g, R, 1000, 50) == 0,
              "root makes /gc/other, owned by uid 1000 but in group 50");
@@ -1530,42 +1530,42 @@ static void test_setgid_and_sticky_dirs(void) {
     D = (const struct cred *)&downer;
 
     /* --- setgid ---------------------------------------------------------- */
-    check(fs_mkdir("/gs/plain", R) == 0 && fs_lookup("/gs/plain", &n) == 0 &&
+    check(fs_mkdir("/gs/plain", R, 0755u) == 0 && fs_lookup("/gs/plain", &n) == 0 &&
          fs_chmod(&n, R, 0777u) == 0,
          "root makes /gs/plain, 0777, no setgid");
-    check(fs_create("/gs/plain/f", U) == 0 &&
+    check(fs_create("/gs/plain/f", U, 0644u) == 0 &&
          fs_lookup("/gs/plain/f", &n) == 0 && n.gid == 1000,
          "a file made there takes its creator's egid - the control");
 
-    check(fs_mkdir("/gs/proj", R) == 0 && fs_lookup("/gs/proj", &n) == 0 &&
+    check(fs_mkdir("/gs/proj", R, 0755u) == 0 && fs_lookup("/gs/proj", &n) == 0 &&
          fs_setowner(&n, R, ACL_CHOWN_KEEP, 50) == 0 &&
          fs_chmod(&n, R, 02777u) == 0 && (n.mode & 07777) == 02777u,
          "root makes /gs/proj, group 50, setgid");
-    check(fs_create("/gs/proj/f", U) == 0 &&
+    check(fs_create("/gs/proj/f", U, 0644u) == 0 &&
          fs_lookup("/gs/proj/f", &n) == 0 && n.uid == 1000 && n.gid == 50,
          "a file made there by uid 1000 is still ITS file, but in group 50 "
          "- the directory's, though uid 1000 is not even a member");
     check((n.mode & S_ISGID) == 0,
          "and a FILE is not born setgid");
-    check(fs_mkdir("/gs/proj/sub", U) == 0 &&
+    check(fs_mkdir("/gs/proj/sub", U, 0755u) == 0 &&
          fs_lookup("/gs/proj/sub", &n) == 0 && n.gid == 50 &&
          (n.mode & S_ISGID) != 0,
          "a DIRECTORY made there is group 50 AND setgid, so the rule "
          "carries on below it");
-    check(fs_create("/gs/proj/sub/deep", U) == 0 &&
+    check(fs_create("/gs/proj/sub/deep", U, 0644u) == 0 &&
          fs_lookup("/gs/proj/sub/deep", &n) == 0 && n.gid == 50,
          "one level further down, still group 50");
 
     /* --- sticky ---------------------------------------------------------- */
-    check(fs_create("/gs/plain/g", U) == 0 &&
+    check(fs_create("/gs/plain/g", U, 0644u) == 0 &&
          fs_unlink("/gs/plain/g", S) == 0,
          "in a plain 0777 directory a stranger may delete uid 1000's file "
          "- the control for everything below");
 
-    check(fs_mkdir("/gs/tmp", R) == 0 && fs_lookup("/gs/tmp", &n) == 0 &&
+    check(fs_mkdir("/gs/tmp", R, 0755u) == 0 && fs_lookup("/gs/tmp", &n) == 0 &&
          fs_chmod(&n, R, 01777u) == 0 && (n.mode & 07777) == 01777u,
          "root makes /gs/tmp, 01777");
-    check(fs_create("/gs/tmp/u", U) == 0 && fs_create("/gs/tmp/s", S) == 0,
+    check(fs_create("/gs/tmp/u", U, 0644u) == 0 && fs_create("/gs/tmp/s", S, 0644u) == 0,
          "uid 1000 and uid 2000 each make a file in it");
     check(fs_unlink("/gs/tmp/u", S) == -1,
          "uid 2000 may NOT delete uid 1000's file there - -EPERM, the "
@@ -1576,14 +1576,14 @@ static void test_setgid_and_sticky_dirs(void) {
     check(fs_unlink("/gs/tmp/s", R) == 0,
          "root - the directory's owner and supreme - may delete uid 2000's");
 
-    check(fs_mkdir("/gs/tmp2", R) == 0 && fs_lookup("/gs/tmp2", &n) == 0 &&
+    check(fs_mkdir("/gs/tmp2", R, 0755u) == 0 && fs_lookup("/gs/tmp2", &n) == 0 &&
          fs_setowner(&n, R, 3000, 3000) == 0 &&
          fs_chmod(&n, D, 01777u) == 0,
          "uid 3000 owns a sticky /gs/tmp2 of its own");
-    check(fs_create("/gs/tmp2/u", U) == 0 && fs_unlink("/gs/tmp2/u", D) == 0,
+    check(fs_create("/gs/tmp2/u", U, 0644u) == 0 && fs_unlink("/gs/tmp2/u", D) == 0,
          "and, as the DIRECTORY's owner, may delete uid 1000's file in it");
 
-    check(fs_create("/gs/tmp/granted", U) == 0 &&
+    check(fs_create("/gs/tmp/granted", U, 0644u) == 0 &&
          fs_lookup("/gs/tmp/granted", &n) == 0 &&
          fs_getacl(&n, (struct acl *)&a) == 0, "uid 1000 makes another");
     a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
@@ -1596,6 +1596,71 @@ static void test_setgid_and_sticky_dirs(void) {
          fs_unlink("/gs/tmp/granted", S) == 0,
          "an explicit ACE_DELETE its owner grants uid 2000 still works in a "
          "sticky directory - the bit narrows the parent route only");
+
+    fs_unmount_volume(v);
+    free(image);
+}
+
+/* The mode a create/mkdir asks for is the mode it gets - its permission
+ * bits, plus sticky for a directory; setuid/setgid never come from a
+ * create. (umask is applied a layer up, in the syscalls.) */
+static void test_create_mode(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t n;
+    cred_t root;
+    const struct cred *R;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the create-mode test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+    check(fs_mount_at("/gm", v) == 0, "and it goes into the mount table");
+    cred_init_nobody(&root);
+    root.euid = 0;
+    R = (const struct cred *)&root;
+
+    check(fs_create("/gm/secret", R, 0600u) == 0 &&
+         fs_lookup("/gm/secret", &n) == 0 && n.mode == 0100600u,
+         "create with 0600 makes a 0600 regular file - not the fixed 0644 "
+         "it used to be");
+    check(fs_mkdir("/gm/private", R, 0700u) == 0 &&
+         fs_lookup("/gm/private", &n) == 0 && n.mode == 0040700u,
+         "mkdir with 0700 makes a 0700 directory - mkdir -m 700 is no "
+         "longer world-readable");
+    {
+        cred_t other;
+
+        cred_init_nobody(&other);
+        other.euid = 4242;
+        check(fs_access(&n, (const struct cred *)&other, ACE_READ_DATA) == -13,
+             "and a stranger really cannot list it");
+    }
+    check(fs_mkdir("/gm/tmp", R, 01777u) == 0 &&
+         fs_lookup("/gm/tmp", &n) == 0 && n.mode == 0041777u,
+         "mkdir keeps the sticky bit");
+    check(fs_create("/gm/suid", R, 04755u) == 0 &&
+         fs_lookup("/gm/suid", &n) == 0 && n.mode == 0100755u,
+         "create drops setuid - that comes from chmod, never a create");
+    check(fs_mkdir("/gm/sg", R, 02755u) == 0 &&
+         fs_lookup("/gm/sg", &n) == 0 && n.mode == 0040755u,
+         "mkdir drops a REQUESTED setgid too");
+    check(fs_chmod(&n, R, 02755u) == 0 &&
+         fs_mkdir("/gm/sg/child", R, 0700u) == 0 &&
+         fs_lookup("/gm/sg/child", &n) == 0 && n.mode == 0042700u,
+         "but a setgid PARENT still makes a child directory setgid, on "
+         "top of the mode it asked for");
 
     fs_unmount_volume(v);
     free(image);
@@ -1627,6 +1692,7 @@ int gnfs_run_tests(void) {
     test_acl_chmod_mode();
     test_chmod_special_bits();
     test_setgid_and_sticky_dirs();
+    test_create_mode();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

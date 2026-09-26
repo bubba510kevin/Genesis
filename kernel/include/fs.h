@@ -185,9 +185,14 @@ typedef struct fs_ops {
      * the right one - without it, every object gnfs made belonged to root
      * and chown was the only way a non-root user ever came to own a file.
      * NULL means the kernel itself, which is root's. A filesystem with no
-     * owners (FAT) ignores it. The same goes for mkdir below. */
+     * owners (FAT) ignores it. The same goes for mkdir below.
+     *
+     * `mode` is the new object's permission bits, already masked by the
+     * caller's umask and by fs_create/fs_mkdir's own limits (see there); the
+     * filesystem supplies the type. FAT, with no permission bits, ignores
+     * it too. */
     int (*create)(fs_volume_t *v, const char *abs_path,
-                  const struct cred *c);
+                  const struct cred *c, uint32 mode);
 
     /* Set a file's length - shorter or longer. Growing must make the new
      * bytes read as ZERO, which on a filesystem with no holes means really
@@ -199,7 +204,8 @@ typedef struct fs_ops {
      * wrapper for truncate(2). */
     int (*truncate)(fs_volume_t *v, fs_node_t *n, uint64 size);
 
-    int (*mkdir)(fs_volume_t *v, const char *abs_path, const struct cred *c);
+    int (*mkdir)(fs_volume_t *v, const char *abs_path, const struct cred *c,
+                 uint32 mode);
     int (*rmdir)(fs_volume_t *v, const char *abs_path);
     int (*unlink)(fs_volume_t *v, const char *abs_path);
     int (*rename)(fs_volume_t *v, const char *old_path, const char *new_path);
@@ -422,8 +428,13 @@ int64 fs_write(fs_node_t *n, uint64 offset, const void *buf, uint64 max);
  * directory (POSIX: write and search), or this is -EACCES - but an
  * existing name is -EEXIST first, so open(O_CREAT) of a file that is
  * already there never needs write on its directory. fs_mkdir is the same
- * with ACE_ADD_SUBDIRECTORY. */
-int fs_create(const char *abs_path, const struct cred *c);
+ * with ACE_ADD_SUBDIRECTORY.
+ *
+ * `mode` is the caller's requested mode with its umask already applied.
+ * Only the permission bits survive (plus S_ISVTX for mkdir, as on Linux):
+ * setuid and setgid come from chmod, which knows the object's group, or -
+ * for a directory's setgid - from a setgid parent, never from a create. */
+int fs_create(const char *abs_path, const struct cred *c, uint32 mode);
 
 /* Set the length of an already-resolved file. */
 int fs_truncate(fs_node_t *n, uint64 size);
@@ -493,7 +504,7 @@ int fs_chmod(fs_node_t *n, const struct cred *c, uint32 mode);
  * acl_chown_permitted refuses. The one place fs_ops_t::setowner is called. */
 int fs_setowner(fs_node_t *n, const struct cred *c, uint32 uid, uint32 gid);
 
-int fs_mkdir(const char *abs_path, const struct cred *c);
+int fs_mkdir(const char *abs_path, const struct cred *c, uint32 mode);
 /* Removal, for a non-NULL `c`, needs ACE_DELETE on the object OR
  * ACE_DELETE_CHILD + ACE_EXECUTE on its directory (the NFSv4 rule; for a
  * mode-only object, POSIX's write+search on the parent), else -EACCES; in

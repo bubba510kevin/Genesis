@@ -844,12 +844,12 @@ static void gnfs_creator_ids(gnfs_mount_t *m, uint64 parent_objnum,
 }
 
 static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
-                          const struct cred *c) {
+                          const struct cred *c, uint32 perm) {
     gnfs_mount_t *m = (gnfs_mount_t *)v->body;
     uint64 parent_objnum, leaf_len, new_objnum;
     const char *leaf;
     gnfs_onode_t *new_onode;
-    uint32 mode = 0100644u;              /* S_IFREG | rw-r--r-- */
+    uint32 mode = S_IFREG | (perm & 0777u);
     uint32 uid, gid;
     int rc;
 
@@ -878,13 +878,13 @@ static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
 }
 
 static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path,
-                         const struct cred *c) {
+                         const struct cred *c, uint32 perm) {
     gnfs_mount_t *m = (gnfs_mount_t *)v->body;
     uint64 parent_objnum, leaf_len, new_objnum, new_block;
     const char *leaf;
     uint8 block[GNFS_BLOCK_SIZE];
     gnfs_onode_t *new_onode;
-    uint32 mode = 0040755u;              /* S_IFDIR | rwxr-xr-x */
+    uint32 mode = S_IFDIR | (perm & (0777u | S_ISVTX));
     uint32 uid, gid;
     int rc;
 

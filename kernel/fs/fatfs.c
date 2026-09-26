@@ -242,10 +242,11 @@ static int fatfs_statfs(fs_volume_t *v, fs_statfs_t *out) {
 }
 
 static int fatfs_create(fs_volume_t *v, const char *abs_path,
-                        const struct cred *c) {
+                        const struct cred *c, uint32 mode) {
     fat_volume_t *vol = (fat_volume_t *)v->body;
 
     (void)c;                             /* FAT records no owner */
+    (void)mode;                          /* ...and no permission bits */
     return fat_to_errno(fat_create(vol, abs_path));
 }
 
@@ -273,8 +274,9 @@ static int fatfs_truncate(fs_volume_t *v, fs_node_t *n, uint64 size) {
 }
 
 static int fatfs_mkdir(fs_volume_t *v, const char *abs_path,
-                       const struct cred *c) {
+                       const struct cred *c, uint32 mode) {
     (void)c;                             /* FAT records no owner */
+    (void)mode;                          /* ...and no permission bits */
     return fat_to_errno(fat_mkdir((fat_volume_t *)v->body, abs_path));
 }
 
