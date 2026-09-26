@@ -1073,6 +1073,97 @@ static void test_creator_owns(void) {
     free(image);
 }
 
+/* Adding a name to a directory needs write AND search on that directory.
+ * Through fs_create/fs_mkdir - the path-shaped VFS entry points the
+ * syscalls use - so the volume is really mounted, not driven through its
+ * ops table the way the tests above are. */
+static void test_parent_write_check(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t n;
+    cred_t root, user, stranger;
+    const struct cred *R, *U, *S;
+    acl_t old_acl, new_acl;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the parent-check test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+    check(fs_mount_at("/gp", v) == 0, "and it goes into the mount table");
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+    cred_init_nobody(&user);
+    user.euid = 1000;
+    user.egid = 1000;
+    cred_init_nobody(&stranger);
+    stranger.euid = 2000;
+    stranger.egid = 2000;
+    R = (const struct cred *)&root;
+    U = (const struct cred *)&user;
+    S = (const struct cred *)&stranger;
+
+    check(fs_mkdir("/gp/pub", R) == 0, "root makes /gp/pub - root's, 0755");
+    check(fs_create("/gp/pub/a", U) == -13,
+         "uid 1000 may not create in a directory it cannot write");
+    check(fs_mkdir("/gp/pub/d", U) == -13,
+         "nor make a subdirectory there");
+    check(fs_lookup("/gp/pub/a", &n) == -2,
+         "and the refused create really left nothing behind");
+
+    check(fs_lookup("/gp/pub", &n) == 0 &&
+         fs_setowner(&n, R, 1000, 1000) == 0,
+         "root gives /gp/pub to uid 1000");
+    check(fs_create("/gp/pub/a", U) == 0,
+         "now its owner may create in it - the control for the refusal");
+    check(fs_mkdir("/gp/pub/d", U) == 0, "and make a subdirectory");
+    check(fs_create("/gp/pub/b", S) == -13,
+         "a stranger still may not - write on the parent is per-caller");
+
+    check(fs_create("/gp/pub/a", S) == -17,
+         "but O_CREAT on a name that already EXISTS answers -EEXIST, not "
+         "-EACCES - opening an existing file never needed the parent's "
+         "write bit");
+    check(fs_mkdir("/gp/pub/d", S) == -17,
+         "and mkdir of an existing name is -EEXIST too, as on Linux");
+
+    check(fs_create("/gp/pub/k", NULL) == 0,
+         "the kernel (NULL cred) is not asked");
+    check(fs_create("/gp/rootfile", R) == 0,
+         "root creates in a root-owned 0755 directory - acl_access's bypass");
+    check(fs_create("/gp/nope/x", U) == -2,
+         "a missing parent is -ENOENT, not a permission answer");
+
+    /* Write without search: -w- on a directory is not enough. */
+    check(fs_mkdir("/gp/nox", R) == 0 && fs_lookup("/gp/nox", &n) == 0 &&
+         fs_setowner(&n, R, 1000, 1000) == 0,
+         "root makes /gp/nox and gives it to uid 1000");
+    check(fs_getacl(&n, (struct acl *)&old_acl) == 0, "read its ACL");
+    acl_apply_chmod(&old_acl, 0040200u, &new_acl);  /* d-w------- */
+    check(fs_setacl(&n, U, (const struct acl *)&new_acl) == 0,
+         "its owner chmods it to 0200 - write, no search");
+    check(fs_create("/gp/nox/f", U) == -13,
+         "and then cannot create in it - POSIX wants w AND x");
+    acl_apply_chmod(&old_acl, 0040300u, &new_acl);  /* d-wx------ */
+    check(fs_setacl(&n, U, (const struct acl *)&new_acl) == 0 &&
+         fs_create("/gp/nox/f", U) == 0,
+         "with 0300 it can - the control");
+
+    fs_unmount_volume(v);
+    free(image);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -1093,6 +1184,7 @@ int gnfs_run_tests(void) {
     test_acl_end_to_end();
     test_chown_end_to_end();
     test_creator_owns();
+    test_parent_write_check();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

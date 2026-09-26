@@ -405,7 +405,13 @@ int64 fs_write(fs_node_t *n, uint64 offset, const void *buf, uint64 max);
 /* Create an empty regular file at an absolute path. Returns 0, -EEXIST,
  * -EROFS if the filesystem has no create slot, or whatever the filesystem
  * says. The parent must exist; this creates one name, not a path. `c` is
- * the creator (see fs_ops_t::create); NULL means the kernel. */
+ * the creator (see fs_ops_t::create); NULL means the kernel.
+ *
+ * A non-NULL `c` must hold ACE_ADD_FILE and ACE_EXECUTE on the parent
+ * directory (POSIX: write and search), or this is -EACCES - but an
+ * existing name is -EEXIST first, so open(O_CREAT) of a file that is
+ * already there never needs write on its directory. fs_mkdir is the same
+ * with ACE_ADD_SUBDIRECTORY. */
 int fs_create(const char *abs_path, const struct cred *c);
 
 /* Set the length of an already-resolved file. */

@@ -143,8 +143,13 @@ right where the work stopped):
 1b. ~~Creator ownership~~ — **DONE 2026-09-26**: `fs_ops_t::create`/`mkdir`
    take the creator's `cred`; gnfs records euid/egid. Found while doing it,
    all still open (ROADMAP.md, "THE CREATOR NOW OWNS WHAT IT CREATES"):
-   - **No parent-directory write check on create/mkdir** — anyone can create
-     anywhere. Most consequential; do this next.
+   - ~~No parent-directory write check on create/mkdir~~ — **DONE
+     2026-09-26** (`fs_may_add_entry`, vfs.c): w+x on the parent, -EEXIST
+     checked first. Side effect: non-root can't create on FAT (root-owned
+     0755 projection); nothing does today.
+   - **Deletion is still ungated** — `fs_unlink`/`fs_rmdir` take no cred;
+     anyone can delete anything. Same class of hole; do this next
+     (ACE_DELETE on the object OR ACE_DELETE_CHILD on the parent).
    - chmod can't set/clear suid/sgid/sticky on gnfs (carried from old mode).
    - open(O_CREAT)/mkdir(2) mode argument still ignored (fixed 0644/0755).
    - setgid-directory group inheritance waits on the chmod fix.

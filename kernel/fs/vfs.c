@@ -2,6 +2,7 @@
 #include "acl.h"
 #include "pcache.h"
 #include "kheap.h"
+#include "path.h"
 #include "typesk.h"
 
 /* The generic half of the filesystem layer: one mounted volume, and the
@@ -418,6 +419,62 @@ static int fs_is_mount_point(const char *abs_path) {
  * a filesystem sees mkdir("/x") whether it is mounted at / or at /mnt/usb.
  */
 
+/* May `c` add a new name to the directory that would hold `abs_path`?
+ * `wanted` is ACE_ADD_FILE for create, ACE_ADD_SUBDIRECTORY for mkdir, and
+ * ACE_EXECUTE is always added to it: POSIX asks for write AND search on the
+ * parent, and NFSv4/NT reach the same answer (a directory you cannot
+ * traverse is one you cannot name a child of). Both are the same bits
+ * acl_from_mode derives from a directory's w and x, so a plain mode-only
+ * directory answers exactly as POSIX would.
+ *
+ * Asked of the PARENT, resolved through fs_lookup rather than through the
+ * volume the child lands on, so a mount point is judged by the directory
+ * actually being written into. NULL `c` is the kernel and is not asked.
+ *
+ * Callers check for an existing name FIRST. open(O_CREAT) on a file that
+ * already exists must not need write access to its directory - that is how
+ * a user opens their own file in a directory they cannot add to - and
+ * mkdir of an existing name answers -EEXIST on Linux regardless. */
+static int fs_may_add_entry(const char *abs_path, const struct cred *c,
+                            uint32 wanted) {
+    char parent[PATH_MAX_LEN];
+    fs_node_t pn;
+    uint64 len = 0, slash = 0, i;
+    int rc;
+
+    if (c == NULL) {
+        return 0;
+    }
+    while (abs_path[len] != '\0') {
+        len++;
+    }
+    if (len == 0 || len >= sizeof(parent)) {
+        return -36;                            /* -ENAMETOOLONG */
+    }
+    /* A trailing slash names the same entry ("mkdir /a/b/"), not a child
+     * of it; the root itself has no parent to add to. */
+    while (len > 1 && abs_path[len - 1] == '/') {
+        len--;
+    }
+    for (i = 0; i < len; i++) {
+        parent[i] = abs_path[i];
+        if (abs_path[i] == '/') {
+            slash = i;
+        }
+    }
+    /* "/x" -> "/", "/a/b" -> "/a". */
+    parent[slash == 0 ? 1 : slash] = '\0';
+
+    rc = fs_lookup(parent, &pn);
+    if (rc != 0) {
+        return rc;
+    }
+    if (!pn.is_dir) {
+        return -20;                            /* -ENOTDIR */
+    }
+    return fs_access(&pn, c, wanted | ACE_EXECUTE);
+}
+
 int fs_mkdir(const char *abs_path, const struct cred *c) {
     fs_volume_t *v;
     const char *rel = NULL;
@@ -432,6 +489,18 @@ int fs_mkdir(const char *abs_path, const struct cred *c) {
     }
     if (v->ops->mkdir == NULL) {
         return -30;                     /* -EROFS */
+    }
+    if (c != NULL) {
+        fs_node_t existing;
+
+        if (fs_lookup(abs_path, &existing) == 0) {
+            return -17;                 /* -EEXIST, before any permission
+                                         * question - see fs_may_add_entry */
+        }
+        rc = fs_may_add_entry(abs_path, c, ACE_ADD_SUBDIRECTORY);
+        if (rc != 0) {
+            return rc;
+        }
     }
     return v->ops->mkdir(v, rel, c);
 }
@@ -487,6 +556,18 @@ int fs_create(const char *abs_path, const struct cred *c) {
     }
     if (v->ops->create == NULL) {
         return -30;                     /* -EROFS */
+    }
+    if (c != NULL) {
+        fs_node_t existing;
+
+        if (fs_lookup(abs_path, &existing) == 0) {
+            return -17;                 /* -EEXIST, before any permission
+                                         * question - see fs_may_add_entry */
+        }
+        rc = fs_may_add_entry(abs_path, c, ACE_ADD_FILE);
+        if (rc != 0) {
+            return rc;
+        }
     }
     return v->ops->create(v, rel, c);
 }
