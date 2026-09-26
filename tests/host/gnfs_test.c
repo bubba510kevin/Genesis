@@ -1,0 +1,1003 @@
+/* Host tests for gnfs: the pure logic in kernel/gnfs/gnfs_format.c and
+ * kernel/gnfs/gnfs_object.c directly, and the device-facing mount/commit
+ * ring and object layer in kernel/gnfs/gnfs_vfs.c through
+ * tests/host/dev_stub.c's fake device_t - the same device_t fatfs's own
+ * tests already mount through, so this suite exercises the real dev_read/
+ * dev_write path rather than a stand-in for it.
+ *
+ * Two properties matter more than "it works" here. One: a torn write during
+ * a commit still leaves a mountable volume - the entire argument
+ * kernel/include/gnfs_layout.h makes for the ring shape. Two: every
+ * committed change - a create, a write, an unlink - actually reaches the
+ * medium, checked by tearing the mount down and remounting from the same
+ * bytes rather than trusting an in-memory view that might never have been
+ * written back at all.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "acl.h"
+#include "dev_stub.h"
+#include "gnfs_dev.h"
+#include "gnfs_layout.h"
+
+static int failures;
+
+static void check(int cond, const char *what) {
+    if (!cond) {
+        printf("  FAIL  %s\n", what);
+        failures++;
+    }
+}
+
+/* --- pure logic: checksum, root records, the bitmap ------------------------ */
+
+static void test_checksum_is_sensitive(void) {
+    uint8 a[16], b[16];
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        a[i] = (uint8)i;
+        b[i] = (uint8)i;
+    }
+    check(gnfs_checksum(a, 16) == gnfs_checksum(b, 16),
+         "identical buffers checksum the same");
+
+    b[7] ^= 0x01;
+    check(gnfs_checksum(a, 16) != gnfs_checksum(b, 16),
+         "one flipped bit must change the checksum");
+}
+
+/* A plausible root record for the pure tests below, sharing exactly one
+ * construction rather than each test hand-rolling gnfs_root_init's argument
+ * list - which matters here because gnfs_root_valid checks max_objects and
+ * obj_table_blocks against the compiled-in constants, so a stray literal in
+ * one test would fail for a reason that has nothing to do with what it is
+ * testing. */
+static void make_test_root(gnfs_root_t *r) {
+    gnfs_root_init(r, 1000, GNFS_RING_SLOTS, 4,
+                   GNFS_RING_SLOTS + 8, GNFS_OBJ_TABLE_BLOCKS,
+                   GNFS_MAX_OBJECTS, GNFS_ROOT_DIR_OBJNUM);
+}
+
+static void test_root_seal_and_valid(void) {
+    gnfs_root_t r;
+
+    make_test_root(&r);
+    check(gnfs_root_valid(&r), "a freshly-initialised root must be valid");
+
+    r.magic ^= 1;
+    check(!gnfs_root_valid(&r), "a corrupted magic must be rejected");
+    r.magic ^= 1;
+    check(gnfs_root_valid(&r), "un-corrupting it must make it valid again");
+
+    r.version = GNFS_VERSION + 1;
+    check(!gnfs_root_valid(&r), "an unrecognised version must be rejected");
+    r.version = GNFS_VERSION;
+
+    r.max_objects = GNFS_MAX_OBJECTS + 1;
+    check(!gnfs_root_valid(&r),
+         "an object-table capacity that disagrees with this build's "
+         "GNFS_MAX_OBJECTS must be refused, not silently trusted");
+    r.max_objects = GNFS_MAX_OBJECTS;
+
+    r.txg = 42;
+    check(!gnfs_root_valid(&r),
+         "changing a field WITHOUT resealing must be caught by the checksum - "
+         "this is the whole point of gnfs_root_valid recomputing rather than "
+         "trusting the stored value");
+    gnfs_root_seal(&r);
+    check(gnfs_root_valid(&r), "resealing after a legitimate change must pass");
+}
+
+static void test_layout_helpers_agree_with_format(void) {
+    gnfs_root_t r;
+
+    make_test_root(&r);
+    check(gnfs_bitmap_region_a(&r) == GNFS_RING_SLOTS,
+         "bitmap region A starts right after the ring");
+    check(gnfs_bitmap_region_b(&r) == GNFS_RING_SLOTS + r.bitmap_blocks,
+         "bitmap region B starts right after region A");
+    check(gnfs_obj_table_region_a(&r) ==
+         GNFS_RING_SLOTS + r.bitmap_blocks * 2,
+         "object-table region A starts right after both bitmap regions");
+    check(gnfs_alloc_region_start(&r) ==
+         gnfs_obj_table_region_a(&r) + r.obj_table_blocks * 2,
+         "the allocatable region starts right after both object-table "
+         "regions");
+}
+
+static void test_bitmap_alloc_first_fit(void) {
+    uint64 total = 100;
+    uint8 *bm = (uint8 *)calloc(1, (size_t)gnfs_bitmap_bytes(total));
+    uint64 a, b, c;
+
+    check(gnfs_alloc_blocks(bm, total, 10, &a) == 0 && a == 0,
+         "first allocation must land at block 0 on an empty bitmap");
+    check(gnfs_alloc_blocks(bm, total, 5, &b) == 0 && b == 10,
+         "second allocation must land right after the first (first-fit)");
+
+    gnfs_free_blocks(bm, total, 0, 10);
+    check(!gnfs_bitmap_test(bm, 0) && !gnfs_bitmap_test(bm, 9),
+         "freed blocks must read as free again");
+    check(gnfs_bitmap_test(bm, 10),
+         "freeing [0,10) must not disturb the allocation at 10 - a control "
+         "for the case above");
+
+    check(gnfs_alloc_blocks(bm, total, 10, &c) == 0 && c == 0,
+         "the freed run must be reused rather than skipped");
+
+    {
+        uint64 huge;
+        check(gnfs_alloc_blocks(bm, total, 1000, &huge) == -28,
+             "an allocation bigger than the whole bitmap must return -ENOSPC");
+    }
+
+    free(bm);
+}
+
+/* --- pure logic: onodes -------------------------------------------------- */
+
+static void test_onode_init_and_access(void) {
+    static uint8 table[(uint64)GNFS_OBJ_TABLE_BLOCKS * GNFS_BLOCK_SIZE];
+    gnfs_onode_t *o;
+
+    check(gnfs_onode_at(table, 0) == NULL,
+         "object number 0 must never resolve - it means \"no object\"");
+    check(gnfs_onode_at(table, GNFS_MAX_OBJECTS) == NULL,
+         "an out-of-range object number must be refused, not read past the "
+         "table");
+
+    o = gnfs_onode_at(table, 5);
+    check(o != NULL, "an in-range object number must resolve");
+    gnfs_onode_init(o, 0100644u, 42, 7);
+    check(o->mode == 0100644u && o->uid == 42 && o->gid == 7 &&
+         o->size == 0 && o->nblocks == 0,
+         "a freshly initialised onode has the identity it was given and no "
+         "data yet");
+}
+
+static void test_onode_alloc_is_monotonic_and_bounded(void) {
+    gnfs_root_t r;
+    uint64 a, b, c;
+
+    make_test_root(&r);
+    check(gnfs_onode_alloc(&r, &a) == 0 && a == GNFS_ROOT_DIR_OBJNUM + 1,
+         "the first allocation after format must be the object right after "
+         "the root directory");
+    check(gnfs_onode_alloc(&r, &b) == 0 && b == a + 1,
+         "allocations are monotonic, never reused in this foundation");
+
+    r.next_objnum = GNFS_MAX_OBJECTS;
+    check(gnfs_onode_alloc(&r, &c) == -28,
+         "allocating past GNFS_MAX_OBJECTS must return -ENOSPC");
+}
+
+/* --- pure logic: directory entries --------------------------------------- */
+
+static void test_directory_entries(void) {
+    static uint8 block[GNFS_BLOCK_SIZE];
+    uint64 objnum;
+    int is_dir;
+
+    gnfs_dir_init_block(block);
+    check(gnfs_dir_find(block, "x", 1, &objnum, &is_dir) == -2,
+         "a fresh block has nothing in it");
+
+    check(gnfs_dir_add(block, "hello", 5, 10, 0) == 0,
+         "adding an entry must succeed");
+    check(gnfs_dir_add(block, "hello", 5, 11, 0) == -17,
+         "adding the same name twice must be -EEXIST, not silently replace "
+         "it");
+    check(gnfs_dir_find(block, "hello", 5, &objnum, &is_dir) == 0 &&
+         objnum == 10 && !is_dir,
+         "the entry must read back exactly what was added");
+
+    check(gnfs_dir_add(block, "sub", 3, 12, 1) == 0,
+         "a second, distinct entry must also succeed");
+    check(gnfs_dir_remove(block, "hello", 5) == 0,
+         "removing an existing entry must succeed");
+    check(gnfs_dir_find(block, "hello", 5, &objnum, &is_dir) == -2,
+         "a removed entry must no longer be found");
+    check(gnfs_dir_find(block, "sub", 3, &objnum, &is_dir) == 0 &&
+         objnum == 12 && is_dir,
+         "removing one entry must not disturb another - a control for the "
+         "case above");
+
+    check(gnfs_dir_add(block, "hello", 5, 99, 0) == 0,
+         "the hole left by a removed entry must be reusable");
+}
+
+typedef struct {
+    int count;
+} iter_ctx_t;
+
+static int iter_count_cb(const char *name, uint64 name_len, uint64 objnum,
+                         int is_dir, void *ctx) {
+    (void)name; (void)name_len; (void)objnum; (void)is_dir;
+    ((iter_ctx_t *)ctx)->count++;
+    return 0;
+}
+
+static void test_directory_iterate_and_full(void) {
+    static uint8 block[GNFS_BLOCK_SIZE];
+    iter_ctx_t ic;
+    uint64 i;
+
+    gnfs_dir_init_block(block);
+    ic.count = 0;
+    gnfs_dir_iterate(block, iter_count_cb, &ic);
+    check(ic.count == 0, "an empty directory iterates zero times");
+
+    for (i = 0; i < GNFS_DIRENTS_PER_BLOCK; i++) {
+        char name[2];
+        int rc;
+
+        name[0] = (char)('a' + (i % 26));
+        name[1] = (char)('0' + (i / 26));
+        rc = gnfs_dir_add(block, name, 2, i + 1, 0);
+        check(rc == 0, "filling every slot in the block must succeed");
+    }
+    ic.count = 0;
+    gnfs_dir_iterate(block, iter_count_cb, &ic);
+    check((uint64)ic.count == GNFS_DIRENTS_PER_BLOCK,
+         "iterating a full directory must visit every entry exactly once");
+
+    check(gnfs_dir_add(block, "zz", 2, 999, 0) == -28,
+         "a directory with every slot taken must refuse a new entry with "
+         "-ENOSPC, not silently drop an existing one");
+}
+
+/* --- pure logic: ACL inheritance and chmod --------------------------------- */
+
+static void test_acl_inherit(void) {
+    acl_t parent;
+    acl_t child;
+
+    acl_from_mode(0040755u, 10, 10, &parent);
+
+    /* An entry inheritable to both files and directories, one to files
+     * only, and one marked NO_PROPAGATE - three different fates below. */
+    parent.ace[parent.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    parent.ace[parent.count].flags = ACE_FILE_INHERIT_ACE |
+                                     ACE_DIRECTORY_INHERIT_ACE;
+    parent.ace[parent.count].mask  = ACE_READ_DATA;
+    parent.ace[parent.count].who   = 1001;
+    parent.count++;
+
+    parent.ace[parent.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    parent.ace[parent.count].flags = ACE_FILE_INHERIT_ACE;
+    parent.ace[parent.count].mask  = ACE_WRITE_DATA;
+    parent.ace[parent.count].who   = 1002;
+    parent.count++;
+
+    parent.ace[parent.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    parent.ace[parent.count].flags = ACE_DIRECTORY_INHERIT_ACE |
+                                     ACE_NO_PROPAGATE_INHERIT_ACE;
+    parent.ace[parent.count].mask  = ACE_EXECUTE;
+    parent.ace[parent.count].who   = 1003;
+    parent.count++;
+
+    acl_inherit(&parent, /* child_is_dir */ 0, 0100644u, 20, 20, &child);
+    check(!child.trivial, "a child that inherited real entries is not "
+         "trivial");
+    check(child.count == 3 + 2,
+         "a FILE child inherits the both-inheritable entry and the "
+         "file-only one, not the directory-only NO_PROPAGATE one");
+    check(child.ace[3].who == 1001 &&
+         (child.ace[3].flags & ACE_INHERIT_ONLY_ACE) == 0 &&
+         (child.ace[3].flags & ACE_INHERITED_ACE) != 0,
+         "the inherited entry is effective (not inherit-only) and marked "
+         "as inherited");
+    check((child.ace[3].flags &
+          (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) == 0,
+         "a FILE cannot have descendants, so the copy's own inherit bits "
+         "are cleared - it must not propagate again");
+    check(child.ace[4].who == 1002,
+         "the file-only inheritable entry is the second one copied");
+
+    acl_inherit(&parent, /* child_is_dir */ 1, 0040755u, 20, 20, &child);
+    check(child.count == 3 + 2,
+         "a DIRECTORY child inherits the both-inheritable entry and the "
+         "NO_PROPAGATE one (which still applies to this level), not the "
+         "file-only one");
+    check(child.ace[3].who == 1001 &&
+         (child.ace[3].flags &
+          (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) != 0,
+         "a directory CAN have descendants, so an entry with no "
+         "NO_PROPAGATE keeps its inherit bits and keeps propagating");
+    check(child.ace[4].who == 1003 &&
+         (child.ace[4].flags &
+          (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) == 0,
+         "NO_PROPAGATE means exactly one level - even a directory child's "
+         "copy loses the inherit bits");
+
+    {
+        acl_t bare;
+        acl_t nothing_inherited;
+
+        acl_from_mode(0040755u, 10, 10, &bare);
+        acl_inherit(&bare, 0, 0100644u, 20, 20, &nothing_inherited);
+        check(nothing_inherited.trivial && nothing_inherited.count == 3,
+             "a parent with nothing inheritable produces exactly the plain "
+             "mode projection - not an empty ACL and not the parent's own");
+    }
+
+    {
+        acl_t from_root;
+
+        acl_inherit(NULL, 0, 0100644u, 20, 20, &from_root);
+        check(from_root.trivial && from_root.count == 3,
+             "no parent at all (a filesystem root) is the same as nothing "
+             "inheritable");
+    }
+}
+
+static void test_acl_apply_chmod(void) {
+    acl_t old, new_acl;
+
+    acl_from_mode(0100644u, 5, 5, &old);
+    /* A named grant chmod has no way to express or take away. */
+    old.ace[old.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    old.ace[old.count].flags = 0;
+    old.ace[old.count].mask  = ACE_READ_DATA;
+    old.ace[old.count].who   = 9001;
+    old.count++;
+    old.trivial = 0;
+
+    acl_apply_chmod(&old, 0100600u, &new_acl);
+    check(new_acl.count == 4, "chmod does not add or remove entries");
+    check(new_acl.ace[3].who == 9001 &&
+         new_acl.ace[3].mask == ACE_READ_DATA,
+         "the named grant chmod cannot express survives completely "
+         "untouched");
+    {
+        uint32 owner_mode = acl_to_mode(&new_acl, 0100000u);
+        check((owner_mode & 0700) == 0600u,
+             "the owner class now matches the new mode (0600 -> rw-)");
+    }
+
+    acl_apply_chmod(&old, 0100755u, &new_acl);
+    {
+        uint32 m = acl_to_mode(&new_acl, 0100000u);
+        check((m & 0777) == 0755u,
+             "a second chmod to a different mode overwrites the rewritten "
+             "classes again rather than accumulating");
+    }
+    check(new_acl.ace[3].who == 9001,
+         "and still leaves the named grant alone");
+
+    {
+        acl_t missing_owner;
+        acl_t fallback;
+
+        acl_from_mode(0100644u, 7, 7, &missing_owner);
+        missing_owner.ace[0].flags |= ACE_INHERIT_ONLY_ACE;  /* owner@ no
+                                                              * longer
+                                                              * effective */
+        acl_apply_chmod(&missing_owner, 0100755u, &fallback);
+        check(fallback.owner == 7 && fallback.group == 7,
+             "when the shape this function expects is not there, it falls "
+             "back to a plain projection rather than guessing");
+    }
+}
+
+/* chown's gate, as pure logic. Every refusal is paired with the one change
+ * that flips it, for the reason acl_selftest.c gives: a gate that only ever
+ * saw allow-cases would pass these tests while granting everything. */
+static void test_acl_chown_permitted(void) {
+    acl_t a;
+    cred_t owner, stranger, root, supreme;
+
+    acl_from_mode(0100644u, 100, 200, &a);   /* owned by 100, group 200 */
+
+    cred_init_nobody(&owner);
+    owner.euid = 100;
+    owner.egid = 200;
+    owner.groups[0] = 300;
+    owner.ngroups = 1;
+
+    cred_init_nobody(&stranger);
+    stranger.euid = 555;
+    stranger.egid = 300;
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+
+    cred_init_nobody(&supreme);
+    supreme.euid = 4242;
+    supreme.supreme = 1;
+
+    /* The distinction this whole function exists for. */
+    check(acl_access(&a, &owner, ACE_WRITE_ACL) == 0,
+         "the owner holds WRITE_ACL (the precondition: chmod is its right)");
+    check(acl_chown_permitted(&a, &owner, 555, ACL_CHOWN_KEEP) == -1,
+         "and still may NOT give the file away - chown is not chmod");
+    check(acl_chown_permitted(&a, &root, 555, ACL_CHOWN_KEEP) == 0,
+         "root may");
+    check(acl_chown_permitted(&a, &supreme, 555, 999) == 0,
+         "and so may the supreme uid, to any pair at all");
+
+    check(acl_chown_permitted(&a, &owner, ACL_CHOWN_KEEP, 300) == 0,
+         "the owner may chgrp into a supplementary group it is in");
+    check(acl_chown_permitted(&a, &owner, ACL_CHOWN_KEEP, 301) == -1,
+         "but not into a group it is not in");
+    check(acl_chown_permitted(&a, &owner, 100, 200) == 0 &&
+         acl_chown_permitted(&a, &stranger, ACL_CHOWN_KEEP,
+                             ACL_CHOWN_KEEP) == 0,
+         "a request that changes nothing is permitted to anyone");
+    check(acl_chown_permitted(&a, &stranger, ACL_CHOWN_KEEP, 300) == -1,
+         "a non-owner without WRITE_OWNER may not chgrp, even into its own "
+         "group");
+
+    /* An explicit WRITE_OWNER grant: take, never give. */
+    a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[a.count].flags = 0;
+    a.ace[a.count].mask  = ACE_WRITE_OWNER;
+    a.ace[a.count].who   = 555;
+    a.count++;
+    a.trivial = 0;
+    check(acl_chown_permitted(&a, &stranger, 555, ACL_CHOWN_KEEP) == 0,
+         "a WRITE_OWNER holder may take ownership for itself");
+    check(acl_chown_permitted(&a, &stranger, 777, ACL_CHOWN_KEEP) == -1,
+         "but may not hand it to a third uid");
+    check(acl_chown_permitted(&a, &stranger, 555, 300) == 0,
+         "and may take it into a group it is in in the same call");
+    check(acl_chown_permitted(&a, &stranger, 555, 201) == -1,
+         "but not into one it is not in");
+
+    /* A deny placed ahead binds WRITE_OWNER like any other bit. */
+    a.ace[3] = a.ace[2];
+    a.ace[2].type  = ACE_ACCESS_DENIED_ACE_TYPE;
+    a.ace[2].flags = 0;
+    a.ace[2].mask  = ACE_WRITE_OWNER;
+    a.ace[2].who   = 555;
+    a.ace[4].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[4].flags = 0;
+    a.ace[4].mask  = ACE_WRITE_OWNER;
+    a.ace[4].who   = 555;
+    a.count = 5;
+    check(acl_chown_permitted(&a, &stranger, 555, ACL_CHOWN_KEEP) == -1,
+         "a DENY of WRITE_OWNER ahead of the grant takes it away");
+    check(acl_chown_permitted(&a, &supreme, 555, ACL_CHOWN_KEEP) == 0,
+         "and does not bind supreme, the same as every other deny");
+}
+
+/* --- device-facing: format, mount, and the commit ring --------------------- */
+
+typedef struct {
+    uint8 *buf;
+    uint64 len;
+} mem_ctx_t;
+
+static int64 mem_write(void *ctx, uint64 offset, const void *data,
+                       uint64 len) {
+    mem_ctx_t *m = (mem_ctx_t *)ctx;
+    if (offset + len > m->len) {
+        return -28;
+    }
+    memcpy(m->buf + offset, data, (size_t)len);
+    return (int64)len;
+}
+
+static void test_format_mount_and_commit_ring(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;   /* 1 MiB - plenty for the ring,
+                                             * two bitmap regions and two
+                                             * object-table regions */
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    gnfs_root_t cur;
+    uint8 *bitmap;
+    uint8 *obj_table;
+    uint64 bitmap_bytes, obj_table_bytes;
+    unsigned i;
+    uint64 corrupt_offset;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "gnfs_format must succeed on a plausibly-sized image");
+
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "gnfs_probe must recognise a freshly formatted image");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+
+    /* v->body is a gnfs_mount_t*, but that type is private to gnfs_vfs.c -
+     * this test only needs the root record. Read it back the same way
+     * gnfs_probe itself found it: scan the ring directly through dev_read,
+     * which is public and exactly what a second, independent check should
+     * use rather than reaching into gnfs_vfs.c's static state. */
+    {
+        int slot;
+        int found = 0;
+        gnfs_root_t r;
+
+        for (slot = 0; slot < (int)GNFS_RING_SLOTS; slot++) {
+            if (dev_read(&dev, (uint64)slot * GNFS_BLOCK_SIZE, &r,
+                        sizeof(r)) == (int64)sizeof(r) &&
+                gnfs_root_valid(&r)) {
+                if (!found || r.txg > cur.txg) {
+                    cur = r;
+                    found = 1;
+                }
+            }
+        }
+        check(found && cur.txg == 1,
+             "the only valid ring slot right after formatting must be txg 1");
+    }
+
+    bitmap_bytes    = cur.bitmap_blocks * (uint64)GNFS_BLOCK_SIZE;
+    obj_table_bytes = cur.obj_table_blocks * (uint64)GNFS_BLOCK_SIZE;
+    bitmap    = (uint8 *)calloc(1, (size_t)bitmap_bytes);
+    obj_table = (uint8 *)calloc(1, (size_t)obj_table_bytes);
+
+    /* Commit past the ring's own length, so this exercises slot reuse - the
+     * exact property the crash-safety argument depends on - not just the
+     * first few, never-recycled slots. The all-zero bitmap/object-table
+     * content committed here is fine for this test: it is checking the ring
+     * mechanism, not file content, and this device is discarded afterwards -
+     * see test_object_layer_end_to_end for content correctness through the
+     * real fs_ops_t. */
+    for (i = 0; i < GNFS_RING_SLOTS + 2; i++) {
+        uint64 prev_txg = cur.txg;
+        int rc = gnfs_txg_commit(&dev, &cur, bitmap, bitmap_bytes,
+                                obj_table, obj_table_bytes);
+
+        check(rc == 0, "each commit in the ring must succeed");
+        check(cur.txg == prev_txg + 1,
+             "a commit must advance txg by exactly one");
+    }
+
+    /* --- the property that matters: a torn write to the NEWEST slot must
+     * not take the whole volume down with it -------------------------------
+     *
+     * cur is currently the highest txg committed (call it T, in slot
+     * T % GNFS_RING_SLOTS). Corrupt exactly that slot - simulating a commit
+     * that started overwriting it and was cut off mid-write - and confirm a
+     * fresh scan falls back to the next-highest STILL-VALID txg, which lives
+     * in a different slot the corruption never touched, rather than either
+     * accepting torn data or reporting no valid volume at all. */
+    corrupt_offset = (cur.txg % GNFS_RING_SLOTS) * GNFS_BLOCK_SIZE;
+    memset(image + corrupt_offset, 0xFF, 37);   /* an arbitrary partial-write
+                                                 * length, not a whole record */
+    {
+        int slot;
+        gnfs_root_t r;
+        gnfs_root_t best;
+        int found = 0;
+
+        for (slot = 0; slot < (int)GNFS_RING_SLOTS; slot++) {
+            if (dev_read(&dev, (uint64)slot * GNFS_BLOCK_SIZE, &r,
+                        sizeof(r)) == (int64)sizeof(r) &&
+                gnfs_root_valid(&r)) {
+                if (!found || r.txg > best.txg) {
+                    best = r;
+                    found = 1;
+                }
+            }
+        }
+        check(found,
+             "after corrupting the newest ring slot, the scan must still "
+             "find AN older valid record - the entire point of a ring "
+             "rather than a single root");
+        check(found && best.txg == cur.txg - 1,
+             "and it must be exactly the commit before the corrupted one - "
+             "the newest surviving txg, not an arbitrary older one");
+    }
+
+    v->ops->unmount(v);
+    free(obj_table);
+    free(bitmap);
+    free(image);
+}
+
+/* --- device-facing: the object layer through the real fs_ops_t ------------ */
+
+static void test_object_layer_end_to_end(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t root_node, file_node, dir_node;
+    int rc;
+    uint8 buf[64];
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the object-layer test must succeed");
+
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting the freshly formatted image must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+
+    rc = v->ops->lookup(v, "/", &root_node);
+    check(rc == 0 && root_node.is_dir,
+         "the root must resolve and be a directory");
+    check(root_node.size == GNFS_BLOCK_SIZE,
+         "a freshly formatted root's directory data is exactly one block");
+
+    rc = v->ops->create(v, "/hello.txt");
+    check(rc == 0, "creating a file must succeed");
+    rc = v->ops->create(v, "/hello.txt");
+    check(rc == -17, "creating the same name twice must be -EEXIST");
+
+    rc = v->ops->lookup(v, "/hello.txt", &file_node);
+    check(rc == 0 && !file_node.is_dir && file_node.size == 0,
+         "a freshly created file must resolve, be a file, and be empty");
+
+    {
+        const char *msg = "hello, gnfs";
+        int64 wrc = v->ops->write(v, &file_node, 0, msg, 11);
+        check(wrc == 11, "writing 11 bytes must report 11 bytes written");
+    }
+    rc = v->ops->lookup(v, "/hello.txt", &file_node);
+    check(rc == 0 && file_node.size == 11,
+         "the size must be visible after a re-lookup, not just on the node "
+         "the write happened to use");
+
+    {
+        int64 rrc = v->ops->read(v, &file_node, 0, buf, sizeof(buf));
+        check(rrc == 11, "reading back must return exactly what was written");
+        check(memcmp(buf, "hello, gnfs", 11) == 0,
+             "and the bytes must match");
+    }
+
+    {
+        /* A write past the current end must zero-fill the gap - the exact
+         * lesson kernel/fs/fat.c's own write path had to learn (see
+         * tests/host/fat_write_test.c), applied here on first principles
+         * rather than re-learned the same way. */
+        int64 wrc = v->ops->write(v, &file_node, 4096 + 10, "TAIL", 4);
+        check(wrc == 4, "a write past the first block must still succeed");
+
+        {
+            uint8 gap[16];
+            int64 rrc = v->ops->read(v, &file_node, 11, gap, sizeof(gap));
+            int all_zero = 1;
+            int k;
+
+            check(rrc == (int64)sizeof(gap),
+                 "reading across the gap must return every byte requested");
+            for (k = 0; k < (int)sizeof(gap); k++) {
+                if (gap[k] != 0) {
+                    all_zero = 0;
+                }
+            }
+            check(all_zero,
+                 "every byte of the gap between the two writes must read "
+                 "as zero");
+        }
+    }
+
+    rc = v->ops->mkdir(v, "/sub");
+    check(rc == 0, "creating a directory must succeed");
+    rc = v->ops->lookup(v, "/sub", &dir_node);
+    check(rc == 0 && dir_node.is_dir,
+         "the new directory must resolve as a directory");
+
+    rc = v->ops->create(v, "/sub/inner.txt");
+    check(rc == 0, "creating a file inside the new directory must succeed");
+    {
+        fs_node_t inner;
+        rc = v->ops->lookup(v, "/sub/inner.txt", &inner);
+        check(rc == 0,
+             "a nested path must resolve through more than one directory "
+             "level");
+    }
+
+    rc = v->ops->rmdir(v, "/sub");
+    check(rc == -39, "rmdir on a non-empty directory must be -ENOTEMPTY");
+    rc = v->ops->unlink(v, "/sub/inner.txt");
+    check(rc == 0, "unlinking the file inside it must succeed");
+    rc = v->ops->rmdir(v, "/sub");
+    check(rc == 0, "rmdir must now succeed once the directory is empty");
+    rc = v->ops->lookup(v, "/sub", &dir_node);
+    check(rc == -2, "the removed directory must no longer resolve");
+
+    rc = v->ops->unlink(v, "/hello.txt");
+    check(rc == 0, "unlinking the file must succeed");
+    rc = v->ops->lookup(v, "/hello.txt", &file_node);
+    check(rc == -2, "the unlinked file must no longer resolve");
+
+    v->ops->unmount(v);
+
+    /* Re-mount from scratch and confirm every committed change actually
+     * reached the medium - the same proof test_format_mount_and_commit_ring
+     * already applies to the ring alone, now applied to real file content.
+     * An in-memory-only "delete" that never made it to the bytes below would
+     * pass every check above and still fail this one. */
+    {
+        device_t dev2;
+        dev_stub_t stub2;
+        fs_volume_t *v2;
+        fs_node_t n2;
+
+        dev_stub_attach(&dev2, &stub2, image, image_bytes);
+        v2 = gnfs_probe(&dev2);
+        check(v2 != NULL, "the volume must remount after every operation "
+             "above");
+        if (v2 != NULL) {
+            rc = v2->ops->lookup(v2, "/hello.txt", &n2);
+            check(rc == -2,
+                 "the unlink must have survived a fresh mount, not just "
+                 "lived in memory");
+            v2->ops->unmount(v2);
+        }
+    }
+
+    free(image);
+}
+
+/* --- device-facing: the ACL write path, storage, inheritance, and real
+ * enforcement through the real fs_ops_t ------------------------------------- */
+
+static void test_acl_end_to_end(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t secure_node, plain_node, child_node, grandchild_node;
+    acl_t acl_out;
+    int rc;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the ACL test must succeed");
+
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting the freshly formatted image must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+
+    rc = v->ops->create(v, "/plain.txt");
+    check(rc == 0, "creating a plain file must succeed");
+    rc = v->ops->lookup(v, "/plain.txt", &plain_node);
+    check(rc == 0, "the plain file must resolve");
+    rc = v->ops->getacl(v, &plain_node, &acl_out);
+    check(rc == -2,
+         "a freshly created file with nothing inherited has no stored ACL - "
+         "getacl answers -ENOENT, the convention every filesystem here "
+         "follows; fs_getacl one layer up is what actually projects the "
+         "mode for a caller, not tested again here");
+
+    rc = v->ops->mkdir(v, "/secure");
+    check(rc == 0, "creating the directory to hold an inheritable ACL must "
+         "succeed");
+    rc = v->ops->lookup(v, "/secure", &secure_node);
+    check(rc == 0, "it must resolve");
+
+    {
+        acl_t custom;
+
+        acl_from_mode(0040750u, 0, 0, &custom);
+        custom.ace[custom.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+        custom.ace[custom.count].flags = ACE_FILE_INHERIT_ACE |
+                                         ACE_DIRECTORY_INHERIT_ACE;
+        /* WRITE_DATA, not READ - both gnfs_op_create and gnfs_op_mkdir use a
+         * fixed default mode (0644/0755, no mode parameter reaches fs_ops_t
+         * yet), and that default's everyone@ already grants READ_DATA. The
+         * enforcement check below needs a bit "everyone" genuinely does not
+         * have, so that a stranger being refused actually exercises the
+         * named entry's absence rather than passing for an unrelated
+         * reason. */
+        custom.ace[custom.count].mask  = ACE_WRITE_DATA;
+        custom.ace[custom.count].who   = 1001;
+        custom.count++;
+        custom.trivial = 0;
+
+        rc = v->ops->setacl(v, &secure_node, &custom);
+        check(rc == 0, "setacl on the directory must succeed");
+    }
+
+    rc = v->ops->getacl(v, &secure_node, &acl_out);
+    check(rc == 0 && acl_out.count == 4,
+         "the directory's ACL is now stored, not projected, and getacl "
+         "reports it back with the entry just set");
+    check(acl_out.ace[3].who == 1001, "including the inheritable entry "
+         "itself");
+
+    rc = v->ops->create(v, "/secure/child.txt");
+    check(rc == 0, "creating a file inside the secured directory must "
+         "succeed");
+    rc = v->ops->lookup(v, "/secure/child.txt", &child_node);
+    check(rc == 0, "it must resolve");
+    rc = v->ops->getacl(v, &child_node, &acl_out);
+    check(rc == 0,
+         "the new file has a REAL stored ACL now - inheritance gave it "
+         "something a mode word cannot express");
+    check(acl_out.count == 4 && acl_out.ace[3].who == 1001 &&
+         (acl_out.ace[3].flags & ACE_INHERITED_ACE) != 0 &&
+         (acl_out.ace[3].flags & ACE_INHERIT_ONLY_ACE) == 0,
+         "the inherited entry is present, effective, and marked as "
+         "inherited rather than explicit");
+    check((acl_out.ace[3].flags &
+          (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) == 0,
+         "and, being a FILE, does not itself propagate any further");
+
+    rc = v->ops->mkdir(v, "/secure/subdir");
+    check(rc == 0, "creating a directory inside the secured directory must "
+         "succeed");
+    rc = v->ops->lookup(v, "/secure/subdir", &grandchild_node);
+    check(rc == 0, "it must resolve");
+    rc = v->ops->getacl(v, &grandchild_node, &acl_out);
+    check(rc == 0 && acl_out.count == 4 &&
+         (acl_out.ace[3].flags &
+          (ACE_FILE_INHERIT_ACE | ACE_DIRECTORY_INHERIT_ACE)) != 0,
+         "a DIRECTORY child keeps the inherit bits, so a file created "
+         "inside IT would inherit the same grant a second level down");
+
+    /* Real permission enforcement, not just that the bytes are stored: uid
+     * 1001 - granted nothing by the default 0755 mode's "other" class, which
+     * has no write bit - but named in the inherited entry - can WRITE to
+     * the grandchild; an arbitrary other uid cannot. */
+    {
+        cred_t writer, stranger;
+
+        cred_init_nobody(&writer);
+        writer.euid = 1001;
+        check(acl_access(&acl_out, &writer, ACE_WRITE_DATA) == 0,
+             "uid 1001 writes via the inherited grant alone");
+
+        cred_init_nobody(&stranger);
+        stranger.euid = 424242;
+        check(acl_access(&acl_out, &stranger, ACE_WRITE_DATA) == -13,
+             "an arbitrary uid the ACL never names is refused - the "
+             "control for the check above");
+    }
+
+    v->ops->unmount(v);
+    free(image);
+}
+
+/* chown through the REAL gate (fs_setowner, not the bare slot) against a
+ * real gnfs volume: that the refusal refuses, that a permitted change
+ * reaches both copies of the owner (onode and stored ACL), and that it
+ * survives a remount. */
+static void test_chown_end_to_end(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t plain, secured;
+    cred_t root, owner;
+    acl_t a;
+    int rc;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the chown test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+    cred_init_nobody(&owner);
+    owner.euid = 1000;
+    owner.egid = 1000;
+    owner.groups[0] = 50;
+    owner.ngroups = 1;
+
+    /* A file with no stored ACL: only the onode's copy exists. */
+    check(v->ops->create(v, "/plain.txt") == 0, "create /plain.txt");
+    check(v->ops->lookup(v, "/plain.txt", &plain) == 0, "and resolve it");
+    plain.vol = v;               /* fs_lookup_on would stamp this */
+
+    rc = fs_setowner(&plain, (const struct cred *)&owner, 1000, 1000);
+    check(rc == -1, "uid 1000 may not seize a file root owns");
+
+    rc = fs_setowner(&plain, (const struct cred *)&root, 1000, 1000);
+    check(rc == 0, "root gives it to uid 1000");
+    check(plain.uid == 1000 && plain.gid == 1000,
+         "and the caller's node reflects it");
+
+    rc = fs_setowner(&plain, (const struct cred *)&owner, 2000,
+                     ACL_CHOWN_KEEP);
+    check(rc == -1, "the new owner holds WRITE_ACL but still may not give "
+         "the file away");
+    rc = fs_setowner(&plain, (const struct cred *)&owner, ACL_CHOWN_KEEP, 50);
+    check(rc == 0, "but may chgrp it into its own supplementary group");
+    rc = fs_setowner(&plain, (const struct cred *)&owner, ACL_CHOWN_KEEP, 51);
+    check(rc == -1, "and not into a group it is not in");
+
+    /* A file WITH a stored ACL: both copies must move. */
+    check(v->ops->create(v, "/secured.txt") == 0, "create /secured.txt");
+    check(v->ops->lookup(v, "/secured.txt", &secured) == 0, "resolve it");
+    secured.vol = v;
+    acl_from_mode(0100600u, 0, 0, &a);
+    a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[a.count].flags = 0;
+    a.ace[a.count].mask  = ACE_READ_DATA;
+    a.ace[a.count].who   = 9001;
+    a.count++;
+    a.trivial = 0;
+    check(v->ops->setacl(v, &secured, &a) == 0, "give it a stored ACL");
+
+    rc = fs_setowner(&secured, (const struct cred *)&root, 1000, 1000);
+    check(rc == 0, "root chowns the ACL-bearing file");
+    check(fs_getacl(&secured, (struct acl *)&a) == 0 && a.owner == 1000 && a.group == 1000,
+         "the STORED ACL's owner moved too - otherwise owner@ would still "
+         "evaluate against uid 0");
+    check(acl_access(&a, &owner, ACE_READ_DATA | ACE_WRITE_DATA) == 0,
+         "so the new owner gets owner@'s rw- through it");
+    check(a.count == 4 && a.ace[3].who == 9001,
+         "and the named grant is untouched");
+
+    /* Both changes must be on the medium, not just in memory. */
+    {
+        device_t dev2;
+        dev_stub_t stub2;
+        fs_volume_t *v2;
+        fs_node_t n2;
+
+        v->ops->unmount(v);
+        v = NULL;
+        dev_stub_attach(&dev2, &stub2, image, image_bytes);
+        v2 = gnfs_probe(&dev2);
+        check(v2 != NULL, "the volume remounts after chown");
+        if (v2 != NULL) {
+            check(v2->ops->lookup(v2, "/plain.txt", &n2) == 0 &&
+                 n2.uid == 1000 && n2.gid == 50,
+                 "the plain file's new owner and group survived a remount");
+            check(v2->ops->lookup(v2, "/secured.txt", &n2) == 0 &&
+                 n2.uid == 1000 &&
+                 v2->ops->getacl(v2, &n2, &a) == 0 && a.owner == 1000,
+                 "and so did the secured file's, in both copies");
+            v2->ops->unmount(v2);
+        }
+    }
+
+    free(image);
+}
+
+int gnfs_run_tests(void) {
+    failures = 0;
+    printf("\ngnfs:\n");
+
+    test_checksum_is_sensitive();
+    test_root_seal_and_valid();
+    test_layout_helpers_agree_with_format();
+    test_bitmap_alloc_first_fit();
+    test_onode_init_and_access();
+    test_onode_alloc_is_monotonic_and_bounded();
+    test_directory_entries();
+    test_directory_iterate_and_full();
+    test_acl_inherit();
+    test_acl_apply_chmod();
+    test_acl_chown_permitted();
+    test_format_mount_and_commit_ring();
+    test_object_layer_end_to_end();
+    test_acl_end_to_end();
+    test_chown_end_to_end();
+
+    printf("gnfs: %s\n", failures ? "FAILED" : "passed");
+    return failures;
+}

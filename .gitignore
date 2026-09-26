@@ -1,0 +1,21 @@
+src/ntdll/*.o
+src/ntdll/ntdll.dll
+src/ntdll/libntdll.a
+src/ntdll/ntsyscalls.h
+src/winhello/*.o
+src/winhello/hello.exe
+src/hand/*.o
+src/hand/hand.exe
+src/kernel32/*.o
+src/kernel32/kernel32.dll
+src/kernel32/libkernel32.a
+src/k32demo/*.o
+src/k32demo/k32.exe
+
+# Build output and generated artifacts
+build/
+__pycache__/
+graphify-out/
+
+# Per-machine Claude Code settings
+.claude/settings.local.json

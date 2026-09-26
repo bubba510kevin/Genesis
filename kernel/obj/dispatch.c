@@ -1,0 +1,494 @@
+#include "dispatch.h"
+#include "kprintf.h"
+#include "ns.h"
+#include "object.h"
+#include "process.h"
+#include "sched.h"
+#include "timer.h"
+#include "typesk.h"
+#include "waitq.h"
+
+/* See kernel/include/dispatch.h for what these are and why there are three.
+ * What follows is the state and the four operations over it.
+ *
+ * --- one body type for three object types ---------------------------------
+ * The three share a wait queue, a signalled test and a consume step, and
+ * differ only in what those mean. Writing them as one struct with a kind tag
+ * rather than three structs keeps the WAIT LOOP in one place - and the wait
+ * loop is where the subtleties are, not in the state.
+ *
+ * They stay three object TYPES, because the type is what a caller sees: the
+ * class in a stat, the name under \ObjectTypes, and the vtable that decides
+ * whether a signal means "set" or "release".
+ */
+
+#define DISPATCH_MAX 32
+
+typedef enum {
+    D_EVENT = 0,
+    D_SEMAPHORE,
+    D_MUTANT
+} disp_kind_t;
+
+typedef struct dispatcher {
+    int          in_use;
+    disp_kind_t  kind;
+
+    /* Event. `manual` is NotificationEvent vs SynchronizationEvent. */
+    int          manual;
+    int          signalled;
+
+    /* Semaphore. */
+    int64        count;
+    int64        limit;
+
+    /* Mutant. `owner` is a pid, 0 for unowned; `depth` is the recursion
+     * count, which is what makes this not a semaphore of one. */
+    int          owner;
+    int          depth;
+
+    wait_queue_t q;
+} dispatcher_t;
+
+static dispatcher_t disp_pool[DISPATCH_MAX];
+
+static dispatcher_t *disp_alloc(disp_kind_t kind) {
+    int i;
+
+    for (i = 0; i < DISPATCH_MAX; i++) {
+        if (!disp_pool[i].in_use) {
+            dispatcher_t *d = &disp_pool[i];
+
+            d->in_use    = 1;
+            d->kind      = kind;
+            d->manual    = 0;
+            d->signalled = 0;
+            d->count     = 0;
+            d->limit     = 0;
+            d->owner     = 0;
+            d->depth     = 0;
+            waitq_init(&d->q);
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* Who is asking, for a mutant's ownership. A pid, because that is the
+ * identity every context here has - a user process inside a syscall and a
+ * kernel thread both have one, and they are the two things that can wait. */
+static int caller_id(void) {
+    process_t *p = proc_current();
+
+    return (p != NULL) ? p->pid : 0;
+}
+
+/* --- would a wait block? -------------------------------------------------
+ *
+ * The predicate, WITHOUT consuming. Used by poll, and by the wait loop's own
+ * re-test - which is why it is a separate function from the consume below:
+ * they run at different moments and only one of them may have side effects. */
+static int disp_ready(const dispatcher_t *d, int who) {
+    switch (d->kind) {
+    case D_EVENT:
+        return d->signalled;
+    case D_SEMAPHORE:
+        return d->count > 0;
+    case D_MUTANT:
+        /* Ready if nobody owns it, OR if the asker already does. The second
+         * half is the recursion, and leaving it out is the bug where a thread
+         * deadlocks against a mutant it is already holding. */
+        return d->owner == 0 || d->owner == who;
+    }
+    return 0;
+}
+
+/* --- take it -------------------------------------------------------------
+ *
+ * Called only when disp_ready said yes AND with interrupts disabled, so that
+ * nothing can slip between the test and the take. That pairing is the whole
+ * reason wait cannot be built out of poll: the gap between asking and taking
+ * is exactly where another waiter gets there first. */
+static void disp_consume(dispatcher_t *d, int who) {
+    switch (d->kind) {
+    case D_EVENT:
+        /* A notification event stays set - that is what "notification" means,
+         * and it is why every waiter is released by one signal. A
+         * synchronisation event auto-resets here, so exactly one waiter gets
+         * through per signal however many were woken. */
+        if (!d->manual) {
+            d->signalled = 0;
+        }
+        break;
+    case D_SEMAPHORE:
+        d->count--;
+        break;
+    case D_MUTANT:
+        d->owner = who;
+        d->depth++;
+        break;
+    }
+}
+
+/* --- the wait ------------------------------------------------------------ */
+
+/* Save RFLAGS and disable interrupts; restore. Duplicated from
+ * kernel/proc/ksleep.c rather than shared, matching this tree's preference
+ * for a trivial helper per file. The REASON it is needed here is the same and
+ * is written out there: a kernel thread runs with interrupts enabled, so
+ * without this a signal can land between the readiness test and the block and
+ * be delivered to an empty queue. A syscall path is already protected by
+ * SFMASK having cleared IF; a kernel thread is not. */
+static uint64 intr_disable(void) {
+    uint64 flags;
+
+    __asm__ volatile ("pushfq\n\tpopq %0\n\tcli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static void intr_restore(uint64 flags) {
+    __asm__ volatile ("pushq %0\n\tpopfq" : : "r"(flags) : "memory", "cc");
+}
+
+struct wait_ctx {
+    dispatcher_t *d;
+    int           who;
+};
+
+static int wait_ready(void *ctx) {
+    struct wait_ctx *w = (struct wait_ctx *)ctx;
+
+    return disp_ready(w->d, w->who);
+}
+
+static int disp_wait(object_t *obj, uint64 deadline) {
+    dispatcher_t *d = (dispatcher_t *)obj->body;
+    struct wait_ctx ctx;
+    uint64 flags;
+    int rc;
+
+    if (d == NULL || !d->in_use) {
+        return -22;
+    }
+    ctx.d   = d;
+    ctx.who = caller_id();
+
+    flags = intr_disable();
+    for (;;) {
+        /* Test and take with interrupts off, so the pair is indivisible.
+         * waitq_wait_until would re-test for us, but it returns BETWEEN the
+         * test and our take - and that gap is where a second waiter wins the
+         * same permit. Testing here instead means the object is consumed
+         * before anything else runs. */
+        if (disp_ready(d, ctx.who)) {
+            disp_consume(d, ctx.who);
+            intr_restore(flags);
+            return 0;
+        }
+
+        rc = waitq_wait_until(&d->q, wait_ready, &ctx, deadline);
+        if (rc == WAITQ_TIMEOUT) {
+            intr_restore(flags);
+            return -110;                    /* -ETIMEDOUT */
+        }
+        if (rc == WAITQ_SIGNAL) {
+            /* A POSIX signal arrived instead. Reported rather than looped on:
+             * every blocking path in this kernel needs this check, and
+             * forgetting it is what makes a process unkillable while it
+             * waits. */
+            intr_restore(flags);
+            return -4;                      /* -EINTR */
+        }
+        /* Ready, but not taken yet - loop round and take it under the same
+         * interrupts-off window as the test. */
+    }
+}
+
+/* --- the signal ---------------------------------------------------------- */
+
+static int disp_signal(object_t *obj, int op, int64 count, int64 *prev) {
+    dispatcher_t *d = (dispatcher_t *)obj->body;
+    uint64 flags;
+    int rc = 0;
+
+    if (d == NULL || !d->in_use) {
+        return -22;
+    }
+
+    flags = intr_disable();
+    switch (d->kind) {
+    case D_EVENT:
+        if (prev != NULL) {
+            *prev = d->signalled;
+        }
+        if (op == OB_SIG_RESET) {
+            d->signalled = 0;
+        } else {
+            d->signalled = 1;
+        }
+        break;
+
+    case D_SEMAPHORE:
+        if (op == OB_SIG_RESET) {
+            rc = -22;                       /* meaningless for a semaphore */
+            break;
+        }
+        if (count <= 0) {
+            rc = -22;
+            break;
+        }
+        /* REFUSED, not clamped, and the count is left exactly where it was.
+         *
+         * A caller that releases more permits than it took has a counting
+         * bug. Clamping to the limit makes that bug invisible forever - the
+         * semaphore keeps working, with a count that no longer corresponds to
+         * anything the program believes. NT returns an error here and so does
+         * this. */
+        if (d->count + count > d->limit) {
+            rc = -22;
+            break;
+        }
+        if (prev != NULL) {
+            *prev = d->count;
+        }
+        d->count += count;
+        break;
+
+    case D_MUTANT:
+        if (op == OB_SIG_RESET) {
+            rc = -22;
+            break;
+        }
+        /* Release by somebody who does not own it is an ERROR. A mutant is
+         * the one dispatcher object with an owner, so "release" is not a
+         * thing anyone may do - and a no-op here would let a thread that
+         * never held the lock unlock it for the thread that does. */
+        if (d->owner != caller_id() || d->depth == 0) {
+            rc = -1;                        /* -EPERM */
+            break;
+        }
+        if (prev != NULL) {
+            *prev = d->depth;
+        }
+        /* Recursive: released as many times as taken, and only the last one
+         * hands it over. */
+        if (--d->depth == 0) {
+            d->owner = 0;
+        }
+        break;
+    }
+
+    if (rc == 0) {
+        /* Woken with the state already changed and interrupts still off, so a
+         * waiter that runs the instant this returns finds the object in the
+         * state this call put it in. waitq_wake_all only marks processes
+         * runnable, so it is safe here and from an interrupt handler. */
+        waitq_wake_all(&d->q);
+    }
+    intr_restore(flags);
+    return rc;
+}
+
+/* --- poll: would it block, WITHOUT taking anything ----------------------- */
+
+static int disp_poll(object_t *obj, int events) {
+    dispatcher_t *d = (dispatcher_t *)obj->body;
+
+    (void)events;
+    if (d == NULL || !d->in_use) {
+        return OB_POLLNVAL;
+    }
+    /* POLLIN for "a wait would succeed". Not POLLOUT: there is nothing to
+     * write to a dispatcher object, and reporting it writable would make
+     * poll(POLLOUT) spin on an object no write can ever consume. */
+    return disp_ready(d, caller_id()) ? OB_POLLIN : 0;
+}
+
+static void disp_destroy(object_t *obj) {
+    dispatcher_t *d = (dispatcher_t *)obj->body;
+
+    if (d != NULL) {
+        /* Anybody still waiting is woken before the body goes. They re-test,
+         * find the object no longer in use, and get -EINVAL - which is a
+         * return rather than a wait on something that no longer exists. */
+        waitq_wake_all(&d->q);
+        d->in_use = 0;
+    }
+}
+
+static const object_type_t event_type = {
+    .name    = "Event",
+    .klass   = OBJ_EVENT,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
+static const object_type_t semaphore_type = {
+    .name    = "Semaphore",
+    .klass   = OBJ_SEMAPHORE,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
+static const object_type_t mutant_type = {
+    .name    = "Mutant",
+    .klass   = OBJ_MUTANT,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
+/* --- creation ------------------------------------------------------------ */
+
+object_t *event_create(int manual, int initial) {
+    dispatcher_t *d = disp_alloc(D_EVENT);
+    object_t *obj;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    d->manual    = manual ? 1 : 0;
+    d->signalled = initial ? 1 : 0;
+
+    obj = ob_create(&event_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+object_t *semaphore_create(int64 initial, int64 limit) {
+    dispatcher_t *d;
+    object_t *obj;
+
+    /* Refused rather than adjusted. A semaphore created with more permits
+     * than its ceiling is a caller that has its two arguments the wrong way
+     * round, and quietly swapping them produces a working object with the
+     * wrong capacity. */
+    if (limit < 1 || initial < 0 || initial > limit) {
+        return NULL;
+    }
+    d = disp_alloc(D_SEMAPHORE);
+    if (d == NULL) {
+        return NULL;
+    }
+    d->count = initial;
+    d->limit = limit;
+
+    obj = ob_create(&semaphore_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+object_t *mutant_create(int owned) {
+    dispatcher_t *d = disp_alloc(D_MUTANT);
+    object_t *obj;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    if (owned) {
+        /* Owned from birth, which is CreateMutex(bInitialOwner=TRUE) and is
+         * NOT the same as creating it and then waiting on it: the second has
+         * a window in which somebody else can take it. */
+        d->owner = caller_id();
+        d->depth = 1;
+    }
+    obj = ob_create(&mutant_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+/* --- naming -------------------------------------------------------------- */
+
+#define BNO_PREFIX "\\BaseNamedObjects\\"
+
+static int bno_path(const char *name, char *out, uint32 cap) {
+    const char *p = BNO_PREFIX;
+    uint32 i = 0;
+
+    if (name == NULL || name[0] == '\0') {
+        return -22;
+    }
+    while (p[i] != '\0') {
+        if (i + 1 >= cap) {
+            return -36;
+        }
+        out[i] = p[i];
+        i++;
+    }
+    while (*name != '\0') {
+        if (i + 1 >= cap) {
+            return -36;                     /* -ENAMETOOLONG */
+        }
+        out[i++] = *name++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+int dispatch_create_named(const char *name, object_t *obj) {
+    char path[NS_PATH_MAX];
+    int rc;
+
+    if (obj == NULL) {
+        return -22;
+    }
+    rc = bno_path(name, path, sizeof(path));
+    if (rc != 0) {
+        return rc;
+    }
+    /* ns_insert takes its own reference and reports -EEXIST itself, so this
+     * does not pre-check: a look-then-insert would have a window, and the
+     * whole point of a named mutex is that two processes racing to create it
+     * get one object between them. */
+    return ns_insert(path, obj);
+}
+
+object_t *dispatch_open_named(const char *name) {
+    char path[NS_PATH_MAX];
+    ns_entry_t *e;
+
+    if (bno_path(name, path, sizeof(path)) != 0) {
+        return NULL;
+    }
+    e = ns_lookup_entry(path);
+    if (e == NULL || e->kind != NS_OBJECT || e->object == NULL) {
+        return NULL;
+    }
+    /* A reference for the caller. The namespace keeps its own, so the object
+     * outlives every opener - which is what "named" has to mean. */
+    ob_ref(e->object);
+    return e->object;
+}
+
+/* --- init ---------------------------------------------------------------- */
+
+void dispatch_init(void) {
+    /* The four directories ROADMAP item 14 lists as missing. Created even
+     * though only the first has anything in it yet: a namespace where
+     * \KernelObjects does not exist answers -ENOENT for a path that is simply
+     * empty, and those are different questions. */
+    (void)ns_mkdir("\\BaseNamedObjects");
+    (void)ns_mkdir("\\KernelObjects");
+    (void)ns_mkdir("\\ObjectTypes");
+    (void)ns_mkdir("\\Sessions");
+
+    (void)ob_register_type(&event_type);
+    (void)ob_register_type(&semaphore_type);
+    (void)ob_register_type(&mutant_type);
+
+    /* After \ObjectTypes exists, and after the three above are registered -
+     * this is the sweep that publishes everything anybody registered before
+     * the directory was there. */
+    ob_publish_types();
+}

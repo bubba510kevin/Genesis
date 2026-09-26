@@ -1,0 +1,59 @@
+; Export list for kernel32.dll.
+;
+; A .def rather than __declspec(dllexport), for the same reason ntdll has one:
+; the export table IS the interface, and adding to it should be a deliberate
+; act rather than a side effect of a keyword. x86-64 has no name decoration,
+; so these names appear in the export directory exactly as written - which is
+; what the kernel's IAT resolution looks up.
+;
+; Forwarders and ordinal-only exports, both of which pe.c used to refuse.
+;
+; This comment used to say "no forwarders", because the loader returned 0 for
+; any export whose RVA landed inside the export directory. It follows them
+; now, so the two entries at the bottom of this file exist to prove it - and
+; they are the only reason they exist. A real kernel32 forwards plenty
+; (HeapAlloc to ntdll's RtlAllocateHeap is the classic), but the wrappers in
+; proc.c are still the honest version of that for this tree: a forwarder here
+; would change what those functions DO, and this file's job is the loader
+; test, not a redesign of kernel32.
+;
+; Note what adding K32OrdinalProbe @42 does as a side effect: it moves this
+; DLL's ordinal base off 1. That is deliberate and is half the test. An
+; ordinal import is resolved as AddressOfFunctions[ordinal - ordinal_base],
+; and a loader that skips the subtraction works perfectly on every DLL whose
+; base is 1 and silently returns the wrong function here.
+LIBRARY kernel32.dll
+EXPORTS
+; --- errors ---
+    GetLastError
+    SetLastError
+; --- files and handles ---
+    GetStdHandle
+    CreateFileW
+    CreateFileA
+    ReadFile
+    WriteFile
+    CloseHandle
+; --- process ---
+    ExitProcess
+    GetCurrentProcess
+    GetCurrentProcessId
+    GetCommandLineW
+    GetCommandLineA
+    GetEnvironmentStringsW
+    FreeEnvironmentStringsW
+    GetCurrentDirectoryW
+    GetModuleHandleW
+; --- memory ---
+    GetProcessHeap
+    HeapAlloc
+    HeapFree
+    VirtualAlloc
+    VirtualFree
+; --- loader test entries (see the note above) ---
+; Ordinal-only: no name-table entry, reachable only as kernel32.dll#42.
+    K32OrdinalProbe @42 NONAME
+; A real forwarder: the export directory holds the string "ntdll.NtCurrentTeb"
+; where a function RVA would be, and the loader has to follow it into a DLL
+; this one already depends on.
+    K32CurrentTeb = ntdll.NtCurrentTeb

@@ -1,0 +1,197 @@
+===== 0. IDENTITY =====
+Linux livecd 7.1.8-gentoo-dist #1 SMP PREEMPT_DYNAMIC Tue Aug 11 14:34:03 UTC 2026 x86_64 Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz GenuineIntel GNU/Linux
+distro: Gentoo Linux
+uptime:19183.73 s
+
+===== 1. FIRMWARE MODE   [BLOCKER] =====
+BIOS / CSM  <-- good, the MBR boot sector will load.
+
+===== 2. SATA CONTROLLER MODE   [BLOCKER] =====
+00:17.0 SATA controller [0106]: Intel Corporation Q170/Q150/B150/H170/H110/Z170/CM236 Chipset SATA Controller [AHCI Mode] [8086:a102] (rev 31)
+-- drivers currently bound to storage:
+  ahci/nvme bound: 0000:00:17.0
+-- if this says AHCI, ROADMAP item 12 (port vendsrc/sys/dev/ahci) is the gate.
+
+===== 3. INPUT: USB OR PS/2   [BLOCKER] =====
+  other : Sleep Button  (PNP0C0E/button/input0)
+  other : Power Button  (PNP0C0C/button/input0)
+  other : Speakup  (speakup/input0)
+  other : Dell WMI hotkeys  ()
+  other : PC Speaker  (isa0061/input0)
+  other : Video Bus  (LNXVIDEO/video/input0)
+  other : HDA Intel PCH Headphone Mic  (ALSA)
+  other : HDA Intel PCH Line Out  (ALSA)
+  other : HDA Intel PCH HDMI/DP,pcm=3  (ALSA)
+  other : HDA Intel PCH HDMI/DP,pcm=7  (ALSA)
+  other : HDA Intel PCH HDMI/DP,pcm=8  (ALSA)
+  other : Power Button  (LNXPWRBN/button/input0)
+  USB   : Logitech USB Keyboard  (usb-0000:00:14.0-10/input0)
+  USB   : Logitech USB Keyboard Consumer Control  (usb-0000:00:14.0-10/input1)
+  USB   : Logitech USB Keyboard System Control  (usb-0000:00:14.0-10/input1)
+-- any PS/2 line above means keyboard.c works as-is.
+-- USB only means you need USB Legacy Support in firmware, or xHCI+HID first.
+
+===== 4. CPU =====
+model name	: Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz
+cpu family	: 6
+logical cpus: 4
+physical cores: 4
+-- flags Genesis cares about:
+   yes  lm
+   yes  nx
+   yes  pae
+   yes  apic
+   yes  x2apic
+   yes  sse2
+   yes  fxsr
+   yes  xsave
+   yes  smep
+   yes  smap
+   yes  pcid
+   yes  rdrand
+   NO   hypervisor
+-- 'hypervisor' present would mean this is a VM, not bare metal.
+Architecture:                            x86_64
+Address sizes:                           39 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+Model name:                              Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz
+Thread(s) per core:                      1
+Core(s) per socket:                      4
+Socket(s):                               1
+Virtualization:                          VT-x
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-3
+
+===== 5. MEMORY =====
+               total        used        free      shared  buff/cache   available
+Mem:           7.6Gi       1.5Gi       5.2Gi       270Mi       1.5Gi       6.1Gi
+Swap:             0B          0B          0B
+MemTotal:        8011308 kB
+MemAvailable:    6422880 kB
+-- E820 map (Genesis parses this in kernel/arch/e820.c):
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009c7ff]  System RAM
+[    0.000000] BIOS-e820: [mem 0x000000000009c800-0x000000000009ffff]  device reserved
+[    0.000000] BIOS-e820: [gap 0x00000000000a0000-0x00000000000dffff]
+[    0.000000] BIOS-e820: [mem 0x00000000000e0000-0x00000000000fffff]  device reserved
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x00000000d5cd8fff]  System RAM
+[    0.000000] BIOS-e820: [mem 0x00000000d5cd9000-0x00000000d5cd9fff]  ACPI NVS
+[    0.000000] BIOS-e820: [mem 0x00000000d5cda000-0x00000000d5d03fff]  device reserved
+[    0.000000] BIOS-e820: [mem 0x00000000d5d04000-0x00000000d5d59fff]  System RAM
+[    0.000000] BIOS-e820: [mem 0x00000000d5d5a000-0x00000000d655afff]  device reserved
+[    0.000000] BIOS-e820: [mem 0x00000000d655b000-0x00000000db58ffff]  System RAM
+[    0.000000] BIOS-e820: [mem 0x00000000db590000-0x00000000db7b5fff]  device reserved
+[    0.000000] BIOS-e820: [mem 0x00000000db7b6000-0x00000000db803fff]  ACPI data
+[    0.000000] BIOS-e820: [mem 0x00000000db804000-0x00000000dbfb8fff]  ACPI NVS
+[    0.000000] BIOS-e820: [mem 0x00000000dbfb9000-0x00000000dc4fefff]  device reserved
+[    0.000000] BIOS-e820: [mem 0x00000000dc4ff000-0x00000000dc4fffff]  System RAM
+[    0.000000] BIOS-e820: [mem 0x00000000dc500000-0x00000000dc5fffff]  device reserved
+[    0.000000] BIOS-e820: [gap 0x00000000dc600000-0x00000000f7ffffff]
+[    0.000000] BIOS-e820: [mem 0x00000000f8000000-0x00000000fbffffff]  device reserved
+[    0.000000] BIOS-e820: [gap 0x00000000fc000000-0x00000000fdffffff]
+[    0.000000] BIOS-e820: [mem 0x00000000fe000000-0x00000000fe010fff]  device reserved
+
+===== 6. DISKS =====
+NAME  MODEL             SERIAL                 SIZE ROTA TRAN
+loop0                                          4.5G    1 
+sda   ST500LM021-1KJ152 W62HX0AP             465.8G    1 sata
+sdb   Cruzer Glide      4C530000130414208412  14.9G    1 usb
+-- partition tables (Genesis reads MBR and GPT, kernel/dev/part.c):
+/dev/dm-0: UUID="ce80b09a-0ba9-44ca-8f44-8430c1f7ff74" TYPE="swap"
+/dev/dm-1: UUID="62a147fb-c275-4a02-b014-ab62b6d6e58b" BLOCK_SIZE="4096" TYPE="ext4"
+/dev/dm-6: PTUUID="94954274" PTTYPE="dos"
+/dev/sda: PTUUID="dfd07799-921a-461d-a4dd-68cdcd7e5c26" PTTYPE="gpt"
+/dev/sdb: BLOCK_SIZE="2048" UUID="2026-08-11-14-40-41-00" LABEL="gentoo-amd64-livegui" TYPE="iso9660" PTUUID="9fa4c888-694f-4e79-8266-b065d0279a0c" PTTYPE="gpt"
+
+===== 7. NETWORK =====
+01:00.0 Ethernet controller [0200]: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet [14e4:168e] (rev 10)
+01:00.1 Ethernet controller [0200]: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet [14e4:168e] (rev 10)
+02:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8111/8168/8211/8411 PCI Express Gigabit Ethernet Controller [10ec:8168] (rev 15)
+-- MACs, so you can tell which port Genesis attached to:
+  enp1s0f0  mac=98:b7:85:22:f6:a2  carrier=0  driver=bnx2x
+  enp1s0f1  mac=98:b7:85:22:f6:a3  carrier=0  driver=bnx2x
+  enp2s0  mac=50:9a:4c:53:5f:c0  carrier=1  driver=r8169
+-- compare a MAC here against 're: Ethernet address:' in the Genesis boot log.
+-- the RJ45 (Realtek 10ec:8168) is the one if_re.c already probes.
+
+===== 8. FULL PCI INVENTORY =====
+00:00.0 Host bridge [0600]: Intel Corporation Xeon E3-1200 v5/E3-1500 v5/6th Gen Core Processor Host Bridge/DRAM Registers [8086:191f] (rev 07)
+00:01.0 PCI bridge [0604]: Intel Corporation 6th-10th Gen Core Processor PCIe Controller (x16) [8086:1901] (rev 07)
+00:02.0 VGA compatible controller [0300]: Intel Corporation HD Graphics 530 [8086:1912] (rev 06)
+00:14.0 USB controller [0c03]: Intel Corporation 100 Series/C230 Series Chipset Family USB 3.0 xHCI Controller [8086:a12f] (rev 31)
+00:14.2 Signal processing controller [1180]: Intel Corporation 100 Series/C230 Series Chipset Family Thermal Subsystem [8086:a131] (rev 31)
+00:16.0 Communication controller [0780]: Intel Corporation 100 Series/C230 Series Chipset Family MEI Controller #1 [8086:a13a] (rev 31)
+00:17.0 SATA controller [0106]: Intel Corporation Q170/Q150/B150/H170/H110/Z170/CM236 Chipset SATA Controller [AHCI Mode] [8086:a102] (rev 31)
+00:1c.0 PCI bridge [0604]: Intel Corporation 100 Series/C230 Series Chipset Family PCI Express Root Port #5 [8086:a114] (rev f1)
+00:1f.0 ISA bridge [0601]: Intel Corporation H110 Chipset LPC/eSPI Controller [8086:a143] (rev 31)
+00:1f.2 Memory controller [0580]: Intel Corporation 100 Series/C230 Series Chipset Family Power Management Controller [8086:a121] (rev 31)
+00:1f.3 Audio device [0403]: Intel Corporation 100 Series/C230 Series Chipset Family HD Audio Controller [8086:a170] (rev 31)
+00:1f.4 SMBus [0c05]: Intel Corporation 100 Series/C230 Series Chipset Family SMBus [8086:a123] (rev 31)
+01:00.0 Ethernet controller [0200]: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet [14e4:168e] (rev 10)
+01:00.1 Ethernet controller [0200]: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet [14e4:168e] (rev 10)
+02:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8111/8168/8211/8411 PCI Express Gigabit Ethernet Controller [10ec:8168] (rev 15)
+
+-- kernel driver in use per device:
+00:00.0 Host bridge: Intel Corporation Xeon E3-1200 v5/E3-1500 v5/6th Gen Core Processor Host Bridge/DRAM Registers (rev 07)
+	Kernel driver in use: skl_uncore
+00:01.0 PCI bridge: Intel Corporation 6th-10th Gen Core Processor PCIe Controller (x16) (rev 07)
+	Kernel driver in use: pcieport
+00:02.0 VGA compatible controller: Intel Corporation HD Graphics 530 (rev 06)
+	Kernel driver in use: i915
+00:14.0 USB controller: Intel Corporation 100 Series/C230 Series Chipset Family USB 3.0 xHCI Controller (rev 31)
+	Kernel driver in use: xhci_hcd
+00:14.2 Signal processing controller: Intel Corporation 100 Series/C230 Series Chipset Family Thermal Subsystem (rev 31)
+	Kernel driver in use: intel_pch_thermal
+00:16.0 Communication controller: Intel Corporation 100 Series/C230 Series Chipset Family MEI Controller #1 (rev 31)
+	Kernel driver in use: mei_me
+00:17.0 SATA controller: Intel Corporation Q170/Q150/B150/H170/H110/Z170/CM236 Chipset SATA Controller [AHCI Mode] (rev 31)
+	Kernel driver in use: ahci
+00:1c.0 PCI bridge: Intel Corporation 100 Series/C230 Series Chipset Family PCI Express Root Port #5 (rev f1)
+	Kernel driver in use: pcieport
+00:1f.0 ISA bridge: Intel Corporation H110 Chipset LPC/eSPI Controller (rev 31)
+00:1f.2 Memory controller: Intel Corporation 100 Series/C230 Series Chipset Family Power Management Controller (rev 31)
+00:1f.3 Audio device: Intel Corporation 100 Series/C230 Series Chipset Family HD Audio Controller (rev 31)
+	Kernel driver in use: snd_hda_intel
+00:1f.4 SMBus: Intel Corporation 100 Series/C230 Series Chipset Family SMBus (rev 31)
+	Kernel driver in use: i801_smbus
+01:00.0 Ethernet controller: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet (rev 10)
+	Kernel driver in use: bnx2x
+01:00.1 Ethernet controller: Broadcom Inc. and subsidiaries NetXtreme II BCM57810 10 Gigabit Ethernet (rev 10)
+	Kernel driver in use: bnx2x
+02:00.0 Ethernet controller: Realtek Semiconductor Co., Ltd. RTL8111/8168/8211/8411 PCI Express Gigabit Ethernet Controller (rev 15)
+	Kernel driver in use: r8169
+
+===== 9. ACPI / INTERRUPT ROUTING =====
+[    0.008378] ACPI: APIC 0x00000000DB7F8BC8 000084 (v03 DELL   CBX3     01072009 AMI  00010013)
+[    0.008440] ACPI: Reserving APIC table memory at [mem 0xdb7f8bc8-0xdb7f8c4b]
+[    0.008946] ACPI: LAPIC_NMI (acpi_id[0x01] high edge lint[0x1])
+[    0.008947] ACPI: LAPIC_NMI (acpi_id[0x02] high edge lint[0x1])
+[    0.008948] ACPI: LAPIC_NMI (acpi_id[0x03] high edge lint[0x1])
+[    0.008949] ACPI: LAPIC_NMI (acpi_id[0x04] high edge lint[0x1])
+[    0.008975] IOAPIC[0]: apic_id 2, version 32, address 0xfec00000, GSI 0-119
+[    0.008983] ACPI: Using ACPI (MADT) for SMP configuration information
+[    0.084157] DMAR-IR: IOAPIC id 2 under DRHD base  0xfed91000 IOMMU 1
+[    0.178802] ACPI: Using IOAPIC for interrupt routing
+-- serial ports (Genesis mirrors print_string to COM1):
+[    0.283752] Serial: 8250/16550 driver, 32 ports, IRQ sharing enabled
+[    0.283861] 00:00: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
+  ttyS0 present
+
+===== 10. FIRMWARE / BOARD =====
+  system-manufacturer      Dell Inc.
+  system-product-name      OptiPlex 3040
+  baseboard-product-name   05XGC8
+  bios-vendor              Dell Inc.
+  bios-version             1.4.13
+  bios-release-date        02/07/2017
+  board_vendor             Dell Inc.
+  board_name               05XGC8
+  bios_vendor              Dell Inc.
+  bios_version             1.4.13
+  bios_date                02/07/2017
+  sys_vendor               Dell Inc.
+  product_name             OptiPlex 3040
+
+===== SUMMARY - the three that decide whether Genesis boots =====
+  1. firmware : BIOS/CSM  -> ok
+  2. storage  : AHCI  -> ata.c will find nothing; port vendsrc/sys/dev/ahci
+  3. input    : USB only -> need USB Legacy Support in firmware

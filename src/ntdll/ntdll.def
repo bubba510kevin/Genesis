@@ -1,0 +1,35 @@
+; Export list for ntdll.dll.
+;
+; A .def rather than __declspec(dllexport) on each function, because the
+; export table IS the interface: one file to read to know what the DLL
+; promises, and adding an export becomes a deliberate act rather than a side
+; effect of a keyword someone typed. x86-64 has no name decoration, so what
+; is written here is exactly what appears in the export directory - which is
+; what item 7's IAT resolution will look names up in.
+LIBRARY ntdll.dll
+EXPORTS
+; --- the native system-call interface ---
+    NtDisplayString
+    NtTerminateProcess
+    NtOpenFile
+    NtClose
+    NtReadFile
+    NtWriteFile
+    NtAllocateVirtualMemory
+; --- the dispatcher objects ---
+    NtCreateEvent
+    NtOpenEvent
+    NtSetEvent
+    NtResetEvent
+    NtWaitForSingleObject
+    NtCreateSemaphore
+    NtReleaseSemaphore
+    NtCreateMutant
+    NtReleaseMutant
+; --- the runtime library ---
+    NtCurrentTeb
+    RtlInitUnicodeString
+    RtlDosPathNameToNtPathName_U
+    RtlAllocateHeap
+    RtlFreeHeap
+    LdrInitializeThunk
