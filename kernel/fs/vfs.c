@@ -494,11 +494,17 @@ static int fs_may_add_entry(const char *abs_path, const struct cred *c,
  * When both refuse, the parent's answer is the one returned - it is the one
  * a mode-only world can act on.
  *
- * Not modelled: the sticky bit's "only the owner may remove it from a
- * shared directory". chmod cannot set S_ISVTX on gnfs yet, so no directory
- * here can be sticky; the rule lands with that. */
+ * A STICKY parent (S_ISVTX - /tmp) narrows the parent half: even with
+ * DELETE_CHILD on the directory, only the entry's owner, the directory's
+ * owner, or a supreme caller may remove it, and anyone else gets -EPERM -
+ * Linux's errno here, because it is not the directory's permission bits
+ * that refused. The object half is NOT narrowed: an explicit ACE_DELETE on
+ * the object was put there by someone allowed to write its ACL, which is a
+ * deliberate grant the sticky bit exists to protect against the absence
+ * of, not to override. */
 static int fs_may_remove_entry(const char *abs_path, const fs_node_t *victim,
                                const struct cred *c) {
+    const cred_t *cr = (const cred_t *)c;
     fs_node_t pn;
     int rc;
 
@@ -512,7 +518,15 @@ static int fs_may_remove_entry(const char *abs_path, const fs_node_t *victim,
     if (rc != 0) {
         return rc;
     }
-    return fs_access(&pn, c, ACE_DELETE_CHILD | ACE_EXECUTE);
+    rc = fs_access(&pn, c, ACE_DELETE_CHILD | ACE_EXECUTE);
+    if (rc != 0) {
+        return rc;
+    }
+    if ((pn.mode & S_ISVTX) && !cred_is_supreme(cr) &&
+        cr->euid != victim->uid && cr->euid != pn.uid) {
+        return -1;                             /* -EPERM */
+    }
+    return 0;
 }
 
 int fs_mkdir(const char *abs_path, const struct cred *c) {

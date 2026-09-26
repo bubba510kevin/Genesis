@@ -816,20 +816,31 @@ static int gnfs_op_setowner(fs_volume_t *v, fs_node_t *n, uint32 uid,
     return 0;
 }
 
-/* Who owns a new object: whoever created it - the creator's euid and egid.
- * NULL `c` is the kernel creating something for itself, which is root's.
+/* Who owns a new object, and whether it is born setgid.
  *
- * The System V setgid-directory rule (a new object takes a setgid parent's
- * group) is deliberately absent, not forgotten: nothing on gnfs can SET a
- * directory's setgid bit yet - chmod rewrites only rwx through
- * acl_apply_chmod, and gnfs_store_acl carries the special bits over from
- * the old mode - so the rule would be code no caller could reach. It lands
- * with chmod learning the special bits. */
-static void gnfs_creator_ids(const struct cred *c, uint32 *uid, uint32 *gid) {
+ * The creator's euid, always. Its group is the creator's egid - unless the
+ * parent directory is setgid, in which case it is the PARENT's group, and a
+ * new DIRECTORY is born setgid itself so the rule keeps applying below it.
+ * That is System V's rule and Linux's; BSD's "always the parent's group" is
+ * the other common one. The setgid form is what lets a shared project
+ * directory work without every member chgrp'ing every file they make.
+ *
+ * NULL `c` is the kernel creating something for itself, which is root's -
+ * but a setgid parent still decides the group, for the same reason. */
+static void gnfs_creator_ids(gnfs_mount_t *m, uint64 parent_objnum,
+                             const struct cred *c, int is_dir, uint32 *mode,
+                             uint32 *uid, uint32 *gid) {
     const cred_t *cr = (const cred_t *)c;
+    gnfs_onode_t *parent = gnfs_onode_at(m->obj_table, parent_objnum);
 
     *uid = (cr != NULL) ? cr->euid : 0;
     *gid = (cr != NULL) ? cr->egid : 0;
+    if (parent != NULL && (parent->mode & S_ISGID)) {
+        *gid = parent->gid;
+        if (is_dir) {
+            *mode |= S_ISGID;
+        }
+    }
 }
 
 static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
@@ -838,6 +849,7 @@ static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
     uint64 parent_objnum, leaf_len, new_objnum;
     const char *leaf;
     gnfs_onode_t *new_onode;
+    uint32 mode = 0100644u;              /* S_IFREG | rw-r--r-- */
     uint32 uid, gid;
     int rc;
 
@@ -850,8 +862,8 @@ static int gnfs_op_create(fs_volume_t *v, const char *abs_path,
         return rc;
     }
     new_onode = gnfs_onode_at(m->obj_table, new_objnum);
-    gnfs_creator_ids(c, &uid, &gid);
-    gnfs_onode_init(new_onode, 0100644u /* S_IFREG | rw-r--r-- */, uid, gid);
+    gnfs_creator_ids(m, parent_objnum, c, 0, &mode, &uid, &gid);
+    gnfs_onode_init(new_onode, mode, uid, gid);
     gnfs_apply_inheritance(m, parent_objnum, new_onode, 0);
 
     rc = gnfs_dir_mutate(m, parent_objnum, leaf, leaf_len, 1, new_objnum, 0);
@@ -872,6 +884,7 @@ static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path,
     const char *leaf;
     uint8 block[GNFS_BLOCK_SIZE];
     gnfs_onode_t *new_onode;
+    uint32 mode = 0040755u;              /* S_IFDIR | rwxr-xr-x */
     uint32 uid, gid;
     int rc;
 
@@ -889,8 +902,8 @@ static int gnfs_op_mkdir(fs_volume_t *v, const char *abs_path,
         return rc;
     }
     new_onode = gnfs_onode_at(m->obj_table, new_objnum);
-    gnfs_creator_ids(c, &uid, &gid);
-    gnfs_onode_init(new_onode, 0040755u /* S_IFDIR | rwxr-xr-x */, uid, gid);
+    gnfs_creator_ids(m, parent_objnum, c, 1, &mode, &uid, &gid);
+    gnfs_onode_init(new_onode, mode, uid, gid);
     new_onode->direct[0] = new_block;
     new_onode->nblocks   = 1;
     new_onode->size      = GNFS_BLOCK_SIZE;

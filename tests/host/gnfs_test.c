@@ -1484,6 +1484,123 @@ static void test_chmod_special_bits(void) {
     free(image);
 }
 
+/* The two directory special bits, now that chmod can set them: setgid
+ * decides new objects' group, sticky narrows who may remove entries. Each
+ * rule is checked against the same operation in a plain 0777 directory, so
+ * it is the bit doing the refusing and not something else. */
+static void test_setgid_and_sticky_dirs(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_node_t n;
+    cred_t root, user, stranger, downer;
+    const struct cred *R, *U, *S, *D;
+    acl_t a;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the setgid/sticky test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+    check(fs_mount_at("/gs", v) == 0, "and it goes into the mount table");
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+    cred_init_nobody(&user);
+    user.euid = 1000;
+    user.egid = 1000;
+    cred_init_nobody(&stranger);
+    stranger.euid = 2000;
+    stranger.egid = 2000;
+    cred_init_nobody(&downer);
+    downer.euid = 3000;
+    downer.egid = 3000;
+    R = (const struct cred *)&root;
+    U = (const struct cred *)&user;
+    S = (const struct cred *)&stranger;
+    D = (const struct cred *)&downer;
+
+    /* --- setgid ---------------------------------------------------------- */
+    check(fs_mkdir("/gs/plain", R) == 0 && fs_lookup("/gs/plain", &n) == 0 &&
+         fs_chmod(&n, R, 0777u) == 0,
+         "root makes /gs/plain, 0777, no setgid");
+    check(fs_create("/gs/plain/f", U) == 0 &&
+         fs_lookup("/gs/plain/f", &n) == 0 && n.gid == 1000,
+         "a file made there takes its creator's egid - the control");
+
+    check(fs_mkdir("/gs/proj", R) == 0 && fs_lookup("/gs/proj", &n) == 0 &&
+         fs_setowner(&n, R, ACL_CHOWN_KEEP, 50) == 0 &&
+         fs_chmod(&n, R, 02777u) == 0 && (n.mode & 07777) == 02777u,
+         "root makes /gs/proj, group 50, setgid");
+    check(fs_create("/gs/proj/f", U) == 0 &&
+         fs_lookup("/gs/proj/f", &n) == 0 && n.uid == 1000 && n.gid == 50,
+         "a file made there by uid 1000 is still ITS file, but in group 50 "
+         "- the directory's, though uid 1000 is not even a member");
+    check((n.mode & S_ISGID) == 0,
+         "and a FILE is not born setgid");
+    check(fs_mkdir("/gs/proj/sub", U) == 0 &&
+         fs_lookup("/gs/proj/sub", &n) == 0 && n.gid == 50 &&
+         (n.mode & S_ISGID) != 0,
+         "a DIRECTORY made there is group 50 AND setgid, so the rule "
+         "carries on below it");
+    check(fs_create("/gs/proj/sub/deep", U) == 0 &&
+         fs_lookup("/gs/proj/sub/deep", &n) == 0 && n.gid == 50,
+         "one level further down, still group 50");
+
+    /* --- sticky ---------------------------------------------------------- */
+    check(fs_create("/gs/plain/g", U) == 0 &&
+         fs_unlink("/gs/plain/g", S) == 0,
+         "in a plain 0777 directory a stranger may delete uid 1000's file "
+         "- the control for everything below");
+
+    check(fs_mkdir("/gs/tmp", R) == 0 && fs_lookup("/gs/tmp", &n) == 0 &&
+         fs_chmod(&n, R, 01777u) == 0 && (n.mode & 07777) == 01777u,
+         "root makes /gs/tmp, 01777");
+    check(fs_create("/gs/tmp/u", U) == 0 && fs_create("/gs/tmp/s", S) == 0,
+         "uid 1000 and uid 2000 each make a file in it");
+    check(fs_unlink("/gs/tmp/u", S) == -1,
+         "uid 2000 may NOT delete uid 1000's file there - -EPERM, the "
+         "sticky bit, though the directory's 0777 would allow it");
+    check(fs_lookup("/gs/tmp/u", &n) == 0, "and it is still there");
+    check(fs_unlink("/gs/tmp/u", U) == 0,
+         "uid 1000 may delete its own");
+    check(fs_unlink("/gs/tmp/s", R) == 0,
+         "root - the directory's owner and supreme - may delete uid 2000's");
+
+    check(fs_mkdir("/gs/tmp2", R) == 0 && fs_lookup("/gs/tmp2", &n) == 0 &&
+         fs_setowner(&n, R, 3000, 3000) == 0 &&
+         fs_chmod(&n, D, 01777u) == 0,
+         "uid 3000 owns a sticky /gs/tmp2 of its own");
+    check(fs_create("/gs/tmp2/u", U) == 0 && fs_unlink("/gs/tmp2/u", D) == 0,
+         "and, as the DIRECTORY's owner, may delete uid 1000's file in it");
+
+    check(fs_create("/gs/tmp/granted", U) == 0 &&
+         fs_lookup("/gs/tmp/granted", &n) == 0 &&
+         fs_getacl(&n, (struct acl *)&a) == 0, "uid 1000 makes another");
+    a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[a.count].flags = 0;
+    a.ace[a.count].mask  = ACE_DELETE;
+    a.ace[a.count].who   = 2000;
+    a.count++;
+    a.trivial = 0;
+    check(fs_setacl(&n, U, (const struct acl *)&a) == 0 &&
+         fs_unlink("/gs/tmp/granted", S) == 0,
+         "an explicit ACE_DELETE its owner grants uid 2000 still works in a "
+         "sticky directory - the bit narrows the parent route only");
+
+    fs_unmount_volume(v);
+    free(image);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -1509,6 +1626,7 @@ int gnfs_run_tests(void) {
     test_delete_and_rename_check();
     test_acl_chmod_mode();
     test_chmod_special_bits();
+    test_setgid_and_sticky_dirs();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

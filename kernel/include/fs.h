@@ -496,7 +496,9 @@ int fs_setowner(fs_node_t *n, const struct cred *c, uint32 uid, uint32 gid);
 int fs_mkdir(const char *abs_path, const struct cred *c);
 /* Removal, for a non-NULL `c`, needs ACE_DELETE on the object OR
  * ACE_DELETE_CHILD + ACE_EXECUTE on its directory (the NFSv4 rule; for a
- * mode-only object, POSIX's write+search on the parent), else -EACCES.
+ * mode-only object, POSIX's write+search on the parent), else -EACCES; in
+ * a sticky directory the parent route is further limited to the entry's or
+ * directory's owner (or supreme), else -EPERM.
  * fs_rename is gated as a removal of the old name, an addition to the new
  * directory, and a removal of anything it replaces. NULL `c` is the kernel
  * and is not asked. */
