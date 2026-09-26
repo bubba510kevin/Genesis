@@ -4898,7 +4898,11 @@ static uint64 sys_chmod_node(fs_node_t *n, uint64 mode) {
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
-    acl_apply_chmod(&old_acl, (uint32)mode, &new_acl);
+    /* The TYPE comes from the object, never from the caller - chmod(2)'s
+     * mode is permission bits only, and acl_apply_chmod needs to know a
+     * directory is one (its w also grants ACE_DELETE_CHILD). */
+    acl_apply_chmod(&old_acl, (n->mode & S_IFMT) | ((uint32)mode & 07777u),
+                    &new_acl);
     proc_cred(p, &c);
     rc = fs_setacl(n, (const struct cred *)&c, (const struct acl *)&new_acl);
     return (uint64)(int64)rc;
@@ -5011,27 +5015,32 @@ static uint64 sys_mkdir(uint64 path_ptr, uint64 mode) {
 
 static uint64 sys_rmdir(uint64 path_ptr) {
     char resolved[PATH_MAX_LEN];
+    cred_t c;
     int rc = resolve_user_path(path_ptr, resolved, sizeof(resolved));
 
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
-    return (uint64)(int64)fs_rmdir(resolved);
+    proc_cred(proc_current(), &c);
+    return (uint64)(int64)fs_rmdir(resolved, (const struct cred *)&c);
 }
 
 static uint64 sys_unlink(uint64 path_ptr) {
     char resolved[PATH_MAX_LEN];
+    cred_t c;
     int rc = resolve_user_path(path_ptr, resolved, sizeof(resolved));
 
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
-    return (uint64)(int64)fs_unlink(resolved);
+    proc_cred(proc_current(), &c);
+    return (uint64)(int64)fs_unlink(resolved, (const struct cred *)&c);
 }
 
 static uint64 sys_rename(uint64 old_ptr, uint64 new_ptr) {
     char old_resolved[PATH_MAX_LEN];
     char new_resolved[PATH_MAX_LEN];
+    cred_t c;
     int rc;
 
     rc = resolve_user_path(old_ptr, old_resolved, sizeof(old_resolved));
@@ -5042,7 +5051,9 @@ static uint64 sys_rename(uint64 old_ptr, uint64 new_ptr) {
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
-    return (uint64)(int64)fs_rename(old_resolved, new_resolved);
+    proc_cred(proc_current(), &c);
+    return (uint64)(int64)fs_rename(old_resolved, new_resolved,
+                                    (const struct cred *)&c);
 }
 
 /* unlinkat's AT_REMOVEDIR flag makes it rmdir instead. That single bit is
@@ -5052,6 +5063,7 @@ static uint64 sys_rename(uint64 old_ptr, uint64 new_ptr) {
 
 static uint64 sys_unlinkat(uint64 dirfd, uint64 path_ptr, uint64 flags) {
     char resolved[PATH_MAX_LEN];
+    cred_t c;
     int rc;
 
     /* AT_FDCWD only, matching every other *at call in this file: a real
@@ -5064,10 +5076,11 @@ static uint64 sys_unlinkat(uint64 dirfd, uint64 path_ptr, uint64 flags) {
     if (rc != 0) {
         return (uint64)(int64)rc;
     }
+    proc_cred(proc_current(), &c);
     if (flags & AT_REMOVEDIR) {
-        return (uint64)(int64)fs_rmdir(resolved);
+        return (uint64)(int64)fs_rmdir(resolved, (const struct cred *)&c);
     }
-    return (uint64)(int64)fs_unlink(resolved);
+    return (uint64)(int64)fs_unlink(resolved, (const struct cred *)&c);
 }
 
 static uint64 sys_mkdirat(uint64 dirfd, uint64 path_ptr, uint64 mode) {

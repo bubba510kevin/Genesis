@@ -193,6 +193,7 @@ int acl_access(const acl_t *a, const cred_t *c, uint32 wanted) {
 
 void acl_from_mode(uint32 mode, uint32 uid, uint32 gid, acl_t *out) {
     uint32 i = 0;
+    uint32 write_bits;
 
     if (out == NULL) {
         return;
@@ -207,6 +208,17 @@ void acl_from_mode(uint32 mode, uint32 uid, uint32 gid, acl_t *out) {
     out->group = gid;
     out->trivial = 1;
 
+    /* On a directory, w also means "may remove entries" - ACE_DELETE_CHILD,
+     * which is a separate NFSv4 bit, and is exactly what OpenZFS's own
+     * zfs_acl_chmod puts in a directory's write mask. Leaving it out made
+     * access(dir, W_OK) - which asks for it, see acl_mask_for_posix - fail
+     * for the non-root owner of their own 0755 directory, and would make
+     * every mode-only directory refuse unlink to everyone but root. */
+    write_bits = ACE_WRITE_DATA | ACE_APPEND_DATA;
+    if ((mode & S_IFMT) == S_IFDIR) {
+        write_bits |= ACE_DELETE_CHILD;
+    }
+
     /* Three entries, in the order ZFS writes them. Order matters even here:
      * these are all allows, so no bit is contested, but a reader that
      * projects them back to a mode expects owner, group, everyone. */
@@ -214,7 +226,7 @@ void acl_from_mode(uint32 mode, uint32 uid, uint32 gid, acl_t *out) {
     out->ace[0].flags = ACE_OWNER;
     out->ace[0].mask = 0;
     if (mode & S_IRUSR) { out->ace[0].mask |= ACE_READ_DATA; }
-    if (mode & S_IWUSR) { out->ace[0].mask |= ACE_WRITE_DATA | ACE_APPEND_DATA; }
+    if (mode & S_IWUSR) { out->ace[0].mask |= write_bits; }
     if (mode & S_IXUSR) { out->ace[0].mask |= ACE_EXECUTE; }
     /* The owner can always read and rewrite the security of its own file, and
      * can always stat it. These bits are not in the mode word and they are
@@ -227,7 +239,7 @@ void acl_from_mode(uint32 mode, uint32 uid, uint32 gid, acl_t *out) {
     out->ace[1].flags = ACE_OWNING_GROUP;
     out->ace[1].mask = 0;
     if (mode & S_IRGRP) { out->ace[1].mask |= ACE_READ_DATA; }
-    if (mode & S_IWGRP) { out->ace[1].mask |= ACE_WRITE_DATA | ACE_APPEND_DATA; }
+    if (mode & S_IWGRP) { out->ace[1].mask |= write_bits; }
     if (mode & S_IXGRP) { out->ace[1].mask |= ACE_EXECUTE; }
     out->ace[1].mask |= ACE_READ_ATTRIBUTES | ACE_READ_ACL | ACE_SYNCHRONIZE;
 
@@ -235,7 +247,7 @@ void acl_from_mode(uint32 mode, uint32 uid, uint32 gid, acl_t *out) {
     out->ace[2].flags = ACE_EVERYONE;
     out->ace[2].mask = 0;
     if (mode & S_IROTH) { out->ace[2].mask |= ACE_READ_DATA; }
-    if (mode & S_IWOTH) { out->ace[2].mask |= ACE_WRITE_DATA | ACE_APPEND_DATA; }
+    if (mode & S_IWOTH) { out->ace[2].mask |= write_bits; }
     if (mode & S_IXOTH) { out->ace[2].mask |= ACE_EXECUTE; }
     out->ace[2].mask |= ACE_READ_ATTRIBUTES | ACE_READ_ACL | ACE_SYNCHRONIZE;
 
@@ -438,7 +450,12 @@ static uint32 chmod_class_mask(uint32 mode, uint32 r_bit, uint32 w_bit,
     uint32 m = 0;
 
     if (mode & r_bit) { m |= ACE_READ_DATA; }
-    if (mode & w_bit) { m |= ACE_WRITE_DATA | ACE_APPEND_DATA; }
+    if (mode & w_bit) {
+        m |= ACE_WRITE_DATA | ACE_APPEND_DATA;
+        if ((mode & S_IFMT) == S_IFDIR) {
+            m |= ACE_DELETE_CHILD;       /* as acl_from_mode, and why */
+        }
+    }
     if (mode & x_bit) { m |= ACE_EXECUTE; }
     return m;
 }

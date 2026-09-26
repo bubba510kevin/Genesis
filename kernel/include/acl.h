@@ -237,7 +237,11 @@ void acl_inherit(const acl_t *parent, int child_is_dir, uint32 default_mode,
  * does, via acl_from_mode or acl_inherit above. An ACL missing one - read
  * from somewhere else entirely - is not a shape this function was written to
  * splice, and it falls back to a fresh acl_from_mode(mode, ...) rather than
- * guess at preserving entries it cannot find a safe place to keep. */
+ * guess at preserving entries it cannot find a safe place to keep.
+ *
+ * `mode` must carry the object's S_IFMT type bits as well as the new
+ * permissions: on a directory, w also grants ACE_DELETE_CHILD, exactly as
+ * acl_from_mode does. */
 void acl_apply_chmod(const acl_t *old, uint32 mode, acl_t *out);
 
 /* chown(2)'s "leave this one alone" - the (uid_t)-1 / (gid_t)-1 POSIX

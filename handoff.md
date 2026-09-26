@@ -147,9 +147,12 @@ right where the work stopped):
      2026-09-26** (`fs_may_add_entry`, vfs.c): w+x on the parent, -EEXIST
      checked first. Side effect: non-root can't create on FAT (root-owned
      0755 projection); nothing does today.
-   - **Deletion is still ungated** — `fs_unlink`/`fs_rmdir` take no cred;
-     anyone can delete anything. Same class of hole; do this next
-     (ACE_DELETE on the object OR ACE_DELETE_CHILD on the parent).
+   - ~~Deletion ungated~~ — **DONE 2026-09-26**: unlink/rmdir/rename take
+     the cred (`fs_may_remove_entry`, vfs.c): ACE_DELETE on the object OR
+     DELETE_CHILD+EXECUTE on the parent; rename = remove + add + remove
+     replaced. Also fixed: directory w never granted ACE_DELETE_CHILD, so
+     `access(dir, W_OK)` failed for non-root owners.
+   - Sticky bit not modelled (can't be set on gnfs yet — see chmod gap).
    - chmod can't set/clear suid/sgid/sticky on gnfs (carried from old mode).
    - open(O_CREAT)/mkdir(2) mode argument still ignored (fixed 0644/0755).
    - setgid-directory group inheritance waits on the chmod fix.

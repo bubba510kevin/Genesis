@@ -476,9 +476,16 @@ int fs_setacl(fs_node_t *n, const struct cred *c, const struct acl *a);
 int fs_setowner(fs_node_t *n, const struct cred *c, uint32 uid, uint32 gid);
 
 int fs_mkdir(const char *abs_path, const struct cred *c);
-int fs_rmdir(const char *abs_path);
-int fs_unlink(const char *abs_path);
-int fs_rename(const char *old_path, const char *new_path);
+/* Removal, for a non-NULL `c`, needs ACE_DELETE on the object OR
+ * ACE_DELETE_CHILD + ACE_EXECUTE on its directory (the NFSv4 rule; for a
+ * mode-only object, POSIX's write+search on the parent), else -EACCES.
+ * fs_rename is gated as a removal of the old name, an addition to the new
+ * directory, and a removal of anything it replaces. NULL `c` is the kernel
+ * and is not asked. */
+int fs_rmdir(const char *abs_path, const struct cred *c);
+int fs_unlink(const char *abs_path, const struct cred *c);
+int fs_rename(const char *old_path, const char *new_path,
+              const struct cred *c);
 
 
 #endif

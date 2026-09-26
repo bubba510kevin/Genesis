@@ -419,40 +419,22 @@ static int fs_is_mount_point(const char *abs_path) {
  * a filesystem sees mkdir("/x") whether it is mounted at / or at /mnt/usb.
  */
 
-/* May `c` add a new name to the directory that would hold `abs_path`?
- * `wanted` is ACE_ADD_FILE for create, ACE_ADD_SUBDIRECTORY for mkdir, and
- * ACE_EXECUTE is always added to it: POSIX asks for write AND search on the
- * parent, and NFSv4/NT reach the same answer (a directory you cannot
- * traverse is one you cannot name a child of). Both are the same bits
- * acl_from_mode derives from a directory's w and x, so a plain mode-only
- * directory answers exactly as POSIX would.
- *
- * Asked of the PARENT, resolved through fs_lookup rather than through the
- * volume the child lands on, so a mount point is judged by the directory
- * actually being written into. NULL `c` is the kernel and is not asked.
- *
- * Callers check for an existing name FIRST. open(O_CREAT) on a file that
- * already exists must not need write access to its directory - that is how
- * a user opens their own file in a directory they cannot add to - and
- * mkdir of an existing name answers -EEXIST on Linux regardless. */
-static int fs_may_add_entry(const char *abs_path, const struct cred *c,
-                            uint32 wanted) {
+/* The directory that holds (or would hold) `abs_path`. "/x" -> "/",
+ * "/a/b" -> "/a"; a trailing slash names the same entry ("mkdir /a/b/"),
+ * not a child of it. Resolved through fs_lookup rather than through the
+ * volume the child lives on, so a mount point is judged by the directory
+ * actually being written into. */
+static int fs_lookup_parent(const char *abs_path, fs_node_t *out) {
     char parent[PATH_MAX_LEN];
-    fs_node_t pn;
     uint64 len = 0, slash = 0, i;
     int rc;
 
-    if (c == NULL) {
-        return 0;
-    }
     while (abs_path[len] != '\0') {
         len++;
     }
     if (len == 0 || len >= sizeof(parent)) {
         return -36;                            /* -ENAMETOOLONG */
     }
-    /* A trailing slash names the same entry ("mkdir /a/b/"), not a child
-     * of it; the root itself has no parent to add to. */
     while (len > 1 && abs_path[len - 1] == '/') {
         len--;
     }
@@ -462,17 +444,75 @@ static int fs_may_add_entry(const char *abs_path, const struct cred *c,
             slash = i;
         }
     }
-    /* "/x" -> "/", "/a/b" -> "/a". */
     parent[slash == 0 ? 1 : slash] = '\0';
 
-    rc = fs_lookup(parent, &pn);
+    rc = fs_lookup(parent, out);
     if (rc != 0) {
         return rc;
     }
-    if (!pn.is_dir) {
+    if (!out->is_dir) {
         return -20;                            /* -ENOTDIR */
     }
+    return 0;
+}
+
+/* May `c` add a new name to the directory that would hold `abs_path`?
+ * `wanted` is ACE_ADD_FILE for create, ACE_ADD_SUBDIRECTORY for mkdir, and
+ * ACE_EXECUTE is always added to it: POSIX asks for write AND search on the
+ * parent, and NFSv4/NT reach the same answer (a directory you cannot
+ * traverse is one you cannot name a child of). Both are the same bits
+ * acl_from_mode derives from a directory's w and x, so a plain mode-only
+ * directory answers exactly as POSIX would. NULL `c` is the kernel and is
+ * not asked.
+ *
+ * Callers check for an existing name FIRST. open(O_CREAT) on a file that
+ * already exists must not need write access to its directory - that is how
+ * a user opens their own file in a directory they cannot add to - and
+ * mkdir of an existing name answers -EEXIST on Linux regardless. */
+static int fs_may_add_entry(const char *abs_path, const struct cred *c,
+                            uint32 wanted) {
+    fs_node_t pn;
+    int rc;
+
+    if (c == NULL) {
+        return 0;
+    }
+    rc = fs_lookup_parent(abs_path, &pn);
+    if (rc != 0) {
+        return rc;
+    }
     return fs_access(&pn, c, wanted | ACE_EXECUTE);
+}
+
+/* May `c` remove the existing name `abs_path`, already resolved to
+ * `victim`? The NFSv4 rule (RFC 5661 6.2.1.3.2), which is ZFS's and, in
+ * spirit, NT's: ACE_DELETE on the object itself, OR ACE_DELETE_CHILD and
+ * ACE_EXECUTE on the directory holding it. Either suffices. For a mode-only
+ * object the first half never fires (acl_from_mode grants no ACE_DELETE),
+ * so the answer is exactly POSIX's "write and search on the parent".
+ *
+ * When both refuse, the parent's answer is the one returned - it is the one
+ * a mode-only world can act on.
+ *
+ * Not modelled: the sticky bit's "only the owner may remove it from a
+ * shared directory". chmod cannot set S_ISVTX on gnfs yet, so no directory
+ * here can be sticky; the rule lands with that. */
+static int fs_may_remove_entry(const char *abs_path, const fs_node_t *victim,
+                               const struct cred *c) {
+    fs_node_t pn;
+    int rc;
+
+    if (c == NULL) {
+        return 0;
+    }
+    if (fs_access(victim, c, ACE_DELETE) == 0) {
+        return 0;
+    }
+    rc = fs_lookup_parent(abs_path, &pn);
+    if (rc != 0) {
+        return rc;
+    }
+    return fs_access(&pn, c, ACE_DELETE_CHILD | ACE_EXECUTE);
 }
 
 int fs_mkdir(const char *abs_path, const struct cred *c) {
@@ -608,7 +648,7 @@ int fs_truncate_at(const char *abs_path, uint64 size) {
     return fs_truncate(&node, size);
 }
 
-int fs_rmdir(const char *abs_path) {
+int fs_rmdir(const char *abs_path, const struct cred *c) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -629,10 +669,22 @@ int fs_rmdir(const char *abs_path) {
     if (fs_is_mount_point(abs_path)) {
         return -16;                     /* -EBUSY */
     }
+    if (c != NULL) {
+        fs_node_t victim;
+
+        rc = fs_lookup(abs_path, &victim);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = fs_may_remove_entry(abs_path, &victim, c);
+        if (rc != 0) {
+            return rc;
+        }
+    }
     return v->ops->rmdir(v, rel);
 }
 
-int fs_unlink(const char *abs_path) {
+int fs_unlink(const char *abs_path, const struct cred *c) {
     fs_volume_t *v;
     const char *rel = NULL;
     int rc;
@@ -654,8 +706,21 @@ int fs_unlink(const char *abs_path) {
      * read the deleted file's contents. */
     {
         fs_node_t doomed;
-        int have = (fs_lookup(abs_path, &doomed) == 0 && !doomed.is_dir);
-        int urc  = v->ops->unlink(v, rel);
+        int found = (fs_lookup(abs_path, &doomed) == 0);
+        int have  = (found && !doomed.is_dir);
+        int urc;
+
+        if (c != NULL) {
+            if (!found) {
+                return -2;              /* -ENOENT: nothing there to be
+                                         * allowed to remove */
+            }
+            rc = fs_may_remove_entry(abs_path, &doomed, c);
+            if (rc != 0) {
+                return rc;
+            }
+        }
+        urc = v->ops->unlink(v, rel);
 
         if (urc == 0 && have) {
             pcache_invalidate(&doomed, 0, 0);
@@ -664,7 +729,8 @@ int fs_unlink(const char *abs_path) {
     }
 }
 
-int fs_rename(const char *old_path, const char *new_path) {
+int fs_rename(const char *old_path, const char *new_path,
+              const struct cred *c) {
     fs_volume_t *vo, *vn;
     const char *rel_old = NULL, *rel_new = NULL;
     int rc;
@@ -688,6 +754,33 @@ int fs_rename(const char *old_path, const char *new_path) {
     }
     if (vo->ops->rename == NULL) {
         return -30;
+    }
+    /* A rename is a removal from one directory and an addition to another,
+     * and is gated as both - plus a removal of whatever it replaces, since
+     * replacing a file the caller may not delete must not be a way to
+     * delete it. */
+    if (c != NULL) {
+        fs_node_t src, dst;
+
+        rc = fs_lookup(old_path, &src);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = fs_may_remove_entry(old_path, &src, c);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = fs_may_add_entry(new_path, c, src.is_dir ? ACE_ADD_SUBDIRECTORY
+                                                      : ACE_ADD_FILE);
+        if (rc != 0) {
+            return rc;
+        }
+        if (fs_lookup(new_path, &dst) == 0) {
+            rc = fs_may_remove_entry(new_path, &dst, c);
+            if (rc != 0) {
+                return rc;
+            }
+        }
     }
     return vo->ops->rename(vo, rel_old, rel_new);
 }

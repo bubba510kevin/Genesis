@@ -1164,6 +1164,190 @@ static void test_parent_write_check(void) {
     free(image);
 }
 
+/* Directory w means "may remove entries" too - ACE_DELETE_CHILD. Without
+ * it, access(dir, W_OK) failed for the non-root owner of a 0755 directory,
+ * and every mode-only directory would refuse unlink to all but root. */
+static void test_dir_write_grants_delete_child(void) {
+    acl_t a, b;
+    cred_t owner, other;
+
+    cred_init_nobody(&owner);
+    owner.euid = 10;
+    cred_init_nobody(&other);
+    other.euid = 11;
+
+    acl_from_mode(0040755u, 10, 10, &a);
+    check(acl_access(&a, &owner, acl_mask_for_posix(0, 1, 0, 1)) == 0,
+         "the owner of a 0755 directory passes access(W_OK) - it used to "
+         "fail, asking for ACE_DELETE_CHILD that nothing granted");
+    check(acl_access(&a, &other, ACE_DELETE_CHILD) == -13,
+         "a stranger to a 0755 directory may not delete children in it");
+
+    acl_from_mode(0100644u, 10, 10, &a);
+    check((a.ace[0].mask & ACE_DELETE_CHILD) == 0,
+         "a FILE's w grants no ACE_DELETE_CHILD - the bit means nothing "
+         "there");
+
+    acl_from_mode(0040700u, 10, 10, &a);
+    acl_apply_chmod(&a, 0040777u, &b);
+    check(acl_access(&b, &other, ACE_DELETE_CHILD) == 0,
+         "chmod 0777 on a directory grants it to everyone, as acl_from_mode "
+         "would");
+    acl_apply_chmod(&b, 0040755u, &a);
+    check(acl_access(&a, &other, ACE_DELETE_CHILD) == -13,
+         "and chmod back to 0755 takes it away again");
+}
+
+static int fake_rename_calls;
+
+static int fake_rename(fs_volume_t *v, const char *o, const char *n) {
+    (void)v; (void)o; (void)n;
+    fake_rename_calls++;
+    return 0;
+}
+
+/* Removing a name: ACE_DELETE on the object, or ACE_DELETE_CHILD + search
+ * on its directory. Rename is gated as a removal plus an addition; gnfs has
+ * no rename slot yet, so a copy of its ops table with a stub rename stands
+ * in - the gate is entirely the VFS's, and what is checked is whether the
+ * call is let through to the filesystem at all. */
+static void test_delete_and_rename_check(void) {
+    uint64 image_bytes = 1 * 1024 * 1024;
+    uint8 *image = (uint8 *)calloc(1, (size_t)image_bytes);
+    mem_ctx_t mctx;
+    device_t dev;
+    dev_stub_t stub;
+    fs_volume_t *v;
+    fs_ops_t ops_with_rename;
+    fs_node_t n;
+    cred_t root, user, stranger, third;
+    const struct cred *R, *U, *S, *T;
+    acl_t a;
+
+    mctx.buf = image;
+    mctx.len = image_bytes;
+    check(gnfs_format(&mctx, mem_write, image_bytes) == 0,
+         "format for the delete test must succeed");
+    dev_stub_attach(&dev, &stub, image, image_bytes);
+    v = gnfs_probe(&dev);
+    check(v != NULL, "mounting it must succeed");
+    if (v == NULL) {
+        free(image);
+        return;
+    }
+    check(fs_mount_at("/gd", v) == 0, "and it goes into the mount table");
+
+    cred_init_nobody(&root);
+    root.euid = 0;
+    cred_init_nobody(&user);
+    user.euid = 1000;
+    user.egid = 1000;
+    cred_init_nobody(&stranger);
+    stranger.euid = 2000;
+    stranger.egid = 2000;
+    cred_init_nobody(&third);
+    third.euid = 3000;
+    third.egid = 3000;
+    R = (const struct cred *)&root;
+    U = (const struct cred *)&user;
+    S = (const struct cred *)&stranger;
+    T = (const struct cred *)&third;
+
+    /* A file uid 1000 OWNS, in a directory it does not. */
+    check(fs_mkdir("/gd/pub", R) == 0 && fs_create("/gd/pub/f", R) == 0 &&
+         fs_lookup("/gd/pub/f", &n) == 0 &&
+         fs_setowner(&n, R, 1000, 1000) == 0,
+         "root makes /gd/pub/f and gives the FILE to uid 1000");
+    check(fs_unlink("/gd/pub/f", U) == -13,
+         "owning a file does not let you unlink it - that is the "
+         "directory's call");
+    check(fs_lookup("/gd/pub/f", &n) == 0, "and it really is still there");
+
+    check(fs_lookup("/gd/pub", &n) == 0 &&
+         fs_setowner(&n, R, 1000, 1000) == 0,
+         "root gives the DIRECTORY to uid 1000");
+    check(fs_unlink("/gd/pub/f", S) == -13,
+         "a stranger still may not unlink in it");
+    check(fs_unlink("/gd/pub/f", U) == 0,
+         "but its owner now may - the control");
+    check(fs_lookup("/gd/pub/f", &n) == -2, "and the file is gone");
+    check(fs_unlink("/gd/pub/f", U) == -2,
+         "unlinking it again is -ENOENT, not a permission answer");
+
+    check(fs_mkdir("/gd/pub/sub", R) == 0,
+         "root makes a subdirectory in uid 1000's directory");
+    check(fs_rmdir("/gd/pub/sub", S) == -13, "a stranger may not rmdir it");
+    check(fs_rmdir("/gd/pub/sub", U) == 0,
+         "the parent's owner may, though root made it");
+
+    /* ACE_DELETE on the object alone - no right on the parent at all. */
+    check(fs_create("/gd/locked", R) == 0 &&
+         fs_lookup("/gd/locked", &n) == 0,
+         "root makes /gd/locked in root's own 0755 directory");
+    acl_from_mode(0100644u, 0, 0, &a);
+    a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[a.count].flags = 0;
+    a.ace[a.count].mask  = ACE_DELETE;
+    a.ace[a.count].who   = 2000;
+    a.count++;
+    a.trivial = 0;
+    check(fs_setacl(&n, R, (const struct acl *)&a) == 0,
+         "and grants uid 2000 ACE_DELETE on that one file");
+    check(fs_unlink("/gd/locked", T) == -13,
+         "uid 3000, named nowhere, may not delete it");
+    check(fs_unlink("/gd/locked", S) == 0,
+         "uid 2000 may, on the object's own ACE_DELETE, with no right on "
+         "the parent - the NFSv4 either-or");
+
+    /* rename, through a stub that only counts arrivals. */
+    ops_with_rename = *v->ops;
+    ops_with_rename.rename = fake_rename;
+    v->ops = &ops_with_rename;
+    fake_rename_calls = 0;
+
+    check(fs_create("/gd/pub/r", U) == 0, "uid 1000 creates /gd/pub/r");
+    check(fs_rename("/gd/pub/r", "/gd/pub/r2", S) == -13 &&
+         fake_rename_calls == 0,
+         "a stranger may not rename in uid 1000's directory, and the "
+         "filesystem is never asked");
+    check(fs_rename("/gd/pub/r", "/gd/r3", U) == -13 &&
+         fake_rename_calls == 0,
+         "nor may the owner move it INTO root's directory - the add half");
+    check(fs_create("/gd/pub/victim", R) == 0,
+         "root puts /gd/pub/victim in uid 1000's directory");
+    check(fs_rename("/gd/pub/r", "/gd/pub/r2", U) == 0 &&
+         fake_rename_calls == 1,
+         "within its own directory the owner may - the control");
+    /* Replacing is deleting. A mode word cannot separate the two halves
+     * (a directory's w grants add AND delete-child together), so this
+     * needs a drop-box ACL: uid 1000 may ADD to /gd/drop, not delete. */
+    check(fs_mkdir("/gd/drop", R) == 0 && fs_lookup("/gd/drop", &n) == 0,
+         "root makes /gd/drop");
+    acl_from_mode(0040755u, 0, 0, &a);
+    a.ace[a.count].type  = ACE_ACCESS_ALLOWED_ACE_TYPE;
+    a.ace[a.count].flags = 0;
+    a.ace[a.count].mask  = ACE_ADD_FILE | ACE_EXECUTE;
+    a.ace[a.count].who   = 1000;
+    a.count++;
+    a.trivial = 0;
+    check(fs_setacl(&n, R, (const struct acl *)&a) == 0 &&
+         fs_create("/gd/drop/existing", R) == 0,
+         "grants uid 1000 add-but-not-delete, and holds a file of root's");
+    check(fs_rename("/gd/pub/r", "/gd/drop/new", U) == 0 &&
+         fake_rename_calls == 2,
+         "uid 1000 may move a file INTO the drop box - the add half alone");
+    check(fs_rename("/gd/pub/r", "/gd/drop/existing", U) == -13 &&
+         fake_rename_calls == 2,
+         "but may not rename OVER the file already there - replacing it "
+         "would delete it, which that ACL does not allow");
+    check(fs_rename("/gd/pub/r", "/gd/drop/existing", R) == 0 &&
+         fake_rename_calls == 3,
+         "root may");
+
+    fs_unmount_volume(v);
+    free(image);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -1185,6 +1369,8 @@ int gnfs_run_tests(void) {
     test_chown_end_to_end();
     test_creator_owns();
     test_parent_write_check();
+    test_dir_write_grants_delete_child();
+    test_delete_and_rename_check();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;
