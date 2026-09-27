@@ -1,5 +1,8 @@
 # Handoff — Genesis
 
+*For a subsystem-by-subsystem tour of everything Genesis can do, see
+`FEATURES.md`. This file is about where to pick the work up.*
+
 Last updated 2026-09-26. Read this first if you're picking the project back
 up cold. It points at the detailed prose in `ROADMAP.md` rather than
 repeating it — this file is orientation, `ROADMAP.md` is the record.
