@@ -1097,7 +1097,35 @@ static uint64 nt_create_thread(struct syscall_frame *frame) {
     return STATUS_SUCCESS;
 }
 
-/* NtTerminateThread(HANDLE, NTSTATUS). The caller itself only - see nt.h. */
+/* Another thread of this process, from outside: see nt.h. */
+static uint64 nt_terminate_other(object_t *obj, uint32 status) {
+    process_t *p = proc_current();
+    process_t *t;
+    uint32 code = 0;
+    int tid = 0;
+
+    if (thread_object_query(obj, &tid, &code) != 0) {
+        return STATUS_THREAD_IS_TERMINATING;   /* already exited */
+    }
+    t = proc_find(tid);
+    if (t == NULL || t->tgid != p->tgid || t->is_kthread ||
+        t->state == PROC_ZOMBIE) {
+        return STATUS_THREAD_IS_TERMINATING;
+    }
+    /* The full 32-bit code first, as the self path does - proc_retire's
+     * status is a POSIX one and keeps eight bits. Then the one retirement
+     * path every outside kill uses (exit_group, a fatal signal): off its
+     * wait queue, its Thread object signalled, its mutants abandoned, and
+     * - if it is running in ring 3 on another CPU - that CPU kicked so it
+     * switches away. Blocked, ready or suspended, it simply never runs
+     * again. */
+    thread_object_record_cpu(obj, t->cpu_ticks);
+    thread_object_exited(obj, status);
+    proc_retire(t, (int)(status & 0xFF));
+    return STATUS_SUCCESS;
+}
+
+/* NtTerminateThread(HANDLE, NTSTATUS). */
 static uint64 nt_terminate_thread(uint64 handle, uint64 status,
                                   struct syscall_frame *frame) {
     process_t *p = proc_current();
@@ -1112,7 +1140,7 @@ static uint64 nt_terminate_thread(uint64 handle, uint64 status,
             return STATUS_OBJECT_TYPE_MISMATCH;
         }
         if (obj != p->nt_thread_obj) {
-            return STATUS_NOT_IMPLEMENTED;   /* another thread: see nt.h */
+            return nt_terminate_other(obj, (uint32)status);
         }
     }
     /* The full 32-bit code, first - GetExitCodeThread reports it, and the

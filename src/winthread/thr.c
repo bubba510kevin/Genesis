@@ -161,6 +161,17 @@ static int frozen(void) {
     return spins == a;
 }
 
+static volatile int wrote_after;
+
+/* Blocks on `mutex` (held by the main thread), then would record that it
+ * got past - which a terminated thread must never do. */
+static DWORD WINAPI blocked_on_mutex(LPVOID param) {
+    (void)param;
+    WaitForSingleObject(mutex, INFINITE);
+    wrote_after = 1;
+    return 0;
+}
+
 static DWORD WINAPI forever(LPVOID param) {
     (void)param;
     for (;;) {
@@ -388,6 +399,79 @@ void start(void) {
           WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0 && after_self,
           "and another thread's ResumeThread lets it continue");
     CloseHandle(h[0]);
+
+    /* --- TerminateThread ------------------------------------------------- */
+    spins = 0;
+    stop = 0;
+    h[0] = CreateThread(NULL_PTR, 0, spinner, NULL_PTR, 0, NULL_PTR);
+    while (h[0] != NULL_PTR && spins == 0) {
+    }
+    check(TerminateThread(h[0], 0x12345678u) &&
+          WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0,
+          "TerminateThread ends a thread spinning in ring 3, and its handle "
+          "is signalled");
+    check(GetExitCodeThread(h[0], &code) && code == 0x12345678u,
+          "with the full 32-bit exit code it was given");
+    check(frozen(), "and it really has stopped");
+    check(!TerminateThread(h[0], 1) && GetLastError() == ERROR_ACCESS_DENIED,
+          "terminating it again fails - it has already exited");
+    stop = 1;
+    CloseHandle(h[0]);
+
+    mutex = CreateMutexW(NULL_PTR, 1, NULL_PTR);     /* held by this thread */
+    wrote_after = 0;
+    h[0] = CreateThread(NULL_PTR, 0, blocked_on_mutex, NULL_PTR, 0, NULL_PTR);
+    Sleep(60);
+    check(h[0] != NULL_PTR && WaitForSingleObject(h[0], 0) == WAIT_TIMEOUT,
+          "a thread blocked in WaitForSingleObject on a held mutex");
+    check(TerminateThread(h[0], 3) &&
+          WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0,
+          "is terminated out of the wait");
+    ReleaseMutex(mutex);
+    Sleep(60);
+    check(!wrote_after,
+          "and releasing the mutex afterwards does not wake it - it is "
+          "gone, not interrupted");
+    CloseHandle(h[0]);
+
+    holding = 0;
+    go = 0;
+    h[0] = CreateThread(NULL_PTR, 0, holder, NULL_PTR, 0, NULL_PTR);
+    while (h[0] != NULL_PTR && !holding) {
+    }
+    check(TerminateThread(h[0], 4) &&
+          WaitForSingleObject(mutex, 5000) == WAIT_ABANDONED,
+          "a thread terminated while holding a mutex abandons it");
+    ReleaseMutex(mutex);
+    ReleaseMutex(mutex);
+    CloseHandle(h[0]);
+    CloseHandle(mutex);
+
+    ran = 0;
+    h[0] = CreateThread(NULL_PTR, 0, runs, NULL_PTR, CREATE_SUSPENDED,
+                        NULL_PTR);
+    check(h[0] != NULL_PTR && TerminateThread(h[0], 5) &&
+          WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0 &&
+          GetExitCodeThread(h[0], &code) && code == 5 && !ran,
+          "a thread terminated before it was ever resumed never runs");
+    CloseHandle(h[0]);
+
+    stop = 0;                   /* spinners that only stop when killed */
+    ok = 1;
+    for (i = 0; i < 20; i++) {
+        HANDLE q = CreateThread(NULL_PTR, 0, spinner, NULL_PTR, 0, NULL_PTR);
+
+        if (q == NULL_PTR || !TerminateThread(q, 6) ||
+            WaitForSingleObject(q, 5000) != WAIT_OBJECT_0) {
+            ok = 0;
+        }
+        if (q != NULL_PTR) {
+            CloseHandle(q);
+        }
+    }
+    check(ok, "twenty threads started and terminated in turn - terminated "
+              "threads are reclaimed like exited ones");
+    stop = 1;
 
     h[1] = CreateThread(NULL_PTR, 0, runs, NULL_PTR, CREATE_SUSPENDED,
                         NULL_PTR);

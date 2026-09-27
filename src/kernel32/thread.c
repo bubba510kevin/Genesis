@@ -98,6 +98,19 @@ BOOL WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code) {
     return 1;
 }
 
+/* Wherever the thread is, it stops for good, with `code` as its exit code.
+ * Whatever it was halfway through changing stays half-changed - which is
+ * why this is a last resort on Windows too. Mutexes it held are abandoned. */
+BOOL WINAPI TerminateThread(HANDLE thread, DWORD code) {
+    NTSTATUS st = NtTerminateThread(thread, (NTSTATUS)code);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
+}
+
 DWORD WINAPI SuspendThread(HANDLE thread) {
     DWORD prev = 0;
     NTSTATUS st = NtSuspendThread(thread, &prev);

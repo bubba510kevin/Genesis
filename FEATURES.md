@@ -304,7 +304,11 @@ released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.
 `ResumeThread` (counted, up to 127), including a thread suspending itself
 and one spinning in ring 3 on another CPU.
 
-**Not yet:** terminating *another* thread, named mutexes (`OpenMutex`).
+**`TerminateThread` ✅** (2026-09-27) on another thread of the process,
+wherever it is: running on another CPU, blocked in a wait, or suspended.
+Mutexes it held are abandoned.
+
+**Not yet:** named mutexes (`OpenMutex`).
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used
@@ -514,7 +518,7 @@ Every structure offset is checked at build time against the documented ABI.
 | Area | Calls |
 |---|---|
 | Process | `NtTerminateProcess`, `NtQueryInformationProcess` (basic info, affinity, times, priority class), `NtSetInformationProcess` (affinity, priority class) |
-| Threads | `NtCreateThreadEx`, `NtTerminateThread`, `NtQueryInformationThread` (basic, times, priorities, group affinity, ideal processor), `NtSetInformationThread` (affinity, group affinity, ideal processor, priorities) |
+| Threads | `NtCreateThreadEx`, `NtTerminateThread` (self or another thread), `NtSuspendThread`, `NtResumeThread`, `NtQueryInformationThread` (basic, times, priorities, group affinity, ideal processor), `NtSetInformationThread` (affinity, group affinity, ideal processor, priorities) |
 | System | `NtQuerySystemInformation(Ex)` (basic info, processor info, per-CPU performance, logical-processor information in both forms) |
 | Scheduling & time | `NtYieldExecution`, `NtDelayExecution`, `NtGetCurrentProcessorNumber(Ex)`, `NtQueryPerformanceCounter` (the calibrated TSC), `NtQuerySystemTime` |
 | Files | `NtOpenFile`, `NtReadFile`, `NtWriteFile`, `NtClose` |

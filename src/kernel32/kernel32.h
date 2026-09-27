@@ -192,6 +192,7 @@ DWORD  WINAPI GetThreadId(HANDLE thread);
 BOOL   WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code);
 /* The previous suspend count, or (DWORD)-1 on failure. */
 DWORD  WINAPI SuspendThread(HANDLE thread);
+BOOL   WINAPI TerminateThread(HANDLE thread, DWORD code);
 DWORD  WINAPI ResumeThread(HANDLE thread);
 DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
 

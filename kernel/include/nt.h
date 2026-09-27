@@ -95,11 +95,16 @@ struct syscall_frame;
  * RDX and Argument in R8 instead. */
 #define NT_SYS_CREATE_THREAD      0x12
 
-/* NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus). Only the calling
- * thread (NtCurrentThread(), or a handle to itself) - terminating ANOTHER
- * thread asynchronously is the one thread operation even Microsoft's own
- * documentation says never to use, and doing it safely here would need the
- * APC machinery (14(b)). STATUS_NOT_IMPLEMENTED for anything else. */
+/* NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus). The calling
+ * thread (NtCurrentThread(), or a handle to itself) exits the ordinary way.
+ * ANOTHER thread of this process is retired from outside, like a thread
+ * killed by exit_group: wherever it is - ring 3 on another CPU, blocked in a
+ * wait, suspended, not yet started - it never runs another instruction, its
+ * handle is signalled with the full 32-bit ExitStatus, and mutants it held
+ * are abandoned. That is what TerminateThread does on Windows too, and is
+ * why Microsoft's documentation says never to use it: whatever user-mode
+ * state the thread was halfway through changing stays half-changed. A thread
+ * that has already exited is STATUS_THREAD_IS_TERMINATING. */
 #define NT_SYS_TERMINATE_THREAD   0x13
 
 /* NtQueryInformationThread(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG)
@@ -275,6 +280,7 @@ struct syscall_frame;
 #define STATUS_OBJECT_TYPE_MISMATCH  0xC0000024u
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
 #define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
+#define STATUS_THREAD_IS_TERMINATING  0xC000004Bu
 #define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 
 /* EVENT_TYPE. Upstream's spelling and upstream's values: the difference is
