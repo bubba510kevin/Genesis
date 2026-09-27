@@ -77,6 +77,10 @@ object_t *mutant_create(int owned);
 object_t *thread_object_create(int tid);
 void thread_object_exited(object_t *obj, uint32 exit_code);
 int thread_object_query(object_t *obj, int *tid, uint32 *exit_code);
+/* The CPU time (ticks) a thread had used at exit, kept on its object so the
+ * times of a finished thread stay answerable. record: the exit paths. */
+void thread_object_record_cpu(object_t *obj, uint64 cpu_ticks);
+int  thread_object_cpu(object_t *obj, uint64 *cpu_ticks);
 
 int dispatch_create_named(const char *name, object_t *obj);
 

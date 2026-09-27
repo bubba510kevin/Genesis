@@ -541,6 +541,100 @@ static void test_sync(void) {
     }
 }
 
+/* --- WaitOnAddress, and waiters that really sleep ------------------------- */
+
+static volatile LONG wa_word;
+static volatile int  wa_returned;
+
+static DWORD WINAPI wa_waiter(LPVOID p) {
+    LONG seen = 0;
+
+    (void)p;
+    while (wa_word == 0) {
+        WaitOnAddress(&wa_word, &seen, sizeof(seen), INFINITE);
+    }
+    wa_returned = 1;
+    return 0;
+}
+
+static SRWLOCK sleepy;
+static volatile LONG sleepy_count;
+
+static DWORD WINAPI sleepy_worker(LPVOID p) {
+    (void)p;
+    AcquireSRWLockExclusive(&sleepy);
+    sleepy_count++;                      /* deliberately not atomic */
+    ReleaseSRWLockExclusive(&sleepy);
+    return 0;
+}
+
+static void test_wait_on_address(void) {
+    HANDLE h[MAXT];
+    LONG seen = 5;
+    long long t0, t1, f = qpf();
+    DWORD i, n = ncpu < MAXT ? ncpu : MAXT;
+    FILETIME c, e, k, u;
+
+    section("smp: WaitOnAddress, and lock waiters that sleep in the kernel");
+    wa_word = 5;
+    check(WaitOnAddress(&wa_word, &seen, sizeof(seen), 0) == FALSE &&
+          GetLastError() == ERROR_TIMEOUT,
+          "a zero timeout on an unchanged word is ERROR_TIMEOUT");
+    seen = 4;
+    check(WaitOnAddress(&wa_word, &seen, sizeof(seen), INFINITE),
+          "a word that already differs returns at once");
+    seen = 5;
+    t0 = qpc();
+    check(!WaitOnAddress(&wa_word, &seen, sizeof(seen), 60) &&
+          GetLastError() == ERROR_TIMEOUT, "a 60ms wait times out");
+    t1 = qpc();
+    check((t1 - t0) * 1000 / f >= 60, "no sooner than 60ms");
+
+    wa_word = 0;
+    wa_returned = 0;
+    h[0] = CreateThread(NULL_PTR, 0, wa_waiter, NULL_PTR, 0, NULL_PTR);
+    Sleep(50);
+    check(!wa_returned, "a waiter on an unchanged word stays asleep");
+    wa_word = 1;
+    WakeByAddressSingle((PVOID)&wa_word);
+    WaitForSingleObject(h[0], 2000);
+    CloseHandle(h[0]);
+    check(wa_returned, "WakeByAddressSingle wakes it after the word changes");
+
+    /* SRW waiters that must SLEEP: the lock is held for 200ms, far past any
+     * spin, while one thread per CPU queues on it. They all get it in the
+     * end, none of it lost, and the time they spent waiting was asleep -
+     * their CPU time stays far below the 200ms they waited. */
+    InitializeSRWLock(&sleepy);
+    sleepy_count = 0;
+    AcquireSRWLockExclusive(&sleepy);
+    for (i = 0; i < n; i++) {
+        h[i] = CreateThread(NULL_PTR, 0, sleepy_worker, NULL_PTR, 0, NULL_PTR);
+    }
+    Sleep(200);
+    ReleaseSRWLockExclusive(&sleepy);
+    for (i = 0; i < n; i++) {
+        WaitForSingleObject(h[i], 5000);
+    }
+    check(sleepy_count == (LONG)n, "every SRW waiter got the lock, once");
+    {
+        unsigned long long worst = 0;
+
+        for (i = 0; i < n; i++) {
+            unsigned long long t;
+
+            GetThreadTimes(h[i], &c, &e, &k, &u);
+            t = ((unsigned long long)u.dwHighDateTime << 32) | u.dwLowDateTime;
+            if (t > worst) {
+                worst = t;
+            }
+            CloseHandle(h[i]);
+        }
+        check(worst < 1000000ULL,
+              "and waiting 200ms cost each less than 100ms of CPU - it slept");
+    }
+}
+
 void start(void) {
     out = GetStdHandle(STD_OUTPUT_HANDLE);
     say("smp: the multiprocessor, from Win32\r\n");
@@ -550,6 +644,7 @@ void start(void) {
     test_priority_and_time();
     test_parallel();
     test_sync();
+    test_wait_on_address();
 
     say("\r\nsmp: ");
     say_u((unsigned long long)passes);

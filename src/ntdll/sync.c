@@ -7,16 +7,14 @@
  * ksmp.h), so every primitive here is built on atomic instructions and is
  * correct under true parallelism, not just under interleaving.
  *
- * Waiting is done three ways, by what each primitive can afford:
- *   critical sections  block in the kernel on an auto-reset event, created
- *                      on first contention - NT's own design (LockSemaphore)
- *   SRW locks          spin, then yield the CPU (NtYieldExecution), then
- *                      sleep a tick at a time - there are no keyed events
- *   condition vars     a generation counter; a sleeper waits for it to move,
- *                      with the same spin/yield/sleep ladder. Wake and WakeAll
- *                      both move it, which wakes every sleeper: that is a
- *                      spurious wakeup for all but one, and the API permits
- *                      exactly that - every caller re-tests its predicate. */
+ * Every primitive BLOCKS IN THE KERNEL when it has to wait - after a short
+ * spin, because the holder is usually on another CPU about to let go:
+ *   critical sections  on an auto-reset event, created on first contention -
+ *                      NT's own design (LockSemaphore)
+ *   SRW locks and      on the lock/condition word itself, through
+ *   condition vars     RtlWaitOnAddress (waitaddr.c) over the kernel's
+ *                      NtWaitForAlertByThreadId - which is how Windows 8 and
+ *                      later build them too */
 
 static inline LONG atomic_inc(volatile LONG *p) {
     return __atomic_add_fetch(p, 1, __ATOMIC_ACQ_REL);
@@ -212,30 +210,73 @@ BOOLEAN RtlIsCriticalSectionLockedByThread(PRTL_CRITICAL_SECTION cs) {
 
 /* ===========================================================================
  * slim reader/writer locks
+ *
+ * One word: bit 0 is "held exclusively", bits 1-62 count shared holders,
+ * bit 63 says someone is asleep on the word. A contended acquirer spins
+ * briefly (the holder is probably on another CPU and about to let go), then
+ * sets the waiters bit and sleeps IN THE KERNEL until the word changes
+ * (RtlWaitOnAddress). A release that sees the bit wakes the sleepers.
+ *
+ * Writers are preferred: once a writer is waiting (bit 63 set), new readers
+ * wait too, so a stream of readers cannot starve it.
  * ======================================================================== */
 
 #define SRW_EXCLUSIVE ((SIZE_T)1)
 #define SRW_READER    ((SIZE_T)2)
+#define SRW_WAITERS   ((SIZE_T)1 << 63)
+#define SRW_SPIN      64
+
+void RtlWakeAddressAll(PVOID addr);
+NTSTATUS RtlWaitOnAddress(const volatile void *addr, PVOID compare, SIZE_T size,
+                          LARGE_INTEGER *timeout);
+void RtlWakeAddressSingle(PVOID addr);
 
 void RtlInitializeSRWLock(PRTL_SRWLOCK l) {
     l->Value = 0;
 }
 
 BOOLEAN RtlTryAcquireSRWLockExclusive(PRTL_SRWLOCK l) {
-    return cas_size(&l->Value, 0, SRW_EXCLUSIVE);
+    SIZE_T v = l->Value;
+
+    return (v & ~SRW_WAITERS) == 0 &&
+           cas_size(&l->Value, v, v | SRW_EXCLUSIVE);
 }
 
 BOOLEAN RtlTryAcquireSRWLockShared(PRTL_SRWLOCK l) {
     SIZE_T v = l->Value;
 
-    return !(v & SRW_EXCLUSIVE) && cas_size(&l->Value, v, v + SRW_READER);
+    return !(v & (SRW_EXCLUSIVE | SRW_WAITERS)) &&
+           cas_size(&l->Value, v, v + SRW_READER);
+}
+
+/* Sleep until the word is no longer `v | SRW_WAITERS`, having set the bit
+ * so the holder's release knows to wake us. */
+static void srw_sleep(PRTL_SRWLOCK l, SIZE_T v) {
+    SIZE_T want = v | SRW_WAITERS;
+
+    if (!(v & SRW_WAITERS) && !cas_size(&l->Value, v, want)) {
+        return;                          /* changed under us: re-test */
+    }
+    RtlWaitOnAddress(&l->Value, &want, sizeof(want), NULL_PTR);
 }
 
 void RtlAcquireSRWLockExclusive(PRTL_SRWLOCK l) {
     DWORD round = 0;
 
-    while (!cas_size(&l->Value, 0, SRW_EXCLUSIVE)) {
-        backoff(round++);
+    for (;;) {
+        SIZE_T v = l->Value;
+
+        if ((v & ~SRW_WAITERS) == 0) {
+            if (cas_size(&l->Value, v, v | SRW_EXCLUSIVE)) {
+                return;
+            }
+            continue;
+        }
+        if (round++ < SRW_SPIN) {
+            __asm__ volatile ("pause");
+            continue;
+        }
+        srw_sleep(l, v);
     }
 }
 
@@ -245,23 +286,46 @@ void RtlAcquireSRWLockShared(PRTL_SRWLOCK l) {
     for (;;) {
         SIZE_T v = l->Value;
 
-        if (!(v & SRW_EXCLUSIVE) && cas_size(&l->Value, v, v + SRW_READER)) {
-            return;
+        if (!(v & (SRW_EXCLUSIVE | SRW_WAITERS))) {
+            if (cas_size(&l->Value, v, v + SRW_READER)) {
+                return;
+            }
+            continue;
         }
-        backoff(round++);
+        if (round++ < SRW_SPIN) {
+            __asm__ volatile ("pause");
+            continue;
+        }
+        srw_sleep(l, v);
     }
 }
 
 void RtlReleaseSRWLockExclusive(PRTL_SRWLOCK l) {
-    __atomic_store_n(&l->Value, 0, __ATOMIC_RELEASE);
+    SIZE_T old = __atomic_exchange_n(&l->Value, 0, __ATOMIC_RELEASE);
+
+    if (old & SRW_WAITERS) {
+        RtlWakeAddressAll((PVOID)&l->Value);
+    }
 }
 
 void RtlReleaseSRWLockShared(PRTL_SRWLOCK l) {
-    __atomic_sub_fetch(&l->Value, SRW_READER, __ATOMIC_RELEASE);
+    SIZE_T v = __atomic_sub_fetch(&l->Value, SRW_READER, __ATOMIC_RELEASE);
+
+    /* The last reader out, with someone waiting: clear the bit (they will
+     * set it again if they lose the next race) and wake them. */
+    if (v == SRW_WAITERS && cas_size(&l->Value, SRW_WAITERS, 0)) {
+        RtlWakeAddressAll((PVOID)&l->Value);
+    }
 }
 
 /* ===========================================================================
  * condition variables
+ *
+ * A generation counter. A sleeper reads it before releasing the lock and
+ * sleeps in the kernel until it moves (RtlWaitOnAddress), so a wake landing
+ * between the release and the sleep changes the word the sleep compares
+ * against and is not lost. Wake bumps it and wakes one sleeper; WakeAll
+ * bumps it and wakes them all.
  * ======================================================================== */
 
 void RtlInitializeConditionVariable(PRTL_CONDITION_VARIABLE cv) {
@@ -270,65 +334,30 @@ void RtlInitializeConditionVariable(PRTL_CONDITION_VARIABLE cv) {
 
 void RtlWakeConditionVariable(PRTL_CONDITION_VARIABLE cv) {
     __atomic_add_fetch(&cv->Value, 1, __ATOMIC_ACQ_REL);
+    RtlWakeAddressSingle((PVOID)&cv->Value);
 }
 
 void RtlWakeAllConditionVariable(PRTL_CONDITION_VARIABLE cv) {
     __atomic_add_fetch(&cv->Value, 1, __ATOMIC_ACQ_REL);
+    RtlWakeAddressAll((PVOID)&cv->Value);
 }
 
-static LONGLONG now_100ns(void) {
-    LARGE_INTEGER t;
-
-    NtQuerySystemTime(&t);
-    return t.QuadPart;
-}
-
-/* Wait for the generation to move past `seen`, or the deadline (100ns, 0 for
- * none). Returns STATUS_TIMEOUT if the deadline passed first. */
 static NTSTATUS cv_wait(PRTL_CONDITION_VARIABLE cv, SIZE_T seen,
-                        LONGLONG deadline) {
-    DWORD round = 0;
-
-    while (__atomic_load_n(&cv->Value, __ATOMIC_ACQUIRE) == seen) {
-        if (deadline != 0 && now_100ns() >= deadline) {
-            return STATUS_TIMEOUT;
-        }
-        backoff(round++);
+                        LARGE_INTEGER *timeout) {
+    if (timeout != NULL_PTR && timeout->QuadPart == 0) {
+        return STATUS_TIMEOUT;
     }
-    return STATUS_SUCCESS;
-}
-
-static LONGLONG deadline_of(LARGE_INTEGER *timeout, int *zero_wait) {
-    *zero_wait = 0;
-    if (timeout == NULL_PTR) {
-        return 0;
-    }
-    if (timeout->QuadPart == 0) {
-        *zero_wait = 1;
-        return 0;
-    }
-    if (timeout->QuadPart < 0) {
-        return now_100ns() - timeout->QuadPart;
-    }
-    return timeout->QuadPart;
+    return RtlWaitOnAddress(&cv->Value, &seen, sizeof(seen), timeout);
 }
 
 NTSTATUS RtlSleepConditionVariableCS(PRTL_CONDITION_VARIABLE cv,
                                      PRTL_CRITICAL_SECTION cs,
                                      LARGE_INTEGER *timeout) {
-    int zero_wait;
-    LONGLONG deadline = deadline_of(timeout, &zero_wait);
     SIZE_T seen = __atomic_load_n(&cv->Value, __ATOMIC_ACQUIRE);
     NTSTATUS st;
 
-    if (zero_wait) {
-        return STATUS_TIMEOUT;
-    }
-    /* The generation is read BEFORE the section is released, so a wake that
-     * lands between the release and the wait is not lost: it moves the
-     * generation we are about to compare against. */
     RtlLeaveCriticalSection(cs);
-    st = cv_wait(cv, seen, deadline);
+    st = cv_wait(cv, seen, timeout);
     RtlEnterCriticalSection(cs);
     return st;
 }
@@ -336,21 +365,16 @@ NTSTATUS RtlSleepConditionVariableCS(PRTL_CONDITION_VARIABLE cv,
 NTSTATUS RtlSleepConditionVariableSRW(PRTL_CONDITION_VARIABLE cv,
                                       PRTL_SRWLOCK l, LARGE_INTEGER *timeout,
                                       DWORD flags) {
-    int zero_wait;
-    LONGLONG deadline = deadline_of(timeout, &zero_wait);
     SIZE_T seen = __atomic_load_n(&cv->Value, __ATOMIC_ACQUIRE);
     NTSTATUS st;
     int shared = (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) != 0;
 
-    if (zero_wait) {
-        return STATUS_TIMEOUT;
-    }
     if (shared) {
         RtlReleaseSRWLockShared(l);
     } else {
         RtlReleaseSRWLockExclusive(l);
     }
-    st = cv_wait(cv, seen, deadline);
+    st = cv_wait(cv, seen, timeout);
     if (shared) {
         RtlAcquireSRWLockShared(l);
     } else {

@@ -114,6 +114,9 @@ EXPORTS
     InterlockedPopEntrySList = ntdll.RtlInterlockedPopEntrySList
     InterlockedFlushSList = ntdll.RtlInterlockedFlushSList
     QueryDepthSList = ntdll.RtlQueryDepthSList
+    WaitOnAddress
+    WakeByAddressSingle = ntdll.RtlWakeAddressSingle
+    WakeByAddressAll = ntdll.RtlWakeAddressAll
 ; --- thread-local storage (tls.c) ---
     TlsAlloc
     TlsFree

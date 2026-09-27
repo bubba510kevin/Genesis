@@ -81,3 +81,5 @@ NT_STUB_X(NtGetCurrentProcessorNumber, NT_SYS_CURRENT_PROCESSOR);
 NT_STUB_X(NtGetCurrentProcessorNumberEx, NT_SYS_CURRENT_PROCESSOR_EX);
 NT_STUB_X(NtQueryPerformanceCounter,  NT_SYS_PERF_COUNTER);
 NT_STUB_X(NtQuerySystemTime,          NT_SYS_SYSTEM_TIME);
+NT_STUB_X(NtWaitForAlertByThreadId,   NT_SYS_WAIT_ALERT_BY_TID);
+NT_STUB_X(NtAlertThreadByThreadId,    NT_SYS_ALERT_BY_TID);

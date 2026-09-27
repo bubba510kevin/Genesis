@@ -491,3 +491,24 @@ BOOL WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK l,
     }
     return TRUE;
 }
+
+/* WaitOnAddress: sleep until *address differs from *compare, or the
+ * timeout. FALSE with ERROR_TIMEOUT on the deadline. A thin shape over
+ * ntdll's RtlWaitOnAddress (waitaddr.c); the wakes forward straight to it
+ * in kernel32.def. */
+BOOL WINAPI WaitOnAddress(volatile void *address, PVOID compare, SIZE_T size,
+                          DWORD ms) {
+    LARGE_INTEGER t;
+    NTSTATUS st;
+
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    st = RtlWaitOnAddress(address, compare, size, ms_timeout(ms, &t));
+    if (st == STATUS_TIMEOUT) {
+        SetLastError(ERROR_TIMEOUT);
+        return FALSE;
+    }
+    return NT_SUCCESS(st) ? TRUE : fail(st);
+}

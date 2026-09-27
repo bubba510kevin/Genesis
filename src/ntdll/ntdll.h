@@ -358,6 +358,17 @@ DWORD    NtGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER ProcNumber);
 NTSTATUS NtQueryPerformanceCounter(LARGE_INTEGER *Counter,
                                    LARGE_INTEGER *Frequency);
 NTSTATUS NtQuerySystemTime(LARGE_INTEGER *SystemTime);
+#define STATUS_ALERTED 0x00000101u
+NTSTATUS NtWaitForAlertByThreadId(PVOID Address, LARGE_INTEGER *Timeout);
+NTSTATUS NtAlertThreadByThreadId(HANDLE ThreadId);
+
+/* Wait until *Address differs from *Compare (Size 1, 2, 4 or 8 bytes),
+ * sleeping in the kernel; woken by RtlWakeAddressSingle/All on the same
+ * address. Spurious returns are possible - re-test. waitaddr.c. */
+NTSTATUS RtlWaitOnAddress(const volatile void *Address, PVOID Compare,
+                          SIZE_T Size, LARGE_INTEGER *Timeout);
+void     RtlWakeAddressSingle(PVOID Address);
+void     RtlWakeAddressAll(PVOID Address);
 
 /* --- synchronisation, in user mode ----------------------------------------
  *

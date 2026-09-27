@@ -415,6 +415,10 @@ void         WINAPI InitializeSListHead(PSLIST_HEADER h);
 PSLIST_ENTRY WINAPI InterlockedPushEntrySList(PSLIST_HEADER h, PSLIST_ENTRY e);
 PSLIST_ENTRY WINAPI InterlockedPopEntrySList(PSLIST_HEADER h);
 PSLIST_ENTRY WINAPI InterlockedFlushSList(PSLIST_HEADER h);
+BOOL    WINAPI WaitOnAddress(volatile void *address, PVOID compare, SIZE_T size,
+                             DWORD ms);
+void    WINAPI WakeByAddressSingle(PVOID address);
+void    WINAPI WakeByAddressAll(PVOID address);
 WORD         WINAPI QueryDepthSList(PSLIST_HEADER h);
 
 /* --- thread-local storage (tls.c) --------------------------------------- */

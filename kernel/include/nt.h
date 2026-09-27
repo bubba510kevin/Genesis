@@ -144,6 +144,18 @@ struct syscall_frame;
 #define NT_SYS_CURRENT_PROCESSOR_EX  0x1D
 #define NT_SYS_PERF_COUNTER          0x1E
 #define NT_SYS_SYSTEM_TIME           0x1F
+
+/* NtWaitForAlertByThreadId(PVOID Address, PLARGE_INTEGER Timeout)
+ * NtAlertThreadByThreadId(HANDLE ThreadId)
+ *
+ * Windows 8's primitive under WaitOnAddress, SRW locks and condition
+ * variables: a thread sleeps until ANOTHER thread alerts it by id (or the
+ * timeout passes); an alert that arrives first is remembered, so a wake
+ * racing the sleep is never lost. Address is only a hint for debuggers.
+ * STATUS_ALERTED when woken, STATUS_TIMEOUT on the deadline. The
+ * address-keyed waiting itself is ntdll's (RtlWaitOnAddress). */
+#define NT_SYS_WAIT_ALERT_BY_TID     0x20
+#define NT_SYS_ALERT_BY_TID          0x21
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -227,6 +239,8 @@ struct syscall_frame;
 #define STATUS_NOT_SUPPORTED      0xC00000BBu
 #define STATUS_INSUFFICIENT_RESOURCES 0xC000009Au
 #define STATUS_NO_YIELD_PERFORMED 0x40000024u
+#define STATUS_ALERTED            0x00000101u
+#define STATUS_INVALID_CID        0xC000000Bu
 #define STATUS_INVALID_PARAMETER_2 0xC00000F0u
 
 /* NTSTATUS values the dispatcher objects need.

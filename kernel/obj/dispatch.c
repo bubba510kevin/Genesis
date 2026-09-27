@@ -54,6 +54,9 @@ typedef struct dispatcher {
      * a POSIX wait status and keeps only eight bits. */
     int          tid;
     uint32       exit_code;
+    /* The CPU time it had used when it exited - GetThreadTimes on a handle
+     * to a finished thread, whose process slot is long gone. */
+    uint64       cpu_ticks;
 
     wait_queue_t q;
 } dispatcher_t;
@@ -481,6 +484,32 @@ void thread_object_exited(object_t *obj, uint32 exit_code) {
         waitq_wake_all(&d->q);
     }
     intr_restore(flags);
+}
+
+void thread_object_record_cpu(object_t *obj, uint64 cpu_ticks) {
+    dispatcher_t *d;
+
+    if (obj == NULL || obj->type != &thread_type) {
+        return;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d != NULL && d->in_use) {
+        d->cpu_ticks = cpu_ticks;             /* the latest word wins */
+    }
+}
+
+int thread_object_cpu(object_t *obj, uint64 *cpu_ticks) {
+    dispatcher_t *d;
+
+    if (obj == NULL || obj->type != &thread_type) {
+        return -22;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d == NULL || !d->in_use) {
+        return -22;
+    }
+    *cpu_ticks = d->cpu_ticks;
+    return 0;
 }
 
 int thread_object_query(object_t *obj, int *tid, uint32 *exit_code) {

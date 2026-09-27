@@ -800,9 +800,21 @@ static uint64 nt_set_information_thread(uint64 handle, uint64 cls, uint64 buf,
 uint64 nt_query_thread_more(uint64 handle, uint64 cls, uint64 buf, uint64 len,
                             uint64 retlen) {
     process_t *t = thread_of_handle(handle);
+    uint64 dead_ticks = 0;
 
     if (t == NULL) {
-        return STATUS_INVALID_HANDLE;
+        /* A thread that has exited still answers ThreadTimes, from what its
+         * object kept - as on Windows, where timing a worker after joining
+         * it is the usual way to ask. Every other class needs it alive. */
+        object_t *obj = nt_object_of(handle);
+        int tid;
+        uint32 code;
+
+        if ((uint32)cls != ThreadTimes || obj == NULL ||
+            thread_object_query(obj, &tid, &code) != 1 ||
+            thread_object_cpu(obj, &dead_ticks) != 0) {
+            return STATUS_INVALID_HANDLE;
+        }
     }
     switch ((uint32)cls) {
     case ThreadTimes: {
@@ -816,7 +828,8 @@ uint64 nt_query_thread_more(uint64 handle, uint64 cls, uint64 buf, uint64 len,
             return STATUS_ACCESS_VIOLATION;
         }
         zero(&tt, sizeof(tt));
-        tt.UserTime = (int64)ticks_to_100ns(t->cpu_ticks);
+        tt.UserTime = (int64)ticks_to_100ns(t != NULL ? t->cpu_ticks
+                                                      : dead_ticks);
         *(nt_times_t *)buf = tt;
         put_retlen(retlen, sizeof(tt));
         return STATUS_SUCCESS;
@@ -997,6 +1010,84 @@ static uint64 nt_query_system_time(uint64 time_ptr) {
     return STATUS_SUCCESS;
 }
 
+/* --- NtWaitForAlertByThreadId / NtAlertThreadByThreadId ----------------------------
+ *
+ * One flag per thread, consumed by the wait. All sleepers share one wait
+ * queue and each wakes to test only its own flag - a spurious wake costs a
+ * re-test, and the flag is what guarantees an alert delivered before the
+ * sleep begins is not lost. */
+#include "waitq.h"
+
+static wait_queue_t alert_q;
+static int          alert_q_ready;
+
+static int alerted(void *ctx) {
+    return ((process_t *)ctx)->nt_alerted != 0;
+}
+
+static uint64 nt_wait_for_alert(uint64 address, uint64 timeout_ptr) {
+    process_t *me = proc_current();
+    uint64 deadline = 0;
+    int r;
+
+    (void)address;
+    if (!alert_q_ready) {
+        waitq_init(&alert_q);
+        alert_q_ready = 1;
+    }
+    if (timeout_ptr != 0) {
+        int64 t;
+
+        if (!range_ok(timeout_ptr, 8)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        t = *(const int64 *)timeout_ptr;
+        if (t > 0) {
+            uint64 now = nt_now_100ns();
+
+            t = (uint64)t > now ? -(int64)((uint64)t - now) : 0;
+        }
+        if (t == 0) {
+            if (me->nt_alerted) {
+                me->nt_alerted = 0;
+                return STATUS_ALERTED;
+            }
+            return STATUS_TIMEOUT;
+        }
+        deadline = timer_ticks_now() + 1 +
+                   (((uint64)(-t)) * timer_hz() + 9999999ULL) / 10000000ULL;
+    }
+    for (;;) {
+        if (me->nt_alerted) {
+            me->nt_alerted = 0;
+            return STATUS_ALERTED;
+        }
+        r = deadline == 0 ? waitq_wait(&alert_q, alerted, me)
+                          : waitq_wait_until(&alert_q, alerted, me, deadline);
+        if (r == WAITQ_TIMEOUT && !me->nt_alerted) {
+            return STATUS_TIMEOUT;
+        }
+        if (r == WAITQ_SIGNAL && !me->nt_alerted) {
+            return STATUS_ALERTED;      /* interrupted: the caller re-tests */
+        }
+    }
+}
+
+static uint64 nt_alert_by_tid(uint64 tid) {
+    process_t *me = proc_current();
+    process_t *t = proc_find((int)tid);
+
+    if (t == NULL || t->tgid != me->tgid || t->is_kthread ||
+        t->state == PROC_ZOMBIE) {
+        return STATUS_INVALID_CID;
+    }
+    t->nt_alerted = 1;
+    if (alert_q_ready) {
+        waitq_wake_all(&alert_q);
+    }
+    return STATUS_SUCCESS;
+}
+
 /* --- dispatch ----------------------------------------------------------------------- */
 
 uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
@@ -1034,6 +1125,10 @@ uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
         return nt_query_performance_counter(frame->r10, frame->rdx);
     case NT_SYS_SYSTEM_TIME:
         return nt_query_system_time(frame->r10);
+    case NT_SYS_WAIT_ALERT_BY_TID:
+        return nt_wait_for_alert(frame->r10, frame->rdx);
+    case NT_SYS_ALERT_BY_TID:
+        return nt_alert_by_tid(frame->r10);
     default:
         *handled = 0;
         return 0;

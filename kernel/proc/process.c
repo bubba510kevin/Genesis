@@ -437,6 +437,7 @@ process_t *proc_alloc(int ppid) {
             p->nt_thread_start = 0;
             p->nt_tls_va       = 0;
             p->nt_tls_pages    = 0;
+            p->nt_alerted      = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
@@ -586,6 +587,7 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
         return;
     }
     if (p->nt_thread_obj != NULL) {
+        thread_object_record_cpu(p->nt_thread_obj, p->cpu_ticks);
         thread_object_exited(p->nt_thread_obj, exit_code);
         ob_deref(p->nt_thread_obj);
         p->nt_thread_obj = NULL;

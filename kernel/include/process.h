@@ -193,6 +193,8 @@ typedef struct process {
      * same way its TEB and stack are. 0 pages: the process has no .tls. */
     uint64           nt_tls_va;
     uint64           nt_tls_pages;
+    /* An NtAlertThreadByThreadId that has not been consumed by a wait yet. */
+    volatile int     nt_alerted;
 
     thread_t        thread;
 

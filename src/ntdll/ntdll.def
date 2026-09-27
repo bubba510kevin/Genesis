@@ -42,6 +42,11 @@ EXPORTS
     NtGetCurrentProcessorNumberEx
     NtQueryPerformanceCounter
     NtQuerySystemTime
+    NtWaitForAlertByThreadId
+    NtAlertThreadByThreadId
+    RtlWaitOnAddress
+    RtlWakeAddressSingle
+    RtlWakeAddressAll
 ; --- synchronisation ---
     RtlInitializeCriticalSection
     RtlInitializeCriticalSectionAndSpinCount

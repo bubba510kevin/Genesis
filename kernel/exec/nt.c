@@ -1106,6 +1106,7 @@ static uint64 nt_terminate_thread(uint64 handle, uint64 status,
     /* The full 32-bit code, first - GetExitCodeThread reports it, and the
      * exit path below only has room for a POSIX status's eight bits. */
     if (p->nt_thread_obj != NULL) {
+        thread_object_record_cpu(p->nt_thread_obj, p->cpu_ticks);
         thread_object_exited(p->nt_thread_obj, (uint32)status);
     }
     /* One thread's exit, not the process's: the rest of the group runs on.
