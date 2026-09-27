@@ -66,6 +66,13 @@ typedef struct fs_node {
     uint64 ino;          /* stable identity, for st_ino                     */
     int    is_dir;
 
+    /* Non-zero if THIS object cannot be written even though its volume
+     * can - a file inside a gnfs snapshot, which is a read-only view of an
+     * older state of a writable volume. fs_access treats it exactly as it
+     * treats a read-only volume. Zeroed by the VFS before every lookup, so
+     * a filesystem that has no such objects never has to know it exists. */
+    int    readonly;
+
     /* --- ownership and permission ----------------------------------------
      *
      * Carried on the node because every caller that has a node is a caller

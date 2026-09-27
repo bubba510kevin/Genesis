@@ -2505,6 +2505,154 @@ static void test_gnfs_perms(void) {
     sc1(SYS_umask, old_umask);
 }
 
+/* --- gnfs version 2 from ring 3: big files, rename, snapshots ---------------
+ *
+ * The host suite drives these through the fs_ops_t table directly; this is
+ * the same features through the real syscalls - write(2) past the old 48KB
+ * wall, rename(2) with its replace rules, and snapshots taken and deleted
+ * with plain mkdir(2)/rmdir(2) under <volume>/.snapshots, which is the whole
+ * user interface to them. */
+static int find_gnfs(char *base) {
+    u8 sfs[128];
+    char c;
+
+    base[0] = '/'; base[1] = 'm'; base[2] = 'n'; base[3] = 't';
+    base[4] = '/'; base[6] = '\0';
+    for (c = 'd'; c <= 'z'; c++) {
+        base[5] = c;
+        if (sc2(SYS_statfs, base, sfs) == 0 &&
+            *(u64 *)(sfs + 64) == GNFS_NAMELEN) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static i64 put_text(const char *path, const char *text, u64 len) {
+    i64 fd = sc3(SYS_open, path, O_WRONLY | O_CREAT | 01000 /* O_TRUNC */,
+                 0644);
+    i64 n;
+
+    if (fd < 0) {
+        return fd;
+    }
+    n = sc3(SYS_write, fd, text, len);
+    sc1(SYS_close, fd);
+    return n;
+}
+
+static i64 get_text(const char *path, char *buf, u64 cap) {
+    i64 fd = sc3(SYS_open, path, O_RDONLY, 0);
+    i64 n;
+
+    if (fd < 0) {
+        return fd;
+    }
+    n = sc3(SYS_read, fd, buf, cap - 1);
+    sc1(SYS_close, fd);
+    if (n >= 0) {
+        buf[n] = '\0';
+    }
+    return n;
+}
+
+static int text_is(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static char v2buf[8192];
+
+static void test_gnfs_v2(void) {
+    char base[8];
+    char p[64], q[64], got[64];
+    u8 st[144];
+    i64 fd, i, ok;
+
+    section("gnfs v2 from ring 3: big files, rename, snapshots");
+    if (!find_gnfs(base)) {
+        out("  skip  no gnfs volume is mounted\n");
+        return;
+    }
+
+    /* --- a file past the old 48KB limit, through write(2) ----------------- */
+    path_at(p, base, "/bigfile");
+    fd = sc3(SYS_open, p, O_WRONLY | O_CREAT, 0644);
+    check(fd >= 0, "create <gnfs>/bigfile");
+    ok = fd >= 0;
+    for (i = 0; ok && i < 16; i++) {                /* 16 x 8KB = 128KB */
+        u64 k;
+
+        for (k = 0; k < sizeof(v2buf); k++) {
+            v2buf[k] = (char)('a' + (i + k) % 26);
+        }
+        ok = sc3(SYS_write, fd, v2buf, sizeof(v2buf)) == (i64)sizeof(v2buf);
+    }
+    if (fd >= 0) sc1(SYS_close, fd);
+    check(ok, "write 128KB to it - v1 refused anything past 48KB");
+    check(sc2(SYS_stat, p, st) == 0 && *(i64 *)(st + 48) == 131072,
+          "stat says 131072 bytes");
+    fd = sc3(SYS_open, p, O_RDONLY, 0);
+    ok = fd >= 0 && sc3(SYS_lseek, fd, 15 * 8192, 0) == 15 * 8192 &&
+         sc3(SYS_read, fd, v2buf, 8192) == 8192 &&
+         v2buf[0] == (char)('a' + 15 % 26) && v2buf[8191] ==
+         (char)('a' + (15 + 8191) % 26);
+    if (fd >= 0) sc1(SYS_close, fd);
+    check(ok, "and the last 8KB, read back through the indirect block, is "
+              "right");
+    check_eq(sc1(SYS_unlink, p), 0, "it unlinks");
+
+    /* --- rename(2) ------------------------------------------------------- */
+    path_at(p, base, "/r1");
+    path_at(q, base, "/r2");
+    check_eq(put_text(p, "first", 5), 5, "create <gnfs>/r1");
+    check_eq(sc2(SYS_rename, p, q), 0, "rename r1 -> r2 (v1 had no rename)");
+    check_eq(sc2(SYS_stat, p, st), -ENOENT, "r1 is gone");
+    check(get_text(q, got, sizeof(got)) == 5 && text_is(got, "first"),
+          "r2 has its contents");
+    check_eq(put_text(p, "second", 6), 6, "create a new r1");
+    check_eq(sc2(SYS_rename, p, q), 0, "rename it over the existing r2");
+    check(get_text(q, got, sizeof(got)) == 6 && text_is(got, "second"),
+          "which REPLACED r2");
+    path_at(p, base, "/rdir");
+    check_eq(sc2(SYS_mkdir, p, 0755), 0, "mkdir <gnfs>/rdir");
+    check_eq(sc2(SYS_rename, q, p), -EISDIR,
+             "a file onto a directory is -EISDIR");
+    path_at(q, base, "/rdir/inside");
+    check_eq(sc2(SYS_rename, p, q), -EINVAL,
+             "a directory into itself is -EINVAL");
+
+    /* --- snapshots, through mkdir/rmdir ---------------------------------- */
+    path_at(p, base, "/snapfile");
+    check_eq(put_text(p, "before", 6), 6, "create <gnfs>/snapfile = before");
+    path_at(q, base, "/.snapshots/sys1");
+    check_eq(as_user(1000, 1000, OP_MKDIR, q, 0755, 0), -EACCES,
+             "uid 1000 may not take a snapshot - /.snapshots is root's 0755");
+    check_eq(sc2(SYS_mkdir, q, 0755), 0,
+             "root takes one: mkdir <gnfs>/.snapshots/sys1");
+    check_eq(put_text(p, "after!", 6), 6, "then rewrites snapfile = after!");
+    path_at(q, base, "/.snapshots/sys1/snapfile");
+    check(get_text(q, got, sizeof(got)) == 6 && text_is(got, "before"),
+          "the snapshot still reads before");
+    check(get_text(p, got, sizeof(got)) == 6 && text_is(got, "after!"),
+          "while the live file reads after!");
+    check_eq(sc3(SYS_open, q, O_WRONLY, 0), -EROFS,
+             "the snapshot is read-only - open for write is -EROFS");
+    path_at(q, base, "/.snapshots");
+    fd = sc3(SYS_open, q, O_RDONLY | O_DIRECTORY, 0);
+    check(fd >= 0 && sc3(SYS_getdents64, fd, v2buf, sizeof(v2buf)) > 0 &&
+          mem_has_ci(v2buf, sizeof(v2buf), "sys1"),
+          "getdents on <gnfs>/.snapshots lists sys1");
+    if (fd >= 0) sc1(SYS_close, fd);
+    path_at(q, base, "/.snapshots/sys1");
+    check_eq(sc1(SYS_rmdir, q), 0, "rmdir deletes the snapshot");
+    path_at(q, base, "/.snapshots/sys1/snapfile");
+    check_eq(sc2(SYS_stat, q, st), -ENOENT, "and it is gone");
+}
+
 /* --- main --------------------------------------------------------------- */
 
 void _start(void) {
@@ -2543,6 +2691,7 @@ void _start(void) {
     test_audit_gapfill();
     test_namespace();
     test_gnfs_perms();
+    test_gnfs_v2();
 
     out("\nsystest: ");
     out_i64(passes);

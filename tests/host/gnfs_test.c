@@ -51,14 +51,16 @@ static void test_checksum_is_sensitive(void) {
 
 /* A plausible root record for the pure tests below, sharing exactly one
  * construction rather than each test hand-rolling gnfs_root_init's argument
- * list - which matters here because gnfs_root_valid checks max_objects and
- * obj_table_blocks against the compiled-in constants, so a stray literal in
- * one test would fail for a reason that has nothing to do with what it is
- * testing. */
+ * list - gnfs_root_valid requires obj_table_blocks to agree exactly with
+ * max_objects, so a stray literal in one test would fail for a reason that
+ * has nothing to do with what it is testing. */
+#define TEST_MAX_OBJECTS 256u
+
 static void make_test_root(gnfs_root_t *r) {
     gnfs_root_init(r, 1000, GNFS_RING_SLOTS, 4,
-                   GNFS_RING_SLOTS + 8, GNFS_OBJ_TABLE_BLOCKS,
-                   GNFS_MAX_OBJECTS, GNFS_ROOT_DIR_OBJNUM);
+                   GNFS_RING_SLOTS + 8,
+                   gnfs_obj_table_blocks_for(TEST_MAX_OBJECTS),
+                   TEST_MAX_OBJECTS, GNFS_ROOT_DIR_OBJNUM);
 }
 
 static void test_root_seal_and_valid(void) {
@@ -76,11 +78,19 @@ static void test_root_seal_and_valid(void) {
     check(!gnfs_root_valid(&r), "an unrecognised version must be rejected");
     r.version = GNFS_VERSION;
 
-    r.max_objects = GNFS_MAX_OBJECTS + 1;
+    r.max_objects = TEST_MAX_OBJECTS * 4;
+    gnfs_root_seal(&r);
     check(!gnfs_root_valid(&r),
-         "an object-table capacity that disagrees with this build's "
-         "GNFS_MAX_OBJECTS must be refused, not silently trusted");
-    r.max_objects = GNFS_MAX_OBJECTS;
+         "a capacity the recorded table size cannot hold must be refused - "
+         "even correctly sealed - rather than one of the two numbers being "
+         "trusted over the other");
+    r.max_objects = GNFS_MAX_OBJECTS_LIMIT + 1;
+    r.obj_table_blocks = gnfs_obj_table_blocks_for(r.max_objects);
+    gnfs_root_seal(&r);
+    check(!gnfs_root_valid(&r),
+         "and a capacity past GNFS_MAX_OBJECTS_LIMIT is refused even when "
+         "the table size agrees with it");
+    make_test_root(&r);
 
     r.txg = 42;
     check(!gnfs_root_valid(&r),
@@ -140,16 +150,16 @@ static void test_bitmap_alloc_first_fit(void) {
 /* --- pure logic: onodes -------------------------------------------------- */
 
 static void test_onode_init_and_access(void) {
-    static uint8 table[(uint64)GNFS_OBJ_TABLE_BLOCKS * GNFS_BLOCK_SIZE];
+    static uint8 table[TEST_MAX_OBJECTS * sizeof(gnfs_onode_t)];
     gnfs_onode_t *o;
 
-    check(gnfs_onode_at(table, 0) == NULL,
+    check(gnfs_onode_at(table, TEST_MAX_OBJECTS, 0) == NULL,
          "object number 0 must never resolve - it means \"no object\"");
-    check(gnfs_onode_at(table, GNFS_MAX_OBJECTS) == NULL,
+    check(gnfs_onode_at(table, TEST_MAX_OBJECTS, TEST_MAX_OBJECTS) == NULL,
          "an out-of-range object number must be refused, not read past the "
          "table");
 
-    o = gnfs_onode_at(table, 5);
+    o = gnfs_onode_at(table, TEST_MAX_OBJECTS, 5);
     check(o != NULL, "an in-range object number must resolve");
     gnfs_onode_init(o, 0100644u, 42, 7);
     check(o->mode == 0100644u && o->uid == 42 && o->gid == 7 &&
@@ -158,20 +168,45 @@ static void test_onode_init_and_access(void) {
          "data yet");
 }
 
-static void test_onode_alloc_is_monotonic_and_bounded(void) {
+/* Version 1 never reused an object number, so a volume was permanently
+ * full after its 255th create EVER. Numbers are reused now - checked by
+ * filling the table, freeing one slot BEHIND the hint, and requiring the
+ * next allocation to find exactly that one. */
+static void test_onode_alloc_reuses_and_is_bounded(void) {
+    static uint8 table[TEST_MAX_OBJECTS * sizeof(gnfs_onode_t)];
     gnfs_root_t r;
-    uint64 a, b, c;
+    uint64 a, b, c, n;
 
+    memset(table, 0, sizeof(table));
     make_test_root(&r);
-    check(gnfs_onode_alloc(&r, &a) == 0 && a == GNFS_ROOT_DIR_OBJNUM + 1,
-         "the first allocation after format must be the object right after "
-         "the root directory");
-    check(gnfs_onode_alloc(&r, &b) == 0 && b == a + 1,
-         "allocations are monotonic, never reused in this foundation");
+    gnfs_onode_init(gnfs_onode_at(table, TEST_MAX_OBJECTS,
+                                  GNFS_ROOT_DIR_OBJNUM), 0040755u, 0, 0);
 
-    r.next_objnum = GNFS_MAX_OBJECTS;
-    check(gnfs_onode_alloc(&r, &c) == -28,
-         "allocating past GNFS_MAX_OBJECTS must return -ENOSPC");
+    check(gnfs_onode_alloc(&r, table, &a) == 0 &&
+         a == GNFS_ROOT_DIR_OBJNUM + 1,
+         "the first allocation after format is the object after the root");
+    gnfs_onode_init(gnfs_onode_at(table, TEST_MAX_OBJECTS, a), 0100644u, 0, 0);
+    check(gnfs_onode_alloc(&r, table, &b) == 0 && b == a + 1,
+         "the next one follows it");
+    gnfs_onode_init(gnfs_onode_at(table, TEST_MAX_OBJECTS, b), 0100644u, 0, 0);
+
+    for (n = b + 1; n < TEST_MAX_OBJECTS; n++) {
+        uint64 got;
+
+        if (gnfs_onode_alloc(&r, table, &got) != 0) {
+            break;
+        }
+        gnfs_onode_init(gnfs_onode_at(table, TEST_MAX_OBJECTS, got),
+                        0100644u, 0, 0);
+    }
+    check(gnfs_onode_alloc(&r, table, &c) == -28,
+         "a full table is -ENOSPC");
+    check(gnfs_objects_in_use(table, TEST_MAX_OBJECTS) ==
+         TEST_MAX_OBJECTS - 1, "and every slot but 0 is counted in use");
+
+    gnfs_onode_free(gnfs_onode_at(table, TEST_MAX_OBJECTS, a));
+    check(gnfs_onode_alloc(&r, table, &c) == 0 && c == a,
+         "a freed slot behind the hint is found again - numbers are reused");
 }
 
 /* --- pure logic: directory entries --------------------------------------- */
@@ -1667,6 +1702,418 @@ static void test_create_mode(void) {
     free(image);
 }
 
+/* --- gnfs version 2: big files, reuse, big directories, rename, snapshots -- */
+
+typedef struct {
+    uint8      *image;
+    uint64      bytes;
+    device_t    dev;
+    dev_stub_t  stub;
+    fs_volume_t *v;
+} vol_t;
+
+static fs_volume_t *vol_open(vol_t *t, uint64 bytes) {
+    mem_ctx_t mctx;
+
+    t->image = (uint8 *)calloc(1, (size_t)bytes);
+    t->bytes = bytes;
+    mctx.buf = t->image;
+    mctx.len = bytes;
+    if (t->image == NULL || gnfs_format(&mctx, mem_write, bytes) != 0) {
+        return NULL;
+    }
+    dev_stub_attach(&t->dev, &t->stub, t->image, bytes);
+    t->v = gnfs_probe(&t->dev);
+    return t->v;
+}
+
+/* Tear the mount down and mount the SAME bytes again - the only way to know
+ * a change reached the medium rather than living in the mount's memory. */
+static fs_volume_t *vol_remount(vol_t *t) {
+    t->v->ops->unmount(t->v);
+    dev_stub_attach(&t->dev, &t->stub, t->image, t->bytes);
+    t->v = gnfs_probe(&t->dev);
+    return t->v;
+}
+
+static void vol_close(vol_t *t) {
+    if (t->v != NULL) {
+        t->v->ops->unmount(t->v);
+    }
+    free(t->image);
+}
+
+static uint64 free_blocks(fs_volume_t *v) {
+    fs_statfs_t st;
+
+    return v->ops->statfs(v, &st) == 0 ? st.blocks_free : 0;
+}
+
+static uint8 pattern(uint64 pos) {
+    return (uint8)((pos * 2654435761ULL) >> 13);
+}
+
+static void test_large_and_sparse_files(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 16ULL * 1024 * 1024);
+    fs_node_t n;
+    uint64 before, total = 2560ULL * 1024;     /* 2.5MB: all three levels */
+    uint64 chunk = 64 * 1024, off, i;
+    uint8 *buf = (uint8 *)malloc((size_t)chunk);
+    int ok;
+
+    check(v != NULL && buf != NULL, "big-file volume mounts");
+    if (v == NULL || buf == NULL) {
+        free(buf);
+        vol_close(&t);
+        return;
+    }
+    before = free_blocks(v);
+    check(v->ops->create(v, "/big", NULL, 0644u) == 0 &&
+         v->ops->lookup(v, "/big", &n) == 0, "create /big");
+
+    ok = 1;
+    for (off = 0; off < total; off += chunk) {
+        for (i = 0; i < chunk; i++) {
+            buf[i] = pattern(off + i);
+        }
+        if (v->ops->write(v, &n, off, buf, chunk) != (int64)chunk) {
+            ok = 0;
+            break;
+        }
+    }
+    check(ok, "2.5MB written - through the 12 direct blocks, the whole "
+              "indirect block, and into the double-indirect one (v1 refused "
+              "anything past 48KB)");
+
+    v = vol_remount(&t);
+    check(v != NULL && v->ops->lookup(v, "/big", &n) == 0 && n.size == total,
+         "after a remount /big is still 2.5MB");
+    ok = 1;
+    for (off = 0; v != NULL && off < total; off += chunk) {
+        if (v->ops->read(v, &n, off, buf, chunk) != (int64)chunk) {
+            ok = 0;
+            break;
+        }
+        for (i = 0; i < chunk; i++) {
+            if (buf[i] != pattern(off + i)) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+    }
+    check(ok, "and every byte reads back, across every mapping level");
+
+    /* Sparse, right at the edge of what the map can address. */
+    {
+        uint64 limit = GNFS_MAX_FILE_BLOCKS * (uint64)GNFS_BLOCK_SIZE;
+        uint8 tail[16], got[16];
+
+        for (i = 0; i < 16; i++) {
+            tail[i] = (uint8)(0xA0 + i);
+        }
+        check(v->ops->create(v, "/sparse", NULL, 0644u) == 0 &&
+             v->ops->lookup(v, "/sparse", &n) == 0 &&
+             v->ops->write(v, &n, limit - 16, tail, 16) == 16,
+             "a write in the last 16 bytes the map can address (~1GB) "
+             "succeeds on a 16MB volume - everything before it is a hole");
+        check(n.size == limit, "and the file is that long");
+        check(v->ops->read(v, &n, limit - 16, got, 16) == 16 &&
+             memcmp(got, tail, 16) == 0, "the bytes read back");
+        check(v->ops->read(v, &n, 1ULL << 29, got, 16) == 16 &&
+             got[0] == 0 && got[15] == 0, "and a hole in the middle reads "
+             "as zeroes");
+        check(v->ops->write(v, &n, limit, tail, 1) == -27,
+             "one byte past the map is -EFBIG, not a truncated write");
+    }
+
+    check(v->ops->unlink(v, "/big") == 0 && v->ops->unlink(v, "/sparse") == 0,
+         "both files unlink");
+    check(free_blocks(v) == before,
+         "and the free count is EXACTLY where it started - every data block "
+         "and every pointer block came back");
+    free(buf);
+    vol_close(&t);
+}
+
+static void test_objects_are_reused(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 4ULL * 1024 * 1024);
+    int i, ok = 1;
+
+    check(v != NULL, "reuse volume mounts");
+    if (v == NULL) {
+        vol_close(&t);
+        return;
+    }
+    for (i = 0; i < 2000; i++) {
+        if (v->ops->create(v, "/churn", NULL, 0644u) != 0 ||
+            v->ops->unlink(v, "/churn") != 0) {
+            ok = 0;
+            break;
+        }
+    }
+    check(ok, "2000 create/unlink cycles on a volume with 256 object slots "
+              "all succeed - v1 never reused a number and was full for "
+              "good after 255 creates");
+    vol_close(&t);
+}
+
+static int count_cb(const fs_dirent_t *e, void *ctx) {
+    (void)e;
+    (*(int *)ctx)++;
+    return 0;
+}
+
+static void test_big_directory(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 8ULL * 1024 * 1024);
+    fs_node_t d, n;
+    char path[64];
+    int i, ok = 1, count = 0;
+
+    check(v != NULL, "big-directory volume mounts");
+    if (v == NULL) {
+        vol_close(&t);
+        return;
+    }
+    check(v->ops->mkdir(v, "/many", NULL, 0755u) == 0, "mkdir /many");
+    for (i = 0; i < 300 && ok; i++) {
+        snprintf(path, sizeof(path), "/many/file-number-%d", i);
+        ok = v->ops->create(v, path, NULL, 0644u) == 0;
+    }
+    check(ok, "300 entries in one directory - a block holds 51, so it grew "
+              "to six blocks (v1 stopped at 51 with -ENOSPC)");
+    v = vol_remount(&t);
+    ok = v != NULL;
+    for (i = 0; ok && i < 300; i++) {
+        snprintf(path, sizeof(path), "/many/file-number-%d", i);
+        ok = v->ops->lookup(v, path, &n) == 0;
+    }
+    check(ok, "after a remount every one of them resolves");
+    check(v->ops->lookup(v, "/many", &d) == 0 &&
+         v->ops->iterate(v, &d, count_cb, &count) == 0 && count == 300,
+         "and iterating the directory yields exactly 300");
+    check(v->ops->rmdir(v, "/many") == -39,
+         "rmdir refuses it while it holds anything");
+    ok = 1;
+    for (i = 0; ok && i < 300; i++) {
+        snprintf(path, sizeof(path), "/many/file-number-%d", i);
+        ok = v->ops->unlink(v, path) == 0;
+    }
+    check(ok && v->ops->rmdir(v, "/many") == 0,
+         "and removes it once all 300 are gone");
+    vol_close(&t);
+}
+
+static int read_all(fs_volume_t *v, const char *path, char *out, int cap) {
+    fs_node_t n;
+    int64 got;
+
+    if (v->ops->lookup(v, path, &n) != 0) {
+        return -1;
+    }
+    got = v->ops->read(v, &n, 0, out, (uint64)cap - 1);
+    if (got < 0) {
+        return -1;
+    }
+    out[got] = '\0';
+    return (int)got;
+}
+
+static int put(fs_volume_t *v, const char *path, const char *text) {
+    fs_node_t n;
+
+    if (v->ops->lookup(v, path, &n) != 0 &&
+        v->ops->create(v, path, NULL, 0644u) != 0) {
+        return -1;
+    }
+    if (v->ops->lookup(v, path, &n) != 0) {
+        return -1;
+    }
+    if (v->ops->truncate(v, &n, 0) != 0) {
+        return -1;
+    }
+    return v->ops->write(v, &n, 0, text, strlen(text)) ==
+           (int64)strlen(text) ? 0 : -1;
+}
+
+static void test_rename(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 4ULL * 1024 * 1024);
+    fs_node_t n;
+    char buf[64];
+
+    check(v != NULL, "rename volume mounts");
+    if (v == NULL) {
+        vol_close(&t);
+        return;
+    }
+    check(put(v, "/a", "alpha") == 0 && put(v, "/b", "bravo") == 0 &&
+         v->ops->mkdir(v, "/d1", NULL, 0755u) == 0 &&
+         v->ops->mkdir(v, "/d2", NULL, 0755u) == 0 &&
+         put(v, "/d2/inner", "x") == 0, "set up /a /b /d1 /d2/inner");
+
+    check(v->ops->rename(v, "/a", "/a2") == 0 &&
+         v->ops->lookup(v, "/a", &n) == -2 &&
+         read_all(v, "/a2", buf, sizeof(buf)) == 5 && strcmp(buf, "alpha") == 0,
+         "a rename in place: the old name is gone and the new one has the "
+         "contents");
+    check(v->ops->rename(v, "/a2", "/d1/a3") == 0 &&
+         read_all(v, "/d1/a3", buf, sizeof(buf)) == 5,
+         "across directories");
+    check(v->ops->rename(v, "/b", "/d1/a3") == 0 &&
+         read_all(v, "/d1/a3", buf, sizeof(buf)) == 5 &&
+         strcmp(buf, "bravo") == 0 && v->ops->lookup(v, "/b", &n) == -2,
+         "onto an existing file REPLACES it");
+    check(v->ops->rename(v, "/d1/a3", "/d1/a3") == 0,
+         "onto itself is a successful no-op");
+    check(v->ops->rename(v, "/d1", "/d2") == -39,
+         "a directory onto a NON-empty directory is -ENOTEMPTY");
+    check(v->ops->rename(v, "/d1", "/d1/sub") == -22,
+         "a directory into itself is -EINVAL");
+    check(v->ops->rename(v, "/d1/a3", "/d2") == -21,
+         "a file onto a directory is -EISDIR");
+    check(v->ops->rename(v, "/d2", "/d1/a3") == -20,
+         "a directory onto a file is -ENOTDIR");
+    check(v->ops->rename(v, "/nope", "/x") == -2, "a missing source is -ENOENT");
+    check(v->ops->mkdir(v, "/empty", NULL, 0755u) == 0 &&
+         v->ops->rename(v, "/d1", "/empty") == 0 &&
+         read_all(v, "/empty/a3", buf, sizeof(buf)) == 5,
+         "a directory onto an EMPTY directory replaces it, contents and all");
+
+    v = vol_remount(&t);
+    check(v != NULL && read_all(v, "/empty/a3", buf, sizeof(buf)) == 5 &&
+         strcmp(buf, "bravo") == 0 && v->ops->lookup(v, "/d1", &n) == -2,
+         "and all of it survived a remount");
+    vol_close(&t);
+}
+
+/* Truncate a file into the middle of a block, then grow it again: the
+ * bytes that were cut off must read back as ZERO. v1 left them in the
+ * block's tail and a later grow exposed them. */
+static void test_truncate_does_not_resurrect(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 4ULL * 1024 * 1024);
+    fs_node_t n;
+    uint8 buf[100];
+    int i, clean = 1;
+
+    check(v != NULL, "truncate volume mounts");
+    if (v == NULL) {
+        vol_close(&t);
+        return;
+    }
+    memset(buf, 'S', sizeof(buf));
+    check(v->ops->create(v, "/t", NULL, 0644u) == 0 &&
+         v->ops->lookup(v, "/t", &n) == 0 &&
+         v->ops->write(v, &n, 0, buf, 100) == 100, "write 100 bytes of 'S'");
+    check(v->ops->truncate(v, &n, 10) == 0 && n.size == 10,
+         "truncate to 10");
+    check(v->ops->truncate(v, &n, 100) == 0 && n.size == 100,
+         "and grow back to 100");
+    memset(buf, 0xEE, sizeof(buf));
+    check(v->ops->read(v, &n, 0, buf, 100) == 100, "read it all");
+    for (i = 10; i < 100; i++) {
+        if (buf[i] != 0) {
+            clean = 0;
+        }
+    }
+    check(buf[0] == 'S' && buf[9] == 'S' && clean,
+         "bytes 10..99 read as ZERO, not the 'S' that was cut off");
+    vol_close(&t);
+}
+
+static void test_snapshots(void) {
+    vol_t t;
+    fs_volume_t *v = vol_open(&t, 8ULL * 1024 * 1024);
+    fs_node_t n, sd;
+    char buf[64];
+    uint64 before_snap, after_delete;
+    int count = 0;
+
+    check(v != NULL, "snapshot volume mounts");
+    if (v == NULL) {
+        vol_close(&t);
+        return;
+    }
+    check(put(v, "/keep", "original") == 0 && put(v, "/gone", "doomed") == 0,
+         "set up /keep and /gone");
+    before_snap = free_blocks(v);
+
+    check(v->ops->mkdir(v, "/.snapshots/s1", NULL, 0755u) == 0,
+         "mkdir /.snapshots/s1 takes a snapshot");
+    check(v->ops->mkdir(v, "/.snapshots/s1", NULL, 0755u) == -17,
+         "a second snapshot of the same name is -EEXIST");
+
+    check(put(v, "/keep", "CHANGED!") == 0 && v->ops->unlink(v, "/gone") == 0,
+         "then /keep is rewritten and /gone deleted");
+    check(read_all(v, "/keep", buf, sizeof(buf)) > 0 &&
+         strcmp(buf, "CHANGED!") == 0, "the live /keep has the new contents");
+    check(read_all(v, "/.snapshots/s1/keep", buf, sizeof(buf)) > 0 &&
+         strcmp(buf, "original") == 0,
+         "and the snapshot still has the ORIGINAL - COW left the old blocks "
+         "alone and the allocator did not hand them out again");
+    check(read_all(v, "/.snapshots/s1/gone", buf, sizeof(buf)) > 0 &&
+         strcmp(buf, "doomed") == 0,
+         "a file deleted since is still there in the snapshot");
+
+    check(v->ops->lookup(v, "/.snapshots/s1/keep", &n) == 0 &&
+         v->ops->write(v, &n, 0, "x", 1) == -30,
+         "a snapshot is read-only: a write is -EROFS");
+    check(v->ops->create(v, "/.snapshots/s1/new", NULL, 0644u) == -30,
+         "and so is creating in it");
+    check(v->ops->lookup(v, "/.snapshots", &sd) == 0 &&
+         v->ops->iterate(v, &sd, count_cb, &count) == 0 && count == 1,
+         "/.snapshots lists the one snapshot");
+
+    /* Fill the volume. If the allocator ever handed out a block the
+     * snapshot still references, the snapshot's contents would change. */
+    {
+        uint8 fill[4096];
+        fs_node_t f;
+        uint64 off = 0;
+
+        memset(fill, 0x55, sizeof(fill));
+        check(v->ops->create(v, "/fill", NULL, 0644u) == 0 &&
+             v->ops->lookup(v, "/fill", &f) == 0, "create /fill");
+        while (v->ops->write(v, &f, off, fill, sizeof(fill)) ==
+               (int64)sizeof(fill)) {
+            off += sizeof(fill);
+        }
+        check(off > 0, "and write to it until the volume is full");
+        check(read_all(v, "/.snapshots/s1/keep", buf, sizeof(buf)) > 0 &&
+             strcmp(buf, "original") == 0 &&
+             read_all(v, "/.snapshots/s1/gone", buf, sizeof(buf)) > 0 &&
+             strcmp(buf, "doomed") == 0,
+             "with the volume full, the snapshot is still intact - no block "
+             "it holds was reused");
+        check(v->ops->unlink(v, "/fill") == 0, "remove /fill");
+    }
+
+    v = vol_remount(&t);
+    check(v != NULL && read_all(v, "/.snapshots/s1/keep", buf, sizeof(buf)) > 0
+         && strcmp(buf, "original") == 0,
+         "the snapshot survives a remount");
+
+    check(v->ops->rmdir(v, "/.snapshots/s1") == 0,
+         "rmdir /.snapshots/s1 deletes it");
+    check(v->ops->lookup(v, "/.snapshots/s1/keep", &n) == -2,
+         "after which it is gone");
+    after_delete = free_blocks(v);
+    check(after_delete > before_snap,
+         "and the blocks only it was holding - /gone's, /keep's old ones - "
+         "are free again (more free than before the snapshot, since /gone "
+         "is deleted now)");
+    v = vol_remount(&t);
+    check(v != NULL && free_blocks(v) == after_delete,
+         "and a remount agrees about exactly how much is free");
+    vol_close(&t);
+}
+
 int gnfs_run_tests(void) {
     failures = 0;
     printf("\ngnfs:\n");
@@ -1676,7 +2123,7 @@ int gnfs_run_tests(void) {
     test_layout_helpers_agree_with_format();
     test_bitmap_alloc_first_fit();
     test_onode_init_and_access();
-    test_onode_alloc_is_monotonic_and_bounded();
+    test_onode_alloc_reuses_and_is_bounded();
     test_directory_entries();
     test_directory_iterate_and_full();
     test_acl_inherit();
@@ -1694,6 +2141,12 @@ int gnfs_run_tests(void) {
     test_chmod_special_bits();
     test_setgid_and_sticky_dirs();
     test_create_mode();
+    test_large_and_sparse_files();
+    test_objects_are_reused();
+    test_big_directory();
+    test_rename();
+    test_truncate_does_not_resurrect();
+    test_snapshots();
 
     printf("gnfs: %s\n", failures ? "FAILED" : "passed");
     return failures;

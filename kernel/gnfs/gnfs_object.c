@@ -12,35 +12,78 @@
 #define ENOSPC  28
 #define EEXIST  17
 
-void gnfs_onode_init(gnfs_onode_t *o, uint32 mode, uint32 uid, uint32 gid) {
+uint64 gnfs_obj_table_blocks_for(uint64 max_objects) {
+    return (max_objects + GNFS_ONODES_PER_BLOCK - 1) / GNFS_ONODES_PER_BLOCK;
+}
+
+void gnfs_onode_free(gnfs_onode_t *o) {
+    uint8 *b = (uint8 *)o;
     uint64 i;
 
-    o->mode      = mode;
-    o->uid       = uid;
-    o->gid       = gid;
-    o->nlink     = 1;
-    o->size      = 0;
-    o->nblocks   = 0;
-    o->acl_block = 0;
-    for (i = 0; i < GNFS_OBJ_DIRECT; i++) {
-        o->direct[i] = 0;
+    for (i = 0; i < sizeof(*o); i++) {
+        b[i] = 0;
     }
 }
 
-gnfs_onode_t *gnfs_onode_at(uint8 *table, uint64 objnum) {
-    if (objnum == GNFS_OBJNUM_NONE || objnum >= GNFS_MAX_OBJECTS) {
+void gnfs_onode_init(gnfs_onode_t *o, uint32 mode, uint32 uid, uint32 gid) {
+    /* Zeroed first, so every field this does not name - the block map,
+     * the indirect pointers, the ACL block - starts as "nothing", and so no
+     * byte of a reused slot's previous occupant survives into the new one. */
+    gnfs_onode_free(o);
+    o->mode  = mode;
+    o->uid   = uid;
+    o->gid   = gid;
+    o->nlink = 1;
+}
+
+gnfs_onode_t *gnfs_onode_at(uint8 *table, uint64 max_objects, uint64 objnum) {
+    if (objnum == GNFS_OBJNUM_NONE || objnum >= max_objects) {
         return NULL;
     }
     return &((gnfs_onode_t *)table)[objnum];
 }
 
-int gnfs_onode_alloc(gnfs_root_t *r, uint64 *out) {
-    if (r->next_objnum >= GNFS_MAX_OBJECTS) {
-        return -ENOSPC;
+/* First free slot at or after the hint, wrapping once. The hint moves past
+ * each allocation so a burst of creates does not rescan the same prefix,
+ * and because the scan wraps, a slot freed behind the hint is found again
+ * the moment the table has nothing free ahead of it - which is what
+ * "object numbers are reused" has to mean. */
+int gnfs_onode_alloc(gnfs_root_t *r, uint8 *table, uint64 *out) {
+    uint64 max = r->max_objects;
+    uint64 start = r->next_objnum;
+    uint64 k;
+
+    if (start == GNFS_OBJNUM_NONE || start >= max) {
+        start = 1;
     }
-    *out = r->next_objnum;
-    r->next_objnum++;
-    return 0;
+    for (k = 0; k < max; k++) {
+        uint64 objnum = start + k;
+        gnfs_onode_t *o;
+
+        if (objnum >= max) {
+            objnum -= max - 1;       /* wrap to 1, skipping objnum 0 */
+        }
+        o = gnfs_onode_at(table, max, objnum);
+        if (o != NULL && o->mode == 0) {
+            *out = objnum;
+            r->next_objnum = objnum + 1;
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+uint64 gnfs_objects_in_use(const uint8 *table, uint64 max_objects) {
+    const gnfs_onode_t *t = (const gnfs_onode_t *)table;
+    uint64 n = 0;
+    uint64 i;
+
+    for (i = 1; i < max_objects; i++) {
+        if (t[i].mode != 0) {
+            n++;
+        }
+    }
+    return n;
 }
 
 /* --- directory data ---------------------------------------------------------

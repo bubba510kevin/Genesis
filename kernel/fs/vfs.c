@@ -370,6 +370,7 @@ int fs_lookup(const char *abs_path, fs_node_t *out) {
      * "/mnt/usb/notes.txt". The alternative is every filesystem knowing where
      * it is mounted, and then a volume mounted at two points has to be two
      * objects. */
+    out->readonly = 0;                  /* the filesystem may set it */
     rc = v->ops->lookup(v, rel, out);
     if (rc == 0) {
         /* Stamped here rather than by each filesystem. A filesystem that
@@ -808,6 +809,7 @@ int fs_lookup_on(fs_volume_t *v, const char *rel, fs_node_t *out) {
     if (!v->mounted || v->ops == NULL || v->ops->lookup == NULL) {
         return -19;                     /* -ENODEV */
     }
+    out->readonly = 0;                  /* the filesystem may set it */
     rc = v->ops->lookup(v, rel, out);
     if (rc == 0) {
         /* Stamped here too, and this is the reason it is stamped in the
@@ -891,8 +893,11 @@ int fs_access(const fs_node_t *n, const struct cred *c, uint32 wanted) {
      * the exact "check before writing" pattern faccessat exists to serve. */
     if ((wanted & (ACE_WRITE_DATA | ACE_APPEND_DATA | ACE_DELETE_CHILD |
                    ACE_WRITE_ATTRIBUTES | ACE_WRITE_ACL | ACE_WRITE_OWNER)) &&
-        !fs_writable_vol(n->vol)) {
-        return -13;                            /* -EACCES */
+        (!fs_writable_vol(n->vol) || n->readonly)) {
+        /* -EROFS, not -EACCES: it is Linux's answer for both open(2) and
+         * access(2) here, and the more useful one - no permission would
+         * help, the medium (or the snapshot) cannot change. */
+        return -30;                            /* -EROFS */
     }
 
     return acl_access(&a, (const cred_t *)c, wanted);

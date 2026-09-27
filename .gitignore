@@ -21,3 +21,7 @@ graphify-out/
 
 # Per-machine Claude Code settings
 .claude/settings.local.json
+
+# The FreeBSD source tree vendored files are taken from (FreeBSD main,
+# commit 8b668bc7e7c8b0a1bcb018360a4aafa445ff554f) - fetched, never committed
+vendsrc/

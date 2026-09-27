@@ -20,8 +20,7 @@
  * object layer above this lands) snapshots as retained old roots - and drops
  * everything that made the real format expensive to get right: no space-map
  * log to replay, no multi-level meta-dnode, no compression/dedup/encryption,
- * no feature-flag negotiation. It does not aim to be read by real `zdb`; the
- * vendored reader in kernel/zfs/ keeps that job for real external disks.
+ * no feature-flag negotiation. It does not aim to be read by real `zdb`.
  *
  * --- the shape ---------------------------------------------------------------
  * A fixed-size ring of root records near the start of the volume, one written
@@ -38,11 +37,15 @@
  * alone, which is what makes a torn commit leave a mountable pool: the root
  * ring slot that would have advanced past it still names the old bitmap.
  *
- * What this foundation does NOT yet do, precisely: allocate blocks in a way
- * that accounts for a RETAINED old root (a snapshot) still referencing them -
- * there is only ever one live bitmap, not a union of every retained one.
- * That is the next thing built on top of this, not a gap in what this file
- * claims.
+ * SNAPSHOTS (version 2) are what that shape was for. A snapshot is a
+ * retained view of the object graph at one txg: its own copy of the object
+ * table, plus a REFERENCE MAP - the live bitmap as it stood - saying which
+ * blocks that graph uses. The allocator treats a block as free only if the
+ * live bitmap AND every snapshot's reference map say so, so copy-on-write
+ * keeps working exactly as before (a freed block just drops out of the live
+ * bitmap) while nothing a snapshot still reads can ever be handed out again.
+ * Deleting a snapshot drops its map, and every block only it was holding
+ * becomes free with no walk of anything. See gnfs_snap_t.
  *
  * --- the object layer, added on top of the above ---------------------------
  * The object table is ANOTHER whole-structure ping-pong, exactly like the
@@ -55,16 +58,18 @@
  * array, never an indirect chain of blocks pointing at blocks. Depth is what
  * broke the old cascade; this format has none to break.
  *
- * One consequence worth being honest about: retaining an old root record (a
- * future snapshot) preserves its ENTIRE object graph for free - nothing was
- * overwritten in place, so the old table and the old data blocks it points at
- * are still physically there. What is NOT yet solved is the other half: nothing
- * stops the ALLOCATOR from handing a retained snapshot's still-referenced
- * block to a new write, because there is only one live bitmap. Building that
- * is what "allocate blocks in a way that accounts for a RETAINED old root"
- * above is waiting on, not a defect in this session's object layer - the
- * object layer being real COW is what MAKES that the next solvable step
- * rather than a redesign.
+ * The table copy is incremental on disk even though it is whole in
+ * concept: a commit writes only the table blocks that differ from what the
+ * target region last received (kernel/gnfs/gnfs_vfs.c keeps the comparison),
+ * which is what lets the table be thousands of objects rather than 256.
+ *
+ * --- version 2 -----------------------------------------------------------------
+ * Version 1 capped a volume at 256 objects EVER (numbers were never reused),
+ * a file or directory at 48KB, a directory at one block, and had no rename or
+ * snapshots. Version 2: the object table is sized per volume and recorded,
+ * freed objects are reused, files map blocks through an indirect and a
+ * double-indirect block (about 1GB), directories grow through the same map,
+ * and snapshots exist. A version-1 volume is refused, not misread.
  */
 
 #define GNFS_BLOCK_SIZE   4096u
@@ -78,7 +83,7 @@
      ((uint64)'S') << 24 | ((uint64)'R') << 32 | ((uint64)'O') << 40 | \
      ((uint64)'O') << 48 | ((uint64)'T') << 56)
 
-#define GNFS_VERSION 1u
+#define GNFS_VERSION 2u
 
 /* One ring slot's contents. Exactly one per GNFS_BLOCK_SIZE-aligned block -
  * padded out explicitly rather than left to the compiler, because this
@@ -109,23 +114,29 @@ typedef struct gnfs_root {
                                 * current */
     uint64 obj_table_blocks;   /* how many blocks ONE region occupies */
     uint64 max_objects;        /* object-table capacity */
-    uint64 next_objnum;        /* monotonic allocator cursor - object numbers
-                                * are never reused in this foundation; see
-                                * gnfs_onode_alloc */
+    uint64 next_objnum;        /* where gnfs_onode_alloc starts looking - a
+                                * HINT, not a high-water mark: freed object
+                                * numbers are reused */
     uint64 root_dir_objnum;    /* which object is the root directory - always
                                 * 1 in practice, stored rather than assumed
                                 * for the same one-source-of-truth reason
                                 * every other "obviously constant" field here
                                 * is a field rather than a #define */
 
+    uint64 snap_dir_block;     /* ABSOLUTE block holding the snapshot
+                                * directory (an array of gnfs_snap_t), or 0
+                                * for none. Copy-on-write like everything
+                                * else: a snapshot create or delete writes a
+                                * new block and the next root names it. */
+    uint64 reserved[3];        /* zero; room to grow without a version bump */
+
     uint64 checksum;        /* over every field above, with this field itself
                              * read as 0 while computing it */
-    /* Eleven uint64 fields (88 bytes) plus two uint32 fields (8 bytes) above
-     * this line, 96 bytes total with no compiler-inserted gaps - every
-     * uint64 field sits at an offset already a multiple of 8. The build-time
-     * check right below this struct is what actually enforces the pad is
+    /* Fifteen uint64 fields (120 bytes) plus two uint32 fields (8 bytes)
+     * above this line, 128 bytes total with no compiler-inserted gaps. The
+     * build-time check right below this struct is what enforces the pad is
      * sized correctly rather than this arithmetic being trusted silently. */
-    uint8  pad[GNFS_BLOCK_SIZE - 96];
+    uint8  pad[GNFS_BLOCK_SIZE - 128];
 } gnfs_root_t;
 
 typedef char gnfs_root_fits_one_block
@@ -218,22 +229,26 @@ void gnfs_free_blocks(uint8 *bitmap, uint64 total_blocks, uint64 start,
  * copying the whole table on every commit affordable (see this header's own
  * top comment for why depth, not size, is what broke the old cascade).
  *
- * GNFS_MAX_OBJECTS is a compile-time bound, the same idiom this kernel
- * already uses for ACL_ACE_MAX, KTHREAD_MAX and KLD_MAX_MODULES: a fixed cap
- * that is stated rather than discovered, recorded on disk so a build with a
- * different cap refuses a mismatched volume (gnfs_probe checks it) instead
- * of misreading it. Growing it is a foundation limit to lift later, not a
- * design ceiling - see the header's own note on what is deferred. */
-#define GNFS_MAX_OBJECTS 256u
+ * The capacity is chosen PER VOLUME at format time (one object per four
+ * blocks, within the bounds below) and recorded in the root record, and
+ * obj_table_blocks must agree with it exactly (gnfs_obj_table_blocks_for) or
+ * the volume is refused rather than misread. */
+#define GNFS_MIN_OBJECTS        64u
+#define GNFS_MAX_OBJECTS_LIMIT  65536u
 
-/* Direct block pointers per object - 12, the classic Unix inode count,
- * chosen for the same reason it always is: enough for an ordinary file (12 *
- * GNFS_BLOCK_SIZE = 48KB) without needing an indirect block at all. There is
- * no indirect pointer in this foundation - a file or directory larger than
- * 48KB is refused (-EFBIG), not silently truncated. Growing files past this
- * is the next thing built on top, the same way the object table itself was
- * built on top of the bitmap-and-ring foundation before it. */
-#define GNFS_OBJ_DIRECT 12u
+/* The block map: 12 direct pointers (the classic Unix inode count - 48KB
+ * with no indirection at all), then ONE indirect block of GNFS_PTRS_PER_BLOCK
+ * pointers, then ONE double-indirect block of pointers to such blocks. That
+ * is 12 + 512 + 512*512 blocks, just over 1GB. Every pointer block is copy-
+ * on-write like a data block: changing one mapping writes a new pointer
+ * block (and a new double-indirect block above it) and frees the old ones.
+ * A mapping of 0 is a hole and reads as zeroes; a pointer block of 0 means
+ * every mapping below it is a hole. Past the end is refused (-EFBIG), never
+ * truncated. */
+#define GNFS_OBJ_DIRECT      12u
+#define GNFS_PTRS_PER_BLOCK  (GNFS_BLOCK_SIZE / 8u)
+#define GNFS_MAX_FILE_BLOCKS ((uint64)GNFS_OBJ_DIRECT + GNFS_PTRS_PER_BLOCK + \
+                              (uint64)GNFS_PTRS_PER_BLOCK * GNFS_PTRS_PER_BLOCK)
 
 /* --- a block-number convention worth stating once, precisely ---------------
  *
@@ -257,19 +272,26 @@ typedef struct gnfs_onode {
     uint32 mode;         /* S_IFMT + rwx, the same vocabulary fs_node_t uses */
     uint32 uid;
     uint32 gid;
-    uint32 nlink;         /* reserved at 1 - no hard links in this foundation */
+    uint32 nlink;         /* reserved at 1 - no hard links in this format.
+                           * 0 in a free slot: mode == 0 is what marks a
+                           * table entry unused */
     uint64 size;          /* bytes */
-    uint64 nblocks;       /* how many of direct[] are meaningful, 0..GNFS_OBJ_DIRECT */
+    uint64 nblocks;       /* logical blocks the object spans - how far the
+                           * block map is meaningful (entries inside it may
+                           * still be holes) */
     uint64 direct[GNFS_OBJ_DIRECT];   /* ABSOLUTE block numbers; unused entries
                                       * are 0, which is never a valid data
                                       * block (block 0 is always inside the
                                       * ring) */
+    uint64 indirect;      /* ABSOLUTE block of GNFS_PTRS_PER_BLOCK pointers
+                           * for logical blocks 12..523, or 0 */
+    uint64 dindirect;     /* ABSOLUTE block of pointers to such blocks, for
+                           * everything after that, or 0 */
     uint64 acl_block;     /* ABSOLUTE block holding a serialised acl_t
                            * (kernel/include/acl.h), or 0 - "this object has
                            * no stored ACL", handled by kernel/fs/vfs.c's
                            * fs_getacl the same way a NULL getacl slot is: by
-                           * projecting the mode instead. Same convention
-                           * ZFS_ACL_TRIVIAL follows, one level up. */
+                           * projecting the mode instead. */
 } gnfs_onode_t;
 
 /* objnum 0 is never valid - block 0 doubles as "this onode slot is free",
@@ -280,35 +302,61 @@ typedef struct gnfs_onode {
 #define GNFS_ROOT_DIR_OBJNUM 1u
 
 #define GNFS_ONODES_PER_BLOCK (GNFS_BLOCK_SIZE / (uint64)sizeof(gnfs_onode_t))
-#define GNFS_OBJ_TABLE_BLOCKS \
-    ((GNFS_MAX_OBJECTS + GNFS_ONODES_PER_BLOCK - 1) / GNFS_ONODES_PER_BLOCK)
+
+/* Blocks one object-table region needs for `max_objects` entries. */
+uint64 gnfs_obj_table_blocks_for(uint64 max_objects);
 
 void gnfs_onode_init(gnfs_onode_t *o, uint32 mode, uint32 uid, uint32 gid);
 
-/* Bounds-checked access into a caller-owned object-table buffer (sized
- * GNFS_OBJ_TABLE_BLOCKS * GNFS_BLOCK_SIZE). NULL for objnum 0 or objnum >=
- * GNFS_MAX_OBJECTS - the same "refuse rather than guess" this codebase
- * already applies to an ACL that does not fit or a z_acl_version it does not
- * recognise. */
-gnfs_onode_t *gnfs_onode_at(uint8 *table, uint64 objnum);
+/* Every byte zero - what a never-used table slot looks like, and what makes
+ * it allocatable again (mode == 0). */
+void gnfs_onode_free(gnfs_onode_t *o);
 
-/* Claim the next object number in `r` (monotonic - see gnfs_root_t::
- * next_objnum). Returns 0 and sets *out, or -ENOSPC once GNFS_MAX_OBJECTS is
- * reached. Objects are never reused in this foundation: unlink and rmdir
- * free an object's DATA blocks but not its table slot's number, the same
- * disclosed limitation kldload's module-unload path has for a different
- * resource. */
-int gnfs_onode_alloc(gnfs_root_t *r, uint64 *out);
+/* Bounds-checked access into a caller-owned object-table buffer of
+ * `max_objects` entries. NULL for objnum 0 or objnum >= max_objects -
+ * "refuse rather than guess". */
+gnfs_onode_t *gnfs_onode_at(uint8 *table, uint64 max_objects, uint64 objnum);
+
+/* Claim a free object number (mode == 0), searching from r->next_objnum and
+ * wrapping. The slot is left for the caller to fill with gnfs_onode_init.
+ * Returns 0 and sets *out, or -ENOSPC if every slot is in use. */
+int gnfs_onode_alloc(gnfs_root_t *r, uint8 *table, uint64 *out);
+
+/* How many table slots are in use (for reporting). */
+uint64 gnfs_objects_in_use(const uint8 *table, uint64 max_objects);
+
+/* --- snapshots -------------------------------------------------------------
+ *
+ * One record per snapshot, in the snapshot directory block the root record
+ * names (gnfs_root_t::snap_dir_block). A snapshot owns two contiguous runs of
+ * blocks: its copy of the object table, and its reference map (a bitmap in
+ * the live bitmap's own format, describing every block the snapshot's graph
+ * uses). Both runs are allocated in the live bitmap for as long as the
+ * snapshot exists, and freed when it is deleted. */
+#define GNFS_SNAP_NAME_MAX 40u
+
+typedef struct gnfs_snap {
+    uint64 txg;             /* the txg the snapshot captured; 0 = free slot */
+    uint64 table_block;     /* ABSOLUTE start of its object-table copy */
+    uint64 table_blocks;
+    uint64 refmap_block;    /* ABSOLUTE start of its reference map */
+    uint64 refmap_blocks;
+    uint64 max_objects;
+    uint64 root_dir_objnum;
+    uint8  name_len;
+    uint8  reserved[7];
+    char   name[GNFS_SNAP_NAME_MAX];
+} gnfs_snap_t;
+
+#define GNFS_SNAPS_PER_BLOCK (GNFS_BLOCK_SIZE / (uint64)sizeof(gnfs_snap_t))
 
 /* --- directory data, as pure logic over ONE caller-owned data block --------
  *
- * A directory's entries live entirely in its onode's direct[0] block in this
- * foundation - no indirect growth across multiple blocks yet, which bounds a
- * directory to GNFS_DIRENTS_PER_BLOCK entries and is a stated limit rather
- * than a silent one: gnfs_dir_add returns -ENOSPC rather than spilling
- * anywhere. FAT's own root directory in this tree is a fixed-size array for
- * the same reason - a bounded, honest limit beats an unbounded structure
- * that is subtly wrong. */
+ * A directory is an ordinary object whose blocks hold these entries. The
+ * functions below work on one block at a time; kernel/gnfs/gnfs_vfs.c walks
+ * the directory's block map over them, and grows the directory by a block
+ * when every existing one is full (gnfs_dir_add's -ENOSPC is "this BLOCK is
+ * full", not "the directory is"). */
 #define GNFS_NAME_MAX 60u
 
 typedef struct gnfs_dirent {
