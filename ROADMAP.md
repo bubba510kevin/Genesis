@@ -953,7 +953,7 @@ NT 10.0 SIDE
 
 17. BASH UNDERSTANDS WINDOWS - PHASE 3. STARTED 2026-09-27: GNTbash.
 
-THE SHELL IS GNTbash, its own repository (github.com/bubba510kevin/GNTbash). It is not a patch directory inside this tree. It holds GNU bash 5.3 patch level 9 on branch `upstream` (tagged upstream/bash-5.3 and upstream/bash-5.3.9) and the Genesis commits on top of it on `main`, so moving to a new bash release is a rebase of those commits, not a merge. `git diff upstream main` is the whole change, and its README.md documents every rule below.
+THE SHELL IS GNTbash, its own repository (github.com/bubba510kevin/GNTbash). It is not a patch directory inside this tree. It holds GNU bash 5.3 patch level 9 on branch `upstream` and the Genesis commits on top of it on `main`, so moving to a new bash release is a rebase of those commits, not a merge. `git diff upstream main` is the whole change, and its README.md documents every rule below.
 
 DONE IN GNTbash (winmode and igncr, both shopt options; with both off it is upstream bash):
   - (a) Drive-letter words: C:\x, "C:\Program Files\x" and name=C:\x, through the drive map GNTBASH_DRIVES (default C=/, which matches ntproc.c's /x -> C:\x); pwd -W.
