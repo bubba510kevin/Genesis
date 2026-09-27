@@ -189,6 +189,64 @@ int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc);
 #define NT_THREAD_STACK_STRIDE   0x0000000000100000ULL   /* 1MB */
 #define NT_THREAD_STACK_DEFAULT  0x0000000000010000ULL   /* 64KB, as main */
 
+/* --- thread-local storage ---------------------------------------------------
+ *
+ * DYNAMIC TLS (TlsAlloc) lives in the TEB where Windows puts it: 64 slots
+ * at TEB+0x1480, and a pointer at TEB+0x1780 to 1024 more, allocated by
+ * kernel32 on first use. FLS (FlsAlloc) hangs off TEB+0x17C8. The kernel
+ * touches these only for ThreadZeroTlsCell, which clears one slot in every
+ * thread when TlsFree gives the index back.
+ *
+ * IMPLICIT TLS (a PE's .tls section, __declspec(thread)) is set up by the
+ * kernel: pe.c collects every loaded module's TLS directory, assigns each an
+ * index and writes it to the module's _tls_index; the resulting table is
+ * PUBLISHED in the PEB page at NT_PEB_TLS_OFFSET, where the kernel reads it
+ * back for every new thread and ntdll reads the callback lists; and each
+ * thread gets its own TLS area - the pointer array TEB+0x58 names, followed
+ * by a copy of every module's template - in a fixed per-thread slot. */
+#define NT_TEB_TLS_SLOTS        0x1480   /* PVOID TlsSlots[64]             */
+#define NT_TEB_TLS_EXPANSION    0x1780   /* PVOID *TlsExpansionSlots       */
+#define NT_TEB_FLS_DATA         0x17C8   /* PVOID FlsData                  */
+#define NT_TLS_MINIMUM_SLOTS    64
+#define NT_TLS_EXPANSION_SLOTS  1024
+
+#define NT_PEB_TLS_OFFSET       0x800
+#define NT_TLS_MAGIC            0x534C5447u   /* "GTLS" */
+#define NT_TLS_MAX_MODULES      8
+
+typedef struct {
+    uint64 module_base;      /* the DllHandle callbacks are given            */
+    uint64 start;            /* template: StartAddressOfRawData              */
+    uint64 end;              /*           EndAddressOfRawData                */
+    uint64 zero_fill;        /* SizeOfZeroFill, after the template           */
+    uint64 index_addr;       /* AddressOfIndex (a ULONG in the module)       */
+    uint64 callbacks;        /* AddressOfCallBacks: NULL-terminated, or 0    */
+    uint64 block_offset;     /* this module's block, from the area's start   */
+} nt_tls_module_t;
+
+typedef struct {
+    uint32 magic;
+    uint32 count;            /* modules with a TLS directory, <= 8           */
+    uint64 area_bytes;       /* pointer array + every block, per thread      */
+    nt_tls_module_t mod[NT_TLS_MAX_MODULES];
+} nt_tls_table_t;
+
+/* Each thread's TLS area. Thread slot i (the NT_THREAD_SLOTS scheme) uses
+ * area i; the main thread uses NT_TLS_MAIN_SLOT. 64KB each, which bounds
+ * one thread's implicit TLS - a program needing more is refused at exec. */
+#define NT_TLS_AREA_BASE        0x000000004E000000ULL
+#define NT_TLS_AREA_STRIDE      0x0000000000010000ULL
+#define NT_TLS_MAIN_SLOT        64
+
+/* Write `table` into the PEB of the space (called at exec). */
+int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table);
+
+/* Build a thread's TLS area from the table in the PEB and point its TEB
+ * (at teb_va) at it. `*pages_out` is 0 when the process has no implicit
+ * TLS - nothing is mapped. 0 or a negative errno. */
+int nt_thread_tls_init(address_space_t *as, int slot, uint64 teb_va,
+                       uint64 *area_out, uint64 *pages_out);
+
 /* Build a TEB for a non-first thread at `teb_va` (page-aligned; maps and
  * zeroes NT_TEB_PAGES there). Its PEB pointer is the process's. 0 or a
  * negative errno. */

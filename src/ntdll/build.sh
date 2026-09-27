@@ -35,7 +35,8 @@ LDFLAGS="-shared -nostdlib -nostartfiles \
 $CC $CFLAGS -c stubs.c -o stubs.o
 $CC $CFLAGS -c rtl.c   -o rtl.o
 $CC $CFLAGS -c sync.c  -o sync.o
-$CC $LDFLAGS -o ntdll.dll stubs.o rtl.o sync.o ntdll.def
+$CC $CFLAGS -c tls.c   -o tls.o
+$CC $LDFLAGS -o ntdll.dll stubs.o rtl.o sync.o tls.o ntdll.def
 
 # /wsr/System32 is the Windows side of the volume, and the name is 8.3-clean:
 # WSR and SYSTEM32 both fit, as does NTDLL.DLL. A DLL that cannot be named by

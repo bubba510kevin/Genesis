@@ -617,6 +617,7 @@ static uint64 nt_set_information_process(uint64 handle, uint64 cls, uint64 buf,
 #define ThreadPriority            2
 #define ThreadBasePriority        3
 #define ThreadAffinityMask        4
+#define ThreadZeroTlsCell         10
 #define ThreadIdealProcessor      13
 #define ThreadHideFromDebugger    17
 #define ThreadGroupInformation    30
@@ -732,6 +733,56 @@ static uint64 nt_set_information_thread(uint64 handle, uint64 cls, uint64 buf,
         }
         nt_prio[s]     = (uint32)cls == ThreadBasePriority ? v : v - 8;
         nt_prio_pid[s] = t->pid;
+        return STATUS_SUCCESS;
+    }
+
+    case ThreadZeroTlsCell: {
+        /* TlsFree's other half: the index goes back to the pool, and every
+         * thread's copy of that slot is cleared so the next TlsAlloc hands
+         * out a slot that reads NULL everywhere - Windows' guarantee. The
+         * slots are in each thread's TEB (the 64) or in the expansion array
+         * a TEB points at (the next 1024), all in this process's own space,
+         * which is the one loaded. */
+        uint32 index;
+        int i;
+
+        if ((uint32)len != sizeof(uint32)) {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if (!range_ok(buf, 4)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        index = *(const uint32 *)buf;
+        if (index >= NT_TLS_MINIMUM_SLOTS + NT_TLS_EXPANSION_SLOTS) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        for (i = 0; i < MAX_PROCESSES; i++) {
+            process_t *o = proc_at(i);
+            uint64 teb, cell;
+
+            if (o == NULL || o->is_kthread || o->tgid != t->tgid ||
+                o->state == PROC_ZOMBIE || o->thread.gs_base == 0) {
+                continue;
+            }
+            teb = o->thread.gs_base;
+            if (index < NT_TLS_MINIMUM_SLOTS) {
+                cell = teb + NT_TEB_TLS_SLOTS + (uint64)index * 8;
+            } else {
+                uint64 exp;
+
+                if (!range_ok(teb + NT_TEB_TLS_EXPANSION, 8)) {
+                    continue;
+                }
+                exp = *(const uint64 *)(teb + NT_TEB_TLS_EXPANSION);
+                if (exp == 0) {
+                    continue;                 /* never used: already NULL */
+                }
+                cell = exp + (uint64)(index - NT_TLS_MINIMUM_SLOTS) * 8;
+            }
+            if (range_ok(cell, 8)) {
+                *(uint64 *)cell = 0;
+            }
+        }
         return STATUS_SUCCESS;
     }
 

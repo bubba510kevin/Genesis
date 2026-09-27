@@ -114,6 +114,15 @@ EXPORTS
     InterlockedPopEntrySList = ntdll.RtlInterlockedPopEntrySList
     InterlockedFlushSList = ntdll.RtlInterlockedFlushSList
     QueryDepthSList = ntdll.RtlQueryDepthSList
+; --- thread-local storage (tls.c) ---
+    TlsAlloc
+    TlsFree
+    TlsGetValue
+    TlsSetValue
+    FlsAlloc
+    FlsFree
+    FlsGetValue
+    FlsSetValue
 ; --- memory ---
     GetProcessHeap
     HeapAlloc

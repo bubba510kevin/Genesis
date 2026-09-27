@@ -189,6 +189,10 @@ typedef struct process {
     uint64           nt_stack_lo;
     uint64           nt_stack_pages;
     uint64           nt_thread_start;
+    /* This thread's implicit-TLS area (teb.h), unmapped when it exits the
+     * same way its TEB and stack are. 0 pages: the process has no .tls. */
+    uint64           nt_tls_va;
+    uint64           nt_tls_pages;
 
     thread_t        thread;
 

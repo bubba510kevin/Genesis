@@ -50,6 +50,7 @@
 #define PE_ERR_RELOC       -9   /* needs to move and cannot, or bad .reloc  */
 #define PE_ERR_NOMEM      -10   /* out of physical frames                   */
 #define PE_ERR_SUBSYSTEM  -12   /* kernel-mode load, not IMAGE_SUBSYSTEM_NATIVE */
+#define PE_ERR_TLS        -13   /* a TLS directory this loader will not take   */
 
 /* Same limit and same reason as ELF_USER_LIMIT: at or above this is the
  * non-canonical hole or kernel space, and an image claiming an address up
@@ -111,6 +112,7 @@ void pe_driver_window_init(void);
 #define PE_DIR_EXPORT      0
 #define PE_DIR_IMPORT      1
 #define PE_DIR_BASERELOC   5
+#define PE_DIR_TLS         9
 #define PE_DIR_COUNT      16
 
 /* Base relocation types, from the spec's table. ABSOLUTE is the padding
@@ -248,6 +250,16 @@ typedef struct {
      * does on NT - found here because this is the one moment the module
      * list exists. */
     uint64 thread_start;
+
+    /* Implicit TLS: the executable's and every loaded DLL's TLS directory,
+     * with indices assigned and written back (see teb.h). count 0: none.
+     * has_tls_callbacks: some module has callbacks, so the main thread must
+     * enter through ntdll (RtlUserThreadStart) to have them run. */
+    int    tls_count;
+    int    has_tls_callbacks;
+    struct {
+        uint64 module_base, start, end, zero_fill, index_addr, callbacks;
+    } tls[8];
 } pe_info_t;
 
 /* Cheap enough to call on every execve: reads two magic numbers and nothing

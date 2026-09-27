@@ -106,6 +106,7 @@ typedef DWORD *LPDWORD;
 #define ERROR_INSUFFICIENT_BUFFER 122u
 #define ERROR_GEN_FAILURE          31u
 #define ERROR_TIMEOUT            1460u
+#define ERROR_NO_MORE_ITEMS       259u
 
 /* CreateFile dispositions. Only OPEN_EXISTING is honoured; the rest are
  * declared so a caller's constant means what it says when it is refused. */
@@ -415,6 +416,18 @@ PSLIST_ENTRY WINAPI InterlockedPushEntrySList(PSLIST_HEADER h, PSLIST_ENTRY e);
 PSLIST_ENTRY WINAPI InterlockedPopEntrySList(PSLIST_HEADER h);
 PSLIST_ENTRY WINAPI InterlockedFlushSList(PSLIST_HEADER h);
 WORD         WINAPI QueryDepthSList(PSLIST_HEADER h);
+
+/* --- thread-local storage (tls.c) --------------------------------------- */
+#define TLS_OUT_OF_INDEXES 0xFFFFFFFFu
+#define FLS_OUT_OF_INDEXES 0xFFFFFFFFu
+DWORD  WINAPI TlsAlloc(void);
+BOOL   WINAPI TlsFree(DWORD index);
+LPVOID WINAPI TlsGetValue(DWORD index);
+BOOL   WINAPI TlsSetValue(DWORD index, LPVOID value);
+DWORD  WINAPI FlsAlloc(PFLS_CALLBACK_FUNCTION callback);
+BOOL   WINAPI FlsFree(DWORD index);
+PVOID  WINAPI FlsGetValue(DWORD index);
+BOOL   WINAPI FlsSetValue(DWORD index, PVOID value);
 
 DWORD WINAPI K32OrdinalProbe(void);
 PVOID WINAPI K32CurrentTeb(void);

@@ -102,7 +102,7 @@ def main():
     spec.loader.exec_module(build)
 
     commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
-                                "/bin/smp.exe"]
+                                "/bin/smp.exe", "/bin/tls.exe"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)

@@ -302,10 +302,17 @@ void LdrInitializeThunk(void) {
  * the return address in RCX, so the kernel passes StartRoutine in RDX and
  * Parameter in R8 instead - the second and third Win64 argument registers.
  * Nothing outside this function can see the difference. */
+void ldrp_thread_attach(void);
+void ldrp_thread_detach(void);
+
 void RtlUserThreadStart(PVOID rcx_is_not_an_argument,
                         PUSER_THREAD_START_ROUTINE StartRoutine,
                         PVOID Parameter) {
     (void)rcx_is_not_an_argument;
+    /* The modules' TLS callbacks - DLL_PROCESS_ATTACH on the main thread,
+     * which the kernel starts here when there are any, DLL_THREAD_ATTACH on
+     * every other - before the thread's own code (tls.c). */
+    ldrp_thread_attach();
     RtlExitUserThread(StartRoutine(Parameter));
 }
 
@@ -313,6 +320,9 @@ void RtlUserThreadStart(PVOID rcx_is_not_an_argument,
  * thread has nowhere left to go, and spinning is visible where returning
  * into a garbage frame would not be. */
 void RtlExitUserThread(NTSTATUS ExitStatus) {
+    /* FLS destructors and DLL_THREAD_DETACH, while the thread still exists
+     * to run them. */
+    ldrp_thread_detach();
     NtTerminateThread(NtCurrentThread(), ExitStatus);
     for (;;) {
     }

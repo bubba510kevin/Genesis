@@ -432,6 +432,20 @@ PSLIST_ENTRY RtlInterlockedFlushSList(PSLIST_HEADER h);
 PSLIST_ENTRY RtlFirstEntrySList(const SLIST_HEADER *h);
 WORD         RtlQueryDepthSList(PSLIST_HEADER h);
 
+/* --- thread-local storage (tls.c) --------------------------------------- */
+typedef void (*PFLS_CALLBACK_FUNCTION)(PVOID Data);
+NTSTATUS RtlFlsAlloc(PFLS_CALLBACK_FUNCTION Callback, DWORD *Index);
+NTSTATUS RtlFlsFree(DWORD Index);
+NTSTATUS RtlFlsGetValue(DWORD Index, PVOID *Value);
+NTSTATUS RtlFlsSetValue(DWORD Index, PVOID Value);
+void     LdrShutdownProcess(void);
+
+#define TEB_TLS_SLOTS_OFFSET     0x1480
+#define TEB_TLS_EXPANSION_OFFSET 0x1780
+#define TLS_MINIMUM_AVAILABLE    64
+#define TLS_EXPANSION_SLOTS      1024
+#define ThreadZeroTlsCell        10
+
 DWORD    RtlGetCurrentProcessorNumber(void);
 void     RtlGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER ProcNumber);
 BOOLEAN  RtlQueryPerformanceCounter(LARGE_INTEGER *Counter);

@@ -151,6 +151,8 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->nt_stack_lo     = 0;
     current->nt_stack_pages  = 0;
     current->nt_thread_start = 0;
+    current->nt_tls_va       = 0;
+    current->nt_tls_pages    = 0;
     current->run_ticks       = 0;
     current->sleep_ticks     = 0;
     current->cpu_ticks       = 0;
@@ -433,6 +435,8 @@ process_t *proc_alloc(int ppid) {
             p->nt_stack_lo     = 0;
             p->nt_stack_pages  = 0;
             p->nt_thread_start = 0;
+            p->nt_tls_va       = 0;
+            p->nt_tls_pages    = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
@@ -603,7 +607,13 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
                                   VMM_FREE_FRAME);
             }
         }
+        for (i = 0; i < p->nt_tls_pages; i++) {
+            vmm_unmap_page_in(p->space, p->nt_tls_va + i * 0x1000ULL,
+                              VMM_FREE_FRAME);
+        }
     }
+    p->nt_tls_va      = 0;
+    p->nt_tls_pages   = 0;
     p->nt_stack_pages = 0;
     p->nt_stack_lo    = 0;
     p->nt_teb_va      = 0;

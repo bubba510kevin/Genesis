@@ -451,3 +451,124 @@ int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc) {
     peb->process_parameters = NT_PARAMS_BASE;
     return 0;
 }
+
+/* --- implicit TLS (see teb.h) --------------------------------------------- */
+
+/* Byte copies into and out of a space that may not be the loaded one, a
+ * page at a time through the direct map. */
+static int as_read(address_space_t *as, uint64 va, void *dst, uint64 n) {
+    uint8 *d = (uint8 *)dst;
+
+    while (n > 0) {
+        uint8 *w = (uint8 *)window(as, va);
+        uint64 chunk = PMM_PAGE_SIZE - (va & 0xFFF);
+
+        if (w == NULL) {
+            return -14;
+        }
+        if (chunk > n) {
+            chunk = n;
+        }
+        {
+            uint64 i;
+            for (i = 0; i < chunk; i++) {
+                d[i] = w[i];
+            }
+        }
+        d += chunk;
+        va += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+static int as_write(address_space_t *as, uint64 va, const void *src, uint64 n) {
+    const uint8 *s = (const uint8 *)src;
+
+    while (n > 0) {
+        uint8 *w = (uint8 *)window(as, va);
+        uint64 chunk = PMM_PAGE_SIZE - (va & 0xFFF);
+
+        if (w == NULL) {
+            return -14;
+        }
+        if (chunk > n) {
+            chunk = n;
+        }
+        {
+            uint64 i;
+            for (i = 0; i < chunk; i++) {
+                w[i] = s[i];
+            }
+        }
+        s += chunk;
+        va += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
+int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table) {
+    typedef char fits[(NT_PEB_TLS_OFFSET + sizeof(nt_tls_table_t) <= 0x1000)
+                      ? 1 : -1];
+    (void)sizeof(fits);
+    return as_write(as, NT_PEB_BASE + NT_PEB_TLS_OFFSET, table, sizeof(*table));
+}
+
+int nt_thread_tls_init(address_space_t *as, int slot, uint64 teb_va,
+                       uint64 *area_out, uint64 *pages_out) {
+    nt_tls_table_t t;
+    uint64 area, pages, ptrs[NT_TLS_MAX_MODULES];
+    uint32 i;
+    int rc;
+
+    *area_out = 0;
+    *pages_out = 0;
+    if (as_read(as, NT_PEB_BASE + NT_PEB_TLS_OFFSET, &t, sizeof(t)) != 0 ||
+        t.magic != NT_TLS_MAGIC || t.count == 0) {
+        return 0;                        /* no implicit TLS: nothing to do */
+    }
+    /* The table lives in user memory, so it is re-validated here: a program
+     * that scribbled on its PEB gets a failed thread, not a kernel write
+     * somewhere it chose. */
+    if (t.count > NT_TLS_MAX_MODULES || t.area_bytes == 0 ||
+        t.area_bytes > NT_TLS_AREA_STRIDE || slot < 0 || slot > NT_TLS_MAIN_SLOT) {
+        return -22;
+    }
+    area  = NT_TLS_AREA_BASE + (uint64)slot * NT_TLS_AREA_STRIDE;
+    pages = (t.area_bytes + 0xFFF) / 0x1000;
+    rc = map_zeroed(as, area, pages);
+    if (rc != 0) {
+        return rc;
+    }
+    *area_out = area;
+    *pages_out = pages;
+    for (i = 0; i < t.count; i++) {
+        nt_tls_module_t *m = &t.mod[i];
+        uint64 len = m->end - m->start;
+
+        if (m->end < m->start || m->block_offset + len + m->zero_fill > t.area_bytes) {
+            return -22;
+        }
+        ptrs[i] = area + m->block_offset;
+        /* The template, copied; the zero fill is already zero - the pages
+         * were mapped zeroed. */
+        while (len > 0) {
+            uint8 buf[256];
+            uint64 chunk = len > sizeof(buf) ? sizeof(buf) : len;
+
+            if (as_read(as, m->start + (m->end - m->start - len), buf, chunk) != 0 ||
+                as_write(as, ptrs[i] + (m->end - m->start - len), buf, chunk) != 0) {
+                return -14;
+            }
+            len -= chunk;
+        }
+    }
+    if (as_write(as, area, ptrs, (uint64)t.count * 8) != 0) {
+        return -14;
+    }
+    /* ThreadLocalStoragePointer, TEB+0x58: what compiled TLS accesses read
+     * through gs:[0x58][_tls_index]. */
+    return as_write(as, teb_va + __builtin_offsetof(nt_teb_t, tls_pointer),
+                    &area, 8);
+}

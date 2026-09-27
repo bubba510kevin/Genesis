@@ -9,6 +9,10 @@
 #include "kernel32.h"
 
 void WINAPI ExitProcess(DWORD code) {
+    /* The exiting thread's FLS destructors and every module's
+     * DLL_PROCESS_DETACH TLS callback, while the process still exists to
+     * run them. */
+    LdrShutdownProcess();
     NtTerminateProcess(NtCurrentProcess(), (NTSTATUS)code);
 
     /* Not reached. The loop is here because "not reached" is a claim about

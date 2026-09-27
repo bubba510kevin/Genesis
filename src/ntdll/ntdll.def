@@ -70,6 +70,12 @@ EXPORTS
     RtlInterlockedFlushSList
     RtlFirstEntrySList
     RtlQueryDepthSList
+; --- thread-local storage ---
+    RtlFlsAlloc
+    RtlFlsFree
+    RtlFlsGetValue
+    RtlFlsSetValue
+    LdrShutdownProcess
 ; --- processors and time ---
     RtlGetCurrentProcessorNumber
     RtlGetCurrentProcessorNumberEx

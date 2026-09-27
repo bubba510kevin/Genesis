@@ -2926,6 +2926,8 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     personality_t new_personality = PERSONALITY_LINUX;
     uint64        new_gs_base   = 0;
     uint64        new_thread_start = 0;
+    uint64        new_tls_va = 0, new_tls_pages = 0;
+    uint64        tls_entry_via_ntdll = 0;
     /* Both zero for a static binary, and both are read unconditionally below.
      * interp_entry is a SEPARATE variable from info.entry rather than an
      * overwrite of it, because the two addresses are different and both are
@@ -3034,6 +3036,55 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
             kfree(image);
             kfree(ec);
             return (uint64)-12;   /* -ENOMEM */
+        }
+
+        /* Implicit TLS: lay out one thread's area (the pointer array, then
+         * each module's block, 16-aligned), publish the table in the PEB for
+         * every later thread and for ntdll's callbacks, and build the main
+         * thread's area now. */
+        new_tls_va = 0;
+        new_tls_pages = 0;
+        if (pe.tls_count > 0) {
+            nt_tls_table_t tt;
+            uint64 off;
+            int k;
+
+            tt.magic = NT_TLS_MAGIC;
+            tt.count = (uint32)pe.tls_count;
+            off = ((uint64)pe.tls_count * 8 + 15) & ~15ULL;
+            for (k = 0; k < NT_TLS_MAX_MODULES; k++) {
+                nt_tls_module_t *m = &tt.mod[k];
+
+                if (k >= pe.tls_count) {
+                    m->module_base = m->start = m->end = m->zero_fill = 0;
+                    m->index_addr = m->callbacks = m->block_offset = 0;
+                    continue;
+                }
+                m->module_base  = pe.tls[k].module_base;
+                m->start        = pe.tls[k].start;
+                m->end          = pe.tls[k].end;
+                m->zero_fill    = pe.tls[k].zero_fill;
+                m->index_addr   = pe.tls[k].index_addr;
+                m->callbacks    = pe.tls[k].callbacks;
+                m->block_offset = off;
+                off += ((m->end - m->start) + m->zero_fill + 15) & ~15ULL;
+            }
+            tt.area_bytes = off;
+            if (off > NT_TLS_AREA_STRIDE || nt_tls_publish(new_space, &tt) != 0 ||
+                nt_thread_tls_init(new_space, NT_TLS_MAIN_SLOT, NT_TEB_BASE,
+                                   &new_tls_va, &new_tls_pages) != 0) {
+                print_string("execve: implicit TLS does not fit\n", 0x0C);
+                vmm_space_destroy(new_space);
+                kfree(image);
+                kfree(ec);
+                return (uint64)-8;
+            }
+            /* TLS callbacks run in ring 3, so the main thread enters through
+             * ntdll's RtlUserThreadStart - StartRoutine in RDX, as for every
+             * other thread - which runs them (DLL_PROCESS_ATTACH) first. */
+            if (pe.has_tls_callbacks && pe.thread_start != 0) {
+                tls_entry_via_ntdll = pe.thread_start;
+            }
         }
 
         /* RTL_USER_PROCESS_PARAMETERS: what the process was started with.
@@ -3261,6 +3312,10 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
      * every exec, ELF included (0), because it is an address in the image
      * being thrown away. */
     p->nt_thread_start = new_thread_start;
+    /* The main thread's implicit-TLS area, in the space just installed (the
+     * old one's is gone with it). */
+    p->nt_tls_va    = new_tls_va;
+    p->nt_tls_pages = new_tls_pages;
 
     stack = user_stack_create(USER_STACK_TOP, USER_STACK_SIZE,
                               ec->argv, ec->envp,
@@ -3292,6 +3347,15 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     frame->rip    = (interp_entry != 0) ? interp_entry : info.entry;
     frame->rflags = 0x202;    /* IF set, bit 1 reserved-one; a clean start */
     syscall_set_user_rsp(stack);
+    if (tls_entry_via_ntdll != 0) {
+        /* A PE with TLS callbacks: into RtlUserThreadStart(RDX = the image's
+         * entry), on a Win64-shaped stack - 40 bytes below the aligned top
+         * for the home area and a (never used) return slot. */
+        frame->rip = tls_entry_via_ntdll;
+        frame->rdx = info.entry;
+        frame->r8  = 0;
+        syscall_set_user_rsp((stack & ~0xFULL) - 40);
+    }
 
     return 0;
 }

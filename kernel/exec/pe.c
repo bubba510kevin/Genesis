@@ -1160,6 +1160,74 @@ static int resolve_imports(struct link_ctx *ctx, uint64 base) {
     return PE_OK;
 }
 
+/* --- implicit TLS ----------------------------------------------------------
+ *
+ * IMAGE_TLS_DIRECTORY64, read out of a module that is already mapped: the
+ * template range, the zero fill after it, where the module wants its index
+ * written, and its callback list. Every module with one gets the next index
+ * - the executable first, as on Windows, so a program's own _tls_index is 0 -
+ * and the index is written into the module now, before any code of it runs.
+ * The per-thread copies are the kernel's business at thread creation (see
+ * nt_thread_tls_init). */
+typedef struct __attribute__((packed)) {
+    uint64 start_address_of_raw_data;
+    uint64 end_address_of_raw_data;
+    uint64 address_of_index;
+    uint64 address_of_callbacks;
+    uint32 size_of_zero_fill;
+    uint32 characteristics;
+} pe_tls_directory64_t;
+
+static int collect_tls(address_space_t *as, uint64 base, pe_info_t *info) {
+    uint32 lfanew = 0;
+    pe_opt_header64_t opt;
+    pe_tls_directory64_t td;
+    uint32 index;
+    uint64 first_cb = 0;
+
+    if (read_out(as, base + 0x3C, &lfanew, 4) != PE_OK ||
+        read_out(as, base + lfanew + 24, &opt, sizeof(opt)) != PE_OK) {
+        return PE_ERR_TLS;
+    }
+    if (opt.number_of_rva_and_sizes <= PE_DIR_TLS ||
+        opt.directory[PE_DIR_TLS].virtual_address == 0 ||
+        opt.directory[PE_DIR_TLS].size < sizeof(td)) {
+        return PE_OK;                      /* no TLS: normal */
+    }
+    if (read_out(as, base + opt.directory[PE_DIR_TLS].virtual_address, &td,
+                 sizeof(td)) != PE_OK) {
+        return PE_ERR_TLS;
+    }
+    if (info->tls_count >= 8) {
+        print_string("pe: more than 8 modules with TLS\n", 0x0C);
+        return PE_ERR_TLS;
+    }
+    if (td.end_address_of_raw_data < td.start_address_of_raw_data ||
+        td.end_address_of_raw_data - td.start_address_of_raw_data > 0x8000 ||
+        td.size_of_zero_fill > 0x8000) {
+        print_string("pe: TLS template out of range\n", 0x0C);
+        return PE_ERR_TLS;
+    }
+    index = (uint32)info->tls_count;
+    if (td.address_of_index != 0 &&
+        copy_in(as, td.address_of_index, &index, 4) != PE_OK) {
+        return PE_ERR_TLS;
+    }
+    info->tls[index].module_base = base;
+    info->tls[index].start       = td.start_address_of_raw_data;
+    info->tls[index].end         = td.end_address_of_raw_data;
+    info->tls[index].zero_fill   = td.size_of_zero_fill;
+    info->tls[index].index_addr  = td.address_of_index;
+    info->tls[index].callbacks   = td.address_of_callbacks;
+    if (td.address_of_callbacks != 0 &&
+        read_out(as, td.address_of_callbacks, &first_cb, 8) == PE_OK &&
+        first_cb != 0) {
+        info->has_tls_callbacks = 1;
+    }
+    info->tls_count++;
+    return PE_OK;
+}
+
 int pe_load_executable(address_space_t *as, const void *image, uint64 size,
                        pe_info_t *info, pe_file_reader_t reader,
                        pe_file_release_t release) {
@@ -1171,6 +1239,12 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
         return rc;
     }
     info->thread_start = 0;
+    info->tls_count = 0;
+    info->has_tls_callbacks = 0;
+    rc = collect_tls(as, info->image_base, info);
+    if (rc != PE_OK) {
+        return rc;
+    }
     if (!info->has_imports) {
         return PE_OK;                    /* nothing to link */
     }
@@ -1188,6 +1262,15 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
     rc = resolve_imports(&ctx, info->image_base);
     if (rc != PE_OK) {
         return rc;
+    }
+    /* Every DLL that came in with it, in load order, after the executable. */
+    for (i = 0; i < ctx.count; i++) {
+        if (ctx.modules[i].base != 0 && ctx.modules[i].base != info->image_base) {
+            rc = collect_tls(as, ctx.modules[i].base, info);
+            if (rc != PE_OK) {
+                return rc;
+            }
+        }
     }
     /* Absent is not an error: a program that imports no ntdll, or an ntdll
      * too old to export it, links and runs - it just cannot create threads,
@@ -1316,6 +1399,7 @@ const char *pe_strerror(int rc) {
         case PE_ERR_NOMEM:      return "out of physical frames";
         case PE_ERR_IMPORT:     return "an imported name could not be resolved";
         case PE_ERR_SUBSYSTEM:  return "kernel-mode load requires IMAGE_SUBSYSTEM_NATIVE";
+        case PE_ERR_TLS:        return "a TLS directory out of range (or too many modules with one)";
         default:                return "unknown error";
     }
 }

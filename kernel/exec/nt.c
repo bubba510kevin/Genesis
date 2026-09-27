@@ -1047,6 +1047,20 @@ static uint64 nt_create_thread(struct syscall_frame *frame) {
     }
     t->nt_teb_va = teb_va;
 
+    /* Its own copy of every module's implicit TLS, before it can run. */
+    {
+        uint64 tls_va = 0, tls_pages = 0;
+
+        if (nt_thread_tls_init(p->space, slot, teb_va, &tls_va, &tls_pages) != 0) {
+            t->nt_tls_va = tls_va;
+            t->nt_tls_pages = tls_pages;
+            proc_free(t);
+            return STATUS_NO_MEMORY;
+        }
+        t->nt_tls_va = tls_va;
+        t->nt_tls_pages = tls_pages;
+    }
+
     /* Two references: the thread's own, dropped when it exits (after it
      * has signalled the object), and the handle's, dropped by NtClose. */
     tobj = thread_object_create(t->pid);
