@@ -40,11 +40,6 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
 ## What needs to be done now, in order
 
 ### 1. Finish item 14(a) — threads (small, self-contained)
-- **Mutant abandonment**: a mutex held by a thread that dies must be released
-  with `WAIT_ABANDONED` for the next waiter. The hook is `proc_nt_thread_exit`
-  (`kernel/proc/process.c`); mutant state is in `kernel/obj/dispatch.c`.
-- **`CREATE_SUSPENDED` / `ResumeThread` / `SuspendThread`**: `NtCreateThreadEx`
-  (`kernel/exec/nt.c`) ignores the flag today.
 - **`NtTerminateThread` on another thread** returns `STATUS_NOT_IMPLEMENTED`
   (`kernel/exec/nt.c`); the killing-a-thread-on-another-CPU machinery already
   exists for signals — reuse it.

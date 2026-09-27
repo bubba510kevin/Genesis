@@ -300,8 +300,11 @@ in every thread, as Windows does.
 `ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
 released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.
 
-**Not yet:** `CREATE_SUSPENDED`/`ResumeThread`, terminating *another* thread,
-named mutexes (`OpenMutex`).
+**Suspension ✅** (2026-09-27): `CREATE_SUSPENDED`, `SuspendThread` and
+`ResumeThread` (counted, up to 127), including a thread suspending itself
+and one spinning in ring 3 on another CPU.
+
+**Not yet:** terminating *another* thread, named mutexes (`OpenMutex`).
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used

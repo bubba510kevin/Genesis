@@ -82,9 +82,9 @@ struct syscall_frame;
  *
  * Eleven arguments, seven of them on the stack. ProcessHandle must be
  * NtCurrentProcess() - another process's threads need NtCreateProcess, which
- * does not exist - and CreateFlags may not ask for THREAD_CREATE_FLAGS_
- * CREATE_SUSPENDED, since there is no NtResumeThread to undo it; both are
- * STATUS_NOT_IMPLEMENTED, not silently ignored.
+ * does not exist - and that is STATUS_NOT_IMPLEMENTED, not silently ignored.
+ * THREAD_CREATE_FLAGS_CREATE_SUSPENDED makes a thread with a suspend count
+ * of 1 that is not put on any run queue until NtResumeThread.
  *
  * The new thread starts in ntdll!RtlUserThreadStart, as on NT, with a
  * private TEB (GS:0 is its own, so GetCurrentThreadId and GetLastError are
@@ -156,6 +156,20 @@ struct syscall_frame;
  * address-keyed waiting itself is ntdll's (RtlWaitOnAddress). */
 #define NT_SYS_WAIT_ALERT_BY_TID     0x20
 #define NT_SYS_ALERT_BY_TID          0x21
+
+/* NtSuspendThread(HANDLE Thread, PULONG PreviousSuspendCount)
+ * NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
+ *
+ * A counted suspension, in the calling process. Suspend raises the count
+ * (STATUS_SUSPEND_COUNT_EXCEEDED past 127) and the thread stops before its
+ * next instruction in ring 3: at once if it is in the kernel or blocked,
+ * after a kick if it is running on another CPU, and on the way out of this
+ * very call for NtCurrentThread(). Resume lowers it and lets the thread go
+ * at 0. Both report the count as it was BEFORE the call - which is how
+ * ResumeThread tells "resumed" (1) from "was not suspended" (0). */
+#define NT_SYS_SUSPEND_THREAD        0x22
+#define NT_SYS_RESUME_THREAD         0x23
+#define NT_MAXIMUM_SUSPEND_COUNT     127
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -260,6 +274,7 @@ struct syscall_frame;
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035u
 #define STATUS_OBJECT_TYPE_MISMATCH  0xC0000024u
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
+#define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
 #define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 
 /* EVENT_TYPE. Upstream's spelling and upstream's values: the difference is

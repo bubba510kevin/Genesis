@@ -124,6 +124,43 @@ static DWORD WINAPI holder(LPVOID param) {
     return 0;                                /* not reached */
 }
 
+static volatile int ran;
+
+static DWORD WINAPI runs(LPVOID param) {
+    ran = 1;
+    return (DWORD)(SIZE_T)param;
+}
+
+static volatile LONG spins;
+static volatile int stop;
+
+static DWORD WINAPI spinner(LPVOID param) {
+    (void)param;
+    while (!stop) {
+        __sync_fetch_and_add(&spins, 1);
+    }
+    return 0;
+}
+
+static volatile int before_self, after_self;
+
+static DWORD WINAPI self_suspender(LPVOID param) {
+    (void)param;
+    before_self = 1;
+    SuspendThread(GetCurrentThread());
+    after_self = 1;
+    return 0;
+}
+
+/* Has `spins` stopped moving? Sampled across a real sleep, so a spinner
+ * on another CPU has had time to move it if it could. */
+static int frozen(void) {
+    LONG a = spins;
+
+    Sleep(60);
+    return spins == a;
+}
+
 static DWORD WINAPI forever(LPVOID param) {
     (void)param;
     for (;;) {
@@ -292,11 +329,69 @@ void start(void) {
               "than the process table holds at once, so dead ones are "
               "really reclaimed");
 
-    /* --- refusals --------------------------------------------------------- */
-    check(CreateThread(NULL_PTR, 0, worker, NULL_PTR, CREATE_SUSPENDED,
-                       NULL_PTR) == NULL_PTR &&
-          GetLastError() == ERROR_CALL_NOT_IMPLEMENTED,
-          "CREATE_SUSPENDED is refused, not silently ignored");
+    /* --- suspension ------------------------------------------------------ */
+    ran = 0;
+    h[0] = CreateThread(NULL_PTR, 0, runs, (LPVOID)(SIZE_T)31,
+                        CREATE_SUSPENDED, NULL_PTR);
+    check(h[0] != NULL_PTR, "CreateThread with CREATE_SUSPENDED");
+    Sleep(60);
+    check(!ran && WaitForSingleObject(h[0], 0) == WAIT_TIMEOUT,
+          "and it does not run - not one instruction - until resumed");
+    check(ResumeThread(h[0]) == 1,
+          "ResumeThread reports the count it found: 1");
+    check(WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0 && ran &&
+          GetExitCodeThread(h[0], &code) && code == 31,
+          "and then it runs to completion");
+    check(ResumeThread(h[0]) == (DWORD)-1,
+          "resuming a thread that has exited fails");
+    CloseHandle(h[0]);
+
+    spins = 0;
+    stop = 0;
+    h[0] = CreateThread(NULL_PTR, 0, spinner, NULL_PTR, 0, NULL_PTR);
+    while (h[0] != NULL_PTR && spins == 0) {
+    }
+    check(ResumeThread(h[0]) == 0,
+          "ResumeThread on a running thread is a no-op that reports 0");
+    check(SuspendThread(h[0]) == 0 && frozen(),
+          "SuspendThread stops a thread spinning in ring 3");
+    check(SuspendThread(h[0]) == 1 && ResumeThread(h[0]) == 2 && frozen(),
+          "the count is counted: suspended twice, resumed once, still "
+          "stopped");
+    ok = 1;
+    for (i = 2; i <= 127; i++) {
+        if (SuspendThread(h[0]) != (DWORD)(i - 1)) {
+            ok = 0;
+        }
+    }
+    check(ok && SuspendThread(h[0]) == (DWORD)-1 &&
+          GetLastError() == ERROR_SIGNAL_REFUSED,
+          "up to 127, and the 128th is refused with ERROR_SIGNAL_REFUSED");
+    for (i = 127; i > 1; i--) {
+        (void)ResumeThread(h[0]);
+    }
+    check(ResumeThread(h[0]) == 1 && !frozen(),
+          "the last ResumeThread lets it run again");
+    stop = 1;
+    check(WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0,
+          "and it finishes normally");
+    CloseHandle(h[0]);
+
+    before_self = after_self = 0;
+    h[0] = CreateThread(NULL_PTR, 0, self_suspender, NULL_PTR, 0, NULL_PTR);
+    while (h[0] != NULL_PTR && !before_self) {
+    }
+    Sleep(60);
+    check(!after_self && WaitForSingleObject(h[0], 0) == WAIT_TIMEOUT,
+          "SuspendThread(GetCurrentThread()) stops the caller in the call");
+    check(ResumeThread(h[0]) == 1 &&
+          WaitForSingleObject(h[0], 5000) == WAIT_OBJECT_0 && after_self,
+          "and another thread's ResumeThread lets it continue");
+    CloseHandle(h[0]);
+
+    h[1] = CreateThread(NULL_PTR, 0, runs, NULL_PTR, CREATE_SUSPENDED,
+                        NULL_PTR);
+    check(h[1] != NULL_PTR, "a thread left suspended for ExitProcess");
 
     /* --- ExitProcess with a thread still running ------------------------- */
     h[0] = CreateThread(NULL_PTR, 0, forever, NULL_PTR, 0, NULL_PTR);

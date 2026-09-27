@@ -53,6 +53,8 @@ DWORD k32_set_error_from_status(NTSTATUS status) {
         code = ERROR_TIMEOUT;            break;
     case 0xC0000046u:                    /* MUTANT_NOT_OWNED             */
         code = ERROR_NOT_OWNER;          break;
+    case 0xC000004Au:                    /* SUSPEND_COUNT_EXCEEDED       */
+        code = ERROR_SIGNAL_REFUSED;     break;
     case 0xC0000005u:                    /* ACCESS_VIOLATION             */
         /* A bad pointer handed to the kernel. ERROR_NOACCESS is what
          * Windows uses; ERROR_INVALID_PARAMETER is closer to what a caller

@@ -322,6 +322,22 @@ void return_to_user(int to_user) {
         }
     }
 
+    /* Suspended (NtSuspendThread) - by itself in the syscall now ending, or
+     * by another thread that kicked this CPU to get here. Parked rather than
+     * returned: the next instruction in ring 3 is exactly what a suspend
+     * promises will not run. A loop, because anything else that wakes a
+     * blocked thread is a spurious wake here; only NtResumeThread taking the
+     * count to 0 lets it out. A kill does not come back through here at
+     * all - a zombie's schedule() never returns. */
+    while (me != NULL && me->nt_suspend_count > 0 &&
+           me->state != PROC_ZOMBIE) {
+        me->nt_parked = 1;
+        sched_block(me);
+    }
+    if (me != NULL) {
+        me->nt_parked = 0;
+    }
+
     smp_run_deferred();
     if (sched_needs_resched()) {
         schedule();

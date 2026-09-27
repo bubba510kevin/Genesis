@@ -68,6 +68,8 @@ NT_STUB_X(NtReleaseMutant,         NT_SYS_RELEASE_MUTANT);
 NT_STUB_X(NtCreateThreadEx,        NT_SYS_CREATE_THREAD);
 NT_STUB_X(NtTerminateThread,       NT_SYS_TERMINATE_THREAD);
 NT_STUB_X(NtQueryInformationThread, NT_SYS_QUERY_THREAD);
+NT_STUB_X(NtSuspendThread,         NT_SYS_SUSPEND_THREAD);
+NT_STUB_X(NtResumeThread,          NT_SYS_RESUME_THREAD);
 
 /* The machine, processes and scheduling. */
 NT_STUB_X(NtQuerySystemInformation,   NT_SYS_QUERY_SYSTEM_INFO);

@@ -958,9 +958,6 @@ static uint64 nt_create_thread(struct syscall_frame *frame) {
     if (process != NT_CURRENT_PROCESS) {
         return STATUS_NOT_IMPLEMENTED;   /* another process: no such thing */
     }
-    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) {
-        return STATUS_NOT_IMPLEMENTED;   /* nothing could ever resume it */
-    }
     if (start == 0 || !user_ptr_ok(start)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1086,6 +1083,15 @@ static uint64 nt_create_thread(struct syscall_frame *frame) {
         }
     }
 
+    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) {
+        /* Complete - TEB, stack, TLS, handle - but on no run queue, so it
+         * cannot run a single instruction until NtResumeThread. Parked,
+         * which also keeps a signal from waking it (signal_send). */
+        t->nt_suspend_count = 1;
+        t->nt_parked        = 1;
+        t->state            = PROC_BLOCKED;
+        return STATUS_SUCCESS;
+    }
     t->state = PROC_READY;
     sched_enqueue(t);
     return STATUS_SUCCESS;

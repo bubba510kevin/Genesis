@@ -444,6 +444,8 @@ process_t *proc_alloc(int ppid) {
             p->nt_tls_va       = 0;
             p->nt_tls_pages    = 0;
             p->nt_alerted      = 0;
+            p->nt_suspend_count = 0;
+            p->nt_parked       = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;

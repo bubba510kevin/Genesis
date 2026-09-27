@@ -195,6 +195,13 @@ typedef struct process {
     uint64           nt_tls_pages;
     /* An NtAlertThreadByThreadId that has not been consumed by a wait yet. */
     volatile int     nt_alerted;
+    /* NtSuspendThread's count; the thread runs only while it is 0. A thread
+     * with a count parks on its way back to ring 3 (return_to_user), or -
+     * created suspended - is never put on a run queue at all. nt_parked is
+     * "blocked for this reason and no other": NtResumeThread wakes only a
+     * parked thread, and a signal does not (see signal_send). */
+    volatile int     nt_suspend_count;
+    volatile int     nt_parked;
 
     thread_t        thread;
 

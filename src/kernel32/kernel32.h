@@ -108,6 +108,7 @@ typedef DWORD *LPDWORD;
 #define ERROR_TIMEOUT            1460u
 #define ERROR_NO_MORE_ITEMS       259u
 #define ERROR_NOT_OWNER           288u
+#define ERROR_SIGNAL_REFUSED      156u
 
 /* CreateFile dispositions. Only OPEN_EXISTING is honoured; the rest are
  * declared so a caller's constant means what it says when it is refused. */
@@ -189,6 +190,9 @@ HANDLE WINAPI GetCurrentThread(void);
 DWORD  WINAPI GetCurrentThreadId(void);
 DWORD  WINAPI GetThreadId(HANDLE thread);
 BOOL   WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code);
+/* The previous suspend count, or (DWORD)-1 on failure. */
+DWORD  WINAPI SuspendThread(HANDLE thread);
+DWORD  WINAPI ResumeThread(HANDLE thread);
 DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
 
 /* Mutexes (thread.c). Unnamed only for now: a name is refused with

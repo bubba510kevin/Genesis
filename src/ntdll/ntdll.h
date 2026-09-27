@@ -237,6 +237,9 @@ NTSTATUS NtTerminateThread(HANDLE ThreadHandle, NTSTATUS ExitStatus);
 NTSTATUS NtQueryInformationThread(HANDLE ThreadHandle, DWORD InfoClass,
                                   PVOID Info, DWORD InfoLength,
                                   DWORD *ReturnLength);
+/* Counted: each reports the count as it was BEFORE the call. */
+NTSTATUS NtSuspendThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
+NTSTATUS NtResumeThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
 
 /* --- the runtime library ------------------------------------------------- */
 

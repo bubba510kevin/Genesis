@@ -51,6 +51,8 @@ EXPORTS
     GetCurrentThreadId
     GetThreadId
     GetExitCodeThread
+    SuspendThread
+    ResumeThread
     WaitForSingleObject
     CreateMutexW
     CreateMutexA

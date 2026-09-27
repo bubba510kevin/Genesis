@@ -17,13 +17,6 @@ HANDLE WINAPI CreateThread(LPVOID security, SIZE_T stack_size,
 
     (void)security;                 /* no inheritable handles yet */
 
-    /* CREATE_SUSPENDED is refused rather than ignored: a program that asks
-     * for it is about to fill something in before ResumeThread, and a thread
-     * that is already running would race it. There is no ResumeThread. */
-    if (flags & CREATE_SUSPENDED) {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-        return NULL_PTR;
-    }
     if (start == NULL_PTR) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL_PTR;
@@ -32,9 +25,12 @@ HANDLE WINAPI CreateThread(LPVOID security, SIZE_T stack_size,
     /* STACK_SIZE_PARAM_IS_A_RESERVATION changes what the number means on
      * Windows (reserve vs commit). Here every stack is committed up front,
      * so both readings ask for the same thing. */
+    /* CREATE_SUSPENDED is Win32's 0x4; the native flag is 0x1. */
     st = NtCreateThreadEx(&h, THREAD_ALL_ACCESS, NULL_PTR, NtCurrentProcess(),
-                          (PVOID)start, parameter, 0, 0, stack_size, 0,
-                          NULL_PTR);
+                          (PVOID)start, parameter,
+                          (flags & CREATE_SUSPENDED)
+                              ? THREAD_CREATE_FLAGS_CREATE_SUSPENDED : 0,
+                          0, stack_size, 0, NULL_PTR);
     if (!NT_SUCCESS(st)) {
         k32_set_error_from_status(st);
         return NULL_PTR;
@@ -100,6 +96,28 @@ BOOL WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code) {
      * is the right way to ask "has it finished". */
     *code = tbi.ExitStatus;
     return 1;
+}
+
+DWORD WINAPI SuspendThread(HANDLE thread) {
+    DWORD prev = 0;
+    NTSTATUS st = NtSuspendThread(thread, &prev);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return (DWORD)-1;
+    }
+    return prev;
+}
+
+DWORD WINAPI ResumeThread(HANDLE thread) {
+    DWORD prev = 0;
+    NTSTATUS st = NtResumeThread(thread, &prev);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return (DWORD)-1;
+    }
+    return prev;
 }
 
 DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
