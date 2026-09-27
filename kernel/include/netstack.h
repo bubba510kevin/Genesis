@@ -42,4 +42,26 @@ uint64 net_stat_icmp_echoes(void);
  * failures. Must run AFTER sti - it waits for real received frames. */
 int net_selftest(void);
 
+/* Address configuration (network byte order throughout). net_configure
+ * applies an address/mask/gateway to the NIC; net_configure_static applies
+ * the compiled-in QEMU defaults. */
+int    net_configure(uint32 addr, uint32 mask, uint32 gw);
+int    net_configure_static(void);
+uint32 net_gateway(void);
+uint32 net_netmask(void);
+
+/* DHCP (kernel/bsd/dhcp.c): acquire a lease - DISCOVER, OFFER, REQUEST,
+ * ACK - and configure it, falling back to the static address if no server
+ * answers. Needs interrupts and the scheduler (it sleeps). Starts a kernel
+ * thread that renews the lease at T1. Returns 0 with a lease, 1 on the
+ * static fallback. */
+int  net_dhcp_start(void);
+void net_dhcp_report(uint8 color);
+/* What the last lease said, for tests and reports: 0 if none. */
+uint32 net_dhcp_server(void);
+uint32 net_dhcp_dns(void);
+uint32 net_dhcp_lease_seconds(void);
+uint64 net_dhcp_renewals(void);
+int    net_dhcp_selftest(void);
+
 #endif

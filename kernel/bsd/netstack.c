@@ -66,15 +66,17 @@
 VNET_DECLARE(struct ifnethead, ifnet);
 #define V_ifnet_list  VNET(ifnet)
 
-/* QEMU user-mode networking's defaults. The guest is .15, the gateway and DNS
- * are .2 and .3, and the host is reachable at .2.
- *
- * Compiled in because there is no DHCP client. That is the one piece of
- * configuration this machine cannot discover, and it is the reason these are
- * three constants rather than something learned - see netstack.h. */
-#define MY_IP    0x0F02000AU        /* 10.0.2.15, network byte order */
-#define MY_MASK  0x00FFFFFFU        /* /24                           */
-#define GW_IP    0x0202000AU        /* 10.0.2.2                      */
+/* QEMU user-mode networking's defaults: the guest is .15, the gateway .2,
+ * DNS .3. These are the FALLBACK now - the address is learned by DHCP
+ * (kernel/bsd/dhcp.c) and these are applied only when no server answers,
+ * so a machine on a network without one still comes up. */
+#define STATIC_IP    0x0F02000AU    /* 10.0.2.15, network byte order */
+#define STATIC_MASK  0x00FFFFFFU    /* /24                           */
+#define STATIC_GW    0x0202000AU    /* 10.0.2.2                      */
+
+/* What the interface is configured with right now (network byte order), 0
+ * before anything is. */
+static uint32 cur_ip, cur_mask, cur_gw;
 
 /* The interface everything above is configured on. There is one NIC; this is
  * the pointer to it, kept so the report and the ping can find it without
@@ -87,7 +89,7 @@ struct ifnet *net_interface(void) {
 }
 
 uint32_t net_my_addr(void) {
-    return (MY_IP);
+    return (cur_ip);
 }
 
 uint64 net_stat_rx_frames(void) {
@@ -154,14 +156,14 @@ static int configure_address(struct ifnet *ifp, uint32_t addr, uint32_t mask) {
  * shared) nexthop object for it, and installing a route with a zero-length
  * prefix so it loses to every more specific match.
  */
-static int configure_default_route(struct ifnet *ifp) {
+static int configure_default_route(struct ifnet *ifp, uint32_t gw_ip) {
     struct sockaddr_in gw;
     struct rib_cmd_info rc;
 
     memset(&gw, 0, sizeof(gw));
     gw.sin_len = sizeof(gw);
     gw.sin_family = AF_INET;
-    gw.sin_addr.s_addr = GW_IP;
+    gw.sin_addr.s_addr = gw_ip;
 
     memset(&rc, 0, sizeof(rc));
     return (rib_add_default_route(RT_DEFAULT_FIB, AF_INET, ifp,
@@ -227,7 +229,7 @@ int net_ping(uint32 dst_be) {
     ih->ip_len = htons((u_short)(sizeof(struct ip) + icmplen));
     ih->ip_ttl = 64;
     ih->ip_p   = IPPROTO_ICMP;
-    ih->ip_src.s_addr = MY_IP;
+    ih->ip_src.s_addr = cur_ip;
     ih->ip_dst.s_addr = dst_be;
 
     return (ip_output(m, NULL, NULL, 0, NULL, NULL));
@@ -294,26 +296,73 @@ void net_stack_init(void) {
         net_ifp->if_init(net_ifp->if_softc);
     }
 
-    error = configure_address(net_ifp, MY_IP, MY_MASK);
-    if (error != 0) {
-        kprintf_c(0x0C, "net: SIOCAIFADDR on %s failed, error %d\n",
-                  net_ifp->if_xname, error);
-        return;
-    }
-
-    error = configure_default_route(net_ifp);
-    if (error != 0) {
-        /* Not fatal: the /24 is still reachable through the interface route
-         * in_control just added. Only off-link traffic is affected, and
-         * saying which is more useful than "route add failed". */
-        kprintf_c(0x0E, "net: default route via 10.0.2.2 failed, error %d - "
-                        "the local /24 still works, off-link does not\n",
-                  error);
-    }
-
-    kprintf_c(0x0A, "net: %s is 10.0.2.15/24, gateway 10.0.2.2, "
-                    "drv flags %x\n",
+    /* No address yet: the interface is up and can send and receive
+     * broadcasts, which is all DHCP needs. net_configure (below) is what
+     * gives it one - from a DHCP lease, or the static fallback. */
+    (void)error;
+    kprintf_c(0x0A, "net: %s is up, drv flags %x - address by DHCP\n",
               net_ifp->if_xname, net_ifp->if_drv_flags);
+}
+
+/* Give the NIC an address, netmask and default route - SIOCAIFADDR and
+ * route(8) as rc.conf would. A changed address replaces the old one
+ * (SIOCDIFADDR first), which is what a new lease with a different address
+ * needs; the same one again is left alone. */
+int net_configure(uint32_t addr, uint32_t mask, uint32_t gw) {
+    int error;
+
+    if (net_ifp == NULL) {
+        return (ENXIO);
+    }
+    if (addr == cur_ip && mask == cur_mask && gw == cur_gw) {
+        return (0);
+    }
+    if (cur_ip != 0 && cur_ip != addr) {
+        struct ifreq ifr;
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, net_ifp->if_xname, sizeof(ifr.ifr_name) - 1);
+        sin->sin_len = sizeof(*sin);
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = cur_ip;
+        (void)in_control(NULL, SIOCDIFADDR, (caddr_t)&ifr, net_ifp, NULL);
+        cur_ip = 0;
+    }
+    if (cur_ip == 0) {
+        error = configure_address(net_ifp, addr, mask);
+        if (error != 0) {
+            kprintf_c(0x0C, "net: SIOCAIFADDR on %s failed, error %d\n",
+                      net_ifp->if_xname, error);
+            return (error);
+        }
+    }
+    cur_ip = addr;
+    cur_mask = mask;
+    if (gw != 0 && gw != cur_gw) {
+        error = configure_default_route(net_ifp, gw);
+        if (error != 0 && error != EEXIST) {
+            /* Not fatal: the local subnet still works through the interface
+             * route in_control just added. */
+            kprintf_c(0x0E, "net: default route failed, error %d - the local "
+                            "subnet still works, off-link does not\n", error);
+        }
+    }
+    cur_gw = gw;
+    return (0);
+}
+
+/* The compiled-in address, for when no DHCP server answers. */
+int net_configure_static(void) {
+    return net_configure(STATIC_IP, STATIC_MASK, STATIC_GW);
+}
+
+uint32_t net_gateway(void) {
+    return (cur_gw);
+}
+
+uint32_t net_netmask(void) {
+    return (cur_mask);
 }
 
 void net_stack_report(uint8 color) {

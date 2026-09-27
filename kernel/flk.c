@@ -997,7 +997,11 @@ void flk(void) {
 
     /* After sti, and it has to be: it waits for a real reply to arrive
      * through a real interrupt. */
+    /* The address, by DHCP - after sti and the scheduler, because it waits
+     * for replies - and before the network selftest, which needs one. */
+    net_dhcp_start();
     net_selftest();
+    net_dhcp_selftest();
     net_stack_report(0x0F);
     /* The two mechanisms the protocol layer's initialisation rests on, printed
      * because both of them failed silently once. sysctl's count says the link

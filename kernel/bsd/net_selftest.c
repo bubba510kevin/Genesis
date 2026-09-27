@@ -56,8 +56,12 @@
 #include "netstack.h"
 #include "timer.h"
 
-#define GW_IP_BE  0x0202000AU        /* 10.0.2.2, network byte order */
-#define DNS_IP_BE 0x0302000AU        /* 10.0.2.3 - QEMU's DNS proxy   */
+/* The gateway and resolver the address came with - from the DHCP lease, or
+ * QEMU's defaults (10.0.2.2, 10.0.2.3) on the static fallback. Asked rather
+ * than compiled in, so the checks still hold on a network DHCP configured
+ * differently - which is how the DHCP client itself is checked. */
+#define GW_IP_BE  (net_gateway() != 0 ? net_gateway() : 0x0202000AU)
+#define DNS_IP_BE (net_dhcp_dns() != 0 ? net_dhcp_dns() : 0x0302000AU)
 
 #define ARPSTAT(f)  VNET_PCPUSTAT_FETCH(struct arpstat, arpstat, f)
 #define ICMPSTAT(f) VNET_PCPUSTAT_FETCH(struct icmpstat, icmpstat, f)
@@ -286,10 +290,10 @@ int net_selftest(void) {
                   ARPSTAT(txrequests), ARPSTAT(rxreplies));
         return (1);
     }
-    kprintf_c(0x0A, "net: ARP check passed - 10.0.2.2 resolved: a frame we "
-                    "built was transmitted, answered, and received "
+    kprintf_c(0x0A, "net: ARP check passed - the gateway (%x) resolved: a "
+                    "frame we built was transmitted, answered, and received "
                     "(tx %lx, rx replies %lx)\n",
-              ARPSTAT(txrequests), ARPSTAT(rxreplies));
+              (uint32)ntohl(GW_IP_BE), ARPSTAT(txrequests), ARPSTAT(rxreplies));
 
     /* --- 2: ICMP echo ----------------------------------------------------
      * Now the IP layer itself. Retried, because the first ping raced the ARP

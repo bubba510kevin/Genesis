@@ -536,7 +536,14 @@ def qemu_args():
     # so an ARP reply or an ICMP echo reply arriving back is evidence the
     # whole path works. Without it the NIC transmits into a void and receive
     # can never be exercised at all.
-    args += ["-netdev", "user,id=n0"]
+    # GENESIS_NET=10.0.9.0/24 (say) puts QEMU's user network - its DHCP
+    # server, gateway and DNS - on another subnet: the address the guest ends
+    # up with then says whether DHCP configured it (10.0.9.15) or the static
+    # fallback did (10.0.2.15, which cannot reach anything there).
+    netdev = "user,id=n0"
+    if os.environ.get("GENESIS_NET"):
+        netdev += ",net=" + os.environ["GENESIS_NET"]
+    args += ["-netdev", netdev]
     args += ["-device", "rtl8139,netdev=n0"]
 
     # COM1 to this terminal. The kernel mirrors everything print_string writes
