@@ -260,12 +260,16 @@ struct multi_ctx {
     int            n;
     int            wait_all;
     int            who;
+    process_t     *alertable;   /* the waiter, if an APC may end the wait */
 };
 
 static int multi_ready(void *ctx) {
     struct multi_ctx *m = (struct multi_ctx *)ctx;
     int i;
 
+    if (m->alertable != NULL && m->alertable->nt_apc_head != NULL) {
+        return 1;
+    }
     for (i = 0; i < m->n; i++) {
         int r = !m->d[i]->in_use || disp_ready(m->d[i], m->who);
 
@@ -280,7 +284,7 @@ static int multi_ready(void *ctx) {
 }
 
 int dispatch_wait_multiple(object_t **objs, int n, int wait_all,
-                           uint64 deadline) {
+                           int alertable, uint64 deadline) {
     dispatcher_t *d[DISPATCH_WAIT_MAX];
     struct multi_ctx ctx;
     uint64 flags;
@@ -310,9 +314,17 @@ int dispatch_wait_multiple(object_t **objs, int n, int wait_all,
     ctx.n        = n;
     ctx.wait_all = wait_all;
     ctx.who      = caller_id();
+    ctx.alertable = alertable ? proc_current() : NULL;
 
     flags = intr_disable();
     for (;;) {
+        /* A queued APC ends an alertable wait before anything is taken -
+         * checked first, as NT does, so an APC queued before the wait
+         * began is not held up by an object that happens to be ready. */
+        if (ctx.alertable != NULL && ctx.alertable->nt_apc_head != NULL) {
+            intr_restore(flags);
+            return DISPATCH_WAIT_APC;
+        }
         for (i = 0; i < n; i++) {
             if (!d[i]->in_use) {
                 intr_restore(flags);

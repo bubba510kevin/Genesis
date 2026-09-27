@@ -300,6 +300,11 @@ in every thread, as Windows does.
 wait-any (lowest index wins) and wait-all (all or nothing), plus `CreateEvent`,
 `SetEvent`, `ResetEvent`, `CreateSemaphore` and `ReleaseSemaphore` (unnamed).
 
+**APCs ✅** (2026-09-27): `QueueUserAPC`, and the alertable waits that run
+them - `SleepEx`, `WaitForSingleObjectEx`, `WaitForMultipleObjectsEx`
+(`WAIT_IO_COMPLETION`). Underneath, the kernel can hand a thread a full
+`CONTEXT` on its own stack and `NtContinue` puts every register back.
+
 **Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
 `ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
 released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.

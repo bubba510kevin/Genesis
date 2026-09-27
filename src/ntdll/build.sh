@@ -37,7 +37,8 @@ $CC $CFLAGS -c rtl.c   -o rtl.o
 $CC $CFLAGS -c sync.c  -o sync.o
 $CC $CFLAGS -c tls.c   -o tls.o
 $CC $CFLAGS -c waitaddr.c -o waitaddr.o
-$CC $LDFLAGS -o ntdll.dll stubs.o rtl.o sync.o tls.o waitaddr.o ntdll.def
+$CC $CFLAGS -c except.c -o except.o
+$CC $LDFLAGS -o ntdll.dll stubs.o rtl.o sync.o tls.o waitaddr.o except.o ntdll.def
 
 # /wsr/System32 is the Windows side of the volume, and the name is 8.3-clean:
 # WSR and SYSTEM32 both fit, as does NTDLL.DLL. A DLL that cannot be named by

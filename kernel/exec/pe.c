@@ -233,6 +233,8 @@ static int validate(const void *image, uint64 size, pe_info_t *info,
     info->has_imports    = opt->number_of_rva_and_sizes > PE_DIR_IMPORT &&
                            opt->directory[PE_DIR_IMPORT].size != 0;
     info->thread_start   = 0;    /* set only by pe_load_executable's link */
+    info->apc_dispatcher = 0;
+    info->exception_dispatcher = 0;
     return PE_OK;
 }
 
@@ -1239,6 +1241,8 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
         return rc;
     }
     info->thread_start = 0;
+    info->apc_dispatcher = 0;
+    info->exception_dispatcher = 0;
     info->tls_count = 0;
     info->has_tls_callbacks = 0;
     rc = collect_tls(as, info->image_base, info);
@@ -1281,6 +1285,13 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
 
         if (ntdll != 0 && find_export(&ctx, ntdll, "RtlUserThreadStart", &at)) {
             info->thread_start = at;
+        }
+        if (ntdll != 0 && find_export(&ctx, ntdll, "KiUserApcDispatcher", &at)) {
+            info->apc_dispatcher = at;
+        }
+        if (ntdll != 0 &&
+            find_export(&ctx, ntdll, "KiUserExceptionDispatcher", &at)) {
+            info->exception_dispatcher = at;
         }
     }
     return PE_OK;

@@ -74,6 +74,7 @@ typedef const CHAR *LPCSTR;
 typedef WCHAR *LPWSTR;
 typedef const WCHAR *LPCWSTR;
 typedef void *LPVOID;
+typedef SIZE_T ULONG_PTR;
 typedef DWORD *LPDWORD;
 
 #define WINAPI
@@ -134,6 +135,7 @@ typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID parameter);
 #define WAIT_OBJECT_0        0x00000000u
 #define WAIT_ABANDONED       0x00000080u
 #define WAIT_ABANDONED_0     0x00000080u
+#define WAIT_IO_COMPLETION   0x000000C0u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
 
@@ -204,6 +206,15 @@ DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
  * no kernel path yet. */
 DWORD  WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles,
                                      BOOL wait_all, DWORD milliseconds);
+/* The alertable forms: WAIT_IO_COMPLETION when queued APCs ran instead. */
+DWORD  WINAPI WaitForSingleObjectEx(HANDLE handle, DWORD milliseconds,
+                                    BOOL alertable);
+DWORD  WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
+                                       BOOL wait_all, DWORD milliseconds,
+                                       BOOL alertable);
+typedef void (WINAPI *PAPCFUNC)(ULONG_PTR data);
+/* Queue fn(data) on `thread`; it runs at that thread's next alertable wait. */
+DWORD  WINAPI QueueUserAPC(PAPCFUNC fn, HANDLE thread, ULONG_PTR data);
 /* Events and semaphores, unnamed only for the same reason as mutexes. */
 HANDLE WINAPI CreateEventW(LPVOID security, BOOL manual_reset,
                            BOOL initial_state, LPCWSTR name);

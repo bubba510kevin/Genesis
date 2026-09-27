@@ -134,18 +134,26 @@ DWORD WINAPI ResumeThread(HANDLE thread) {
 }
 
 DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
+    return WaitForSingleObjectEx(handle, milliseconds, 0);
+}
+
+DWORD WINAPI WaitForSingleObjectEx(HANDLE handle, DWORD milliseconds,
+                                   BOOL alertable) {
     LARGE_INTEGER timeout;
     NTSTATUS st;
 
     if (milliseconds == INFINITE) {
-        st = NtWaitForSingleObject(handle, 0, NULL_PTR);
+        st = NtWaitForSingleObject(handle, alertable ? 1 : 0, NULL_PTR);
     } else {
         /* Negative is RELATIVE, in 100ns units. */
         timeout.QuadPart = -(long long)milliseconds * 10000LL;
-        st = NtWaitForSingleObject(handle, 0, &timeout);
+        st = NtWaitForSingleObject(handle, alertable ? 1 : 0, &timeout);
     }
     if (st == STATUS_SUCCESS) {
         return WAIT_OBJECT_0;
+    }
+    if (st == STATUS_USER_APC) {
+        return WAIT_IO_COMPLETION;          /* APCs ran; nothing was taken */
     }
     if (st == STATUS_ABANDONED_WAIT_0) {
         /* The caller owns the mutex now - the previous owner died with it. */
@@ -169,6 +177,25 @@ static LARGE_INTEGER *k32_timeout(DWORD milliseconds, LARGE_INTEGER *t) {
 
 DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles,
                                     BOOL wait_all, DWORD milliseconds) {
+    return WaitForMultipleObjectsEx(count, handles, wait_all, milliseconds, 0);
+}
+
+DWORD WINAPI QueueUserAPC(PAPCFUNC fn, HANDLE thread, ULONG_PTR data) {
+    /* PAPCFUNC takes one argument and an NT APC routine three; under the
+     * Win64 convention the extra two are simply never read. */
+    NTSTATUS st = NtQueueApcThread(thread, (PPS_APC_ROUTINE)(void *)fn,
+                                   (PVOID)data, NULL_PTR, NULL_PTR);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
+}
+
+DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
+                                      BOOL wait_all, DWORD milliseconds,
+                                      BOOL alertable) {
     LARGE_INTEGER timeout;
     NTSTATUS st;
 
@@ -177,8 +204,12 @@ DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles,
         return WAIT_FAILED;
     }
     st = NtWaitForMultipleObjects(count, (HANDLE *)handles,
-                                  wait_all ? WaitAll : WaitAny, 0,
+                                  wait_all ? WaitAll : WaitAny,
+                                  alertable ? 1 : 0,
                                   k32_timeout(milliseconds, &timeout));
+    if ((DWORD)st == STATUS_USER_APC) {
+        return WAIT_IO_COMPLETION;
+    }
     /* WAIT_OBJECT_0 + i and WAIT_ABANDONED_0 + i are the NT statuses
      * themselves, which is why Win32 chose those values. */
     if ((DWORD)st < count ||

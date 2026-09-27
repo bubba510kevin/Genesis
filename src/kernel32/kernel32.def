@@ -56,6 +56,10 @@ EXPORTS
     ResumeThread
     WaitForSingleObject
     WaitForMultipleObjects
+    WaitForSingleObjectEx
+    WaitForMultipleObjectsEx
+    QueueUserAPC
+    RtlCaptureContext = ntdll.RtlCaptureContext
     CreateEventW
     CreateEventA
     SetEvent

@@ -4,6 +4,7 @@
 #include "ns.h"
 #include "dispatch.h"
 #include "nt.h"
+#include "nt_context.h"
 #include "ntsec.h"
 #include "acl.h"
 #include "fileobj.h"
@@ -780,19 +781,60 @@ static uint64 nt_wait_deadline(uint64 timeout_ptr, uint64 *out) {
     return STATUS_SUCCESS;
 }
 
+/* The kernel half of every multi-object (and every alertable) wait: each
+ * object is held by a reference for the length of the wait - a handle
+ * another thread closes meanwhile must not let the object's pool slot be
+ * reused under a waiter still testing it - and the dispatcher's answer
+ * becomes an NTSTATUS. */
+static uint64 nt_wait_objects(object_t **objs, int n, int wait_all,
+                              int alertable, uint64 deadline) {
+    int i, rc;
+
+    for (i = 0; i < n; i++) {
+        ob_ref(objs[i]);
+    }
+    rc = dispatch_wait_multiple(objs, n, wait_all, alertable, deadline);
+    for (i = 0; i < n; i++) {
+        ob_deref(objs[i]);
+    }
+    if (rc >= DISPATCH_WAIT_ABANDONED) {
+        return STATUS_ABANDONED_WAIT_0 + (uint64)(rc - DISPATCH_WAIT_ABANDONED);
+    }
+    if (rc >= 0) {
+        return STATUS_WAIT_0 + (uint64)rc;
+    }
+    switch (rc) {
+    case -110:
+        return STATUS_TIMEOUT;
+    case -4:
+        return STATUS_ALERTED;
+    case DISPATCH_WAIT_APC:
+        return STATUS_USER_APC;     /* delivered on the way out */
+    case DISPATCH_WAIT_DUPLICATE:
+        return STATUS_INVALID_PARAMETER_MIX;
+    default:
+        return STATUS_OBJECT_TYPE_MISMATCH;     /* something not waitable */
+    }
+}
+
 static uint64 nt_wait_single(uint64 handle, uint64 alertable,
                              uint64 timeout_ptr) {
     object_t *obj = nt_object_of(handle);
     uint64 deadline = 0, st;
     int rc;
 
-    (void)alertable;                  /* no APCs, so nothing to be alerted by */
     if (obj == NULL) {
         return STATUS_INVALID_HANDLE;
     }
     st = nt_wait_deadline(timeout_ptr, &deadline);
     if (st != STATUS_SUCCESS) {
         return st;
+    }
+    if ((uint8)alertable != 0) {
+        /* An alertable wait is a wait on one object that an APC may also
+         * end - which is what the multi-object wait already knows how to
+         * do. Its answers are this call's answers for a count of one. */
+        return nt_wait_objects(&obj, 1, 0, 1, deadline);
     }
 
     rc = ob_wait(obj, deadline);
@@ -832,17 +874,14 @@ static uint64 nt_wait_single(uint64 handle, uint64 alertable,
  *
  * WAIT_TYPE is NT's: WaitAll 0, WaitAny 1. The result is STATUS_WAIT_0 + i
  * (the index taken; 0 for wait-all), STATUS_ABANDONED_WAIT_0 + i, or
- * STATUS_TIMEOUT. Each object is held by a reference for the length of the
- * wait: a handle another thread closes meanwhile must not let the object's
- * pool slot be reused under a waiter still testing it. */
+ * STATUS_TIMEOUT; STATUS_USER_APC when Alertable and an APC ran instead. */
 static uint64 nt_wait_multiple(uint64 count, uint64 handles_ptr,
                                uint64 wait_type, uint64 alertable,
                                uint64 timeout_ptr) {
     object_t *objs[DISPATCH_WAIT_MAX];
     uint64 deadline = 0, st;
-    int n = (int)(uint32)count, i, rc;
+    int n = (int)(uint32)count, i;
 
-    (void)alertable;
     if (n < 1 || n > DISPATCH_WAIT_MAX) {
         return STATUS_INVALID_PARAMETER_1;
     }
@@ -860,35 +899,11 @@ static uint64 nt_wait_multiple(uint64 count, uint64 handles_ptr,
     for (i = 0; i < n; i++) {
         objs[i] = nt_object_of(((const uint64 *)handles_ptr)[i]);
         if (objs[i] == NULL) {
-            while (--i >= 0) {
-                ob_deref(objs[i]);
-            }
             return STATUS_INVALID_HANDLE;
         }
-        ob_ref(objs[i]);
     }
-
-    rc = dispatch_wait_multiple(objs, n, (uint32)wait_type == 0, deadline);
-
-    for (i = 0; i < n; i++) {
-        ob_deref(objs[i]);
-    }
-    if (rc >= DISPATCH_WAIT_ABANDONED) {
-        return STATUS_ABANDONED_WAIT_0 + (uint64)(rc - DISPATCH_WAIT_ABANDONED);
-    }
-    if (rc >= 0) {
-        return STATUS_WAIT_0 + (uint64)rc;
-    }
-    switch (rc) {
-    case -110:
-        return STATUS_TIMEOUT;
-    case -4:
-        return STATUS_ALERTED;
-    case DISPATCH_WAIT_DUPLICATE:
-        return STATUS_INVALID_PARAMETER_MIX;
-    default:
-        return STATUS_OBJECT_TYPE_MISMATCH;     /* something not waitable */
-    }
+    return nt_wait_objects(objs, n, (uint32)wait_type == 0,
+                           (uint8)alertable != 0, deadline);
 }
 
 /* NtCreateSemaphore(PHANDLE, ACCESS_MASK, POA, LONG Initial, LONG Maximum) */
@@ -1332,7 +1347,21 @@ static uint64 nt_trace(uint64 number, uint64 status) {
     return status;
 }
 
+static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame);
+
 uint64 nt_syscall_dispatch(struct syscall_frame *frame) {
+    uint64 st = nt_syscall_dispatch_one(frame);
+
+    /* An alertable wait ended by a queued APC: run it now, on the way out.
+     * The CONTEXT handed to the dispatcher returns STATUS_USER_APC as this
+     * call's result once the APC (and any queued behind it) has run. */
+    if ((uint32)st == STATUS_USER_APC) {
+        st = nt_apc_deliver(frame, st);
+    }
+    return st;
+}
+
+static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
     /* Win64: argument one in R10 (the stub copied it out of RCX, which
      * SYSCALL destroys), two in RDX, three in R8, four in R9, the rest on the
      * caller's stack from [rsp+0x28]. See nt.h. */
@@ -1401,6 +1430,14 @@ uint64 nt_syscall_dispatch(struct syscall_frame *frame) {
         case NT_SYS_WAIT_SINGLE:
             return nt_trace(frame->rax,
                             nt_wait_single(frame->r10, frame->rdx, frame->r8));
+
+        case NT_SYS_CONTINUE:
+            /* Returns only on failure - success leaves by iretq. */
+            return nt_trace(frame->rax,
+                            nt_continue(frame, frame->r10, frame->rdx));
+
+        case NT_SYS_TEST_ALERT:
+            return nt_test_alert(frame);
 
         case NT_SYS_WAIT_MULTIPLE: {
             uint64 timeout = 0;

@@ -254,6 +254,59 @@ NTSTATUS NtQueryInformationThread(HANDLE ThreadHandle, DWORD InfoClass,
 NTSTATUS NtSuspendThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
 NTSTATUS NtResumeThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
 
+/* --- CONTEXT, APCs -----------------------------------------------------------
+ *
+ * CONTEXT in Microsoft's exact x64 layout (0x4D0 bytes, 16-aligned): every
+ * exception handler is handed one and compiled code reads it by windows.h's
+ * offsets. See kernel/include/nt_context.h for the kernel's side. */
+typedef struct __attribute__((aligned(16))) _M128A {
+    QWORD Low;
+    long long High;
+} M128A;
+
+typedef struct __attribute__((aligned(16))) _CONTEXT {
+    QWORD P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
+    DWORD ContextFlags;
+    DWORD MxCsr;
+    WORD  SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+    DWORD EFlags;
+    QWORD Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+    QWORD Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    QWORD R8, R9, R10, R11, R12, R13, R14, R15;
+    QWORD Rip;
+    BYTE  FltSave[512];             /* XMM_SAVE_AREA32: FXSAVE's image */
+    M128A VectorRegister[26];
+    QWORD VectorControl;
+    QWORD DebugControl;
+    QWORD LastBranchToRip, LastBranchFromRip;
+    QWORD LastExceptionToRip, LastExceptionFromRip;
+} CONTEXT, *PCONTEXT;
+
+#define CONTEXT_AMD64           0x00100000u
+#define CONTEXT_CONTROL         (CONTEXT_AMD64 | 0x1u)
+#define CONTEXT_INTEGER         (CONTEXT_AMD64 | 0x2u)
+#define CONTEXT_SEGMENTS        (CONTEXT_AMD64 | 0x4u)
+#define CONTEXT_FLOATING_POINT  (CONTEXT_AMD64 | 0x8u)
+#define CONTEXT_FULL            (CONTEXT_CONTROL | CONTEXT_INTEGER | \
+                                 CONTEXT_FLOATING_POINT)
+
+#define STATUS_USER_APC         0x000000C0u
+
+typedef void (*PPS_APC_ROUTINE)(PVOID Arg1, PVOID Arg2, PVOID Arg3);
+
+/* Resume in exactly `Context` - every register. Does not return on success.
+ * TestAlert TRUE runs any queued APC first (see NtQueueApcThread). */
+NTSTATUS NtContinue(PCONTEXT Context, BOOLEAN TestAlert);
+/* Queue Routine(Arg1, Arg2, Arg3) on a thread of this process; it runs the
+ * next time that thread waits alertably or calls NtTestAlert. */
+NTSTATUS NtQueueApcThread(HANDLE Thread, PPS_APC_ROUTINE Routine,
+                          PVOID Arg1, PVOID Arg2, PVOID Arg3);
+NTSTATUS NtTestAlert(void);
+/* The caller's registers as they will be when this returns. */
+void     RtlCaptureContext(PCONTEXT Context);
+/* Where the kernel sends a thread to run an APC. Not called by anybody. */
+void     KiUserApcDispatcher(void);
+
 /* --- the runtime library ------------------------------------------------- */
 
 PTEB     NtCurrentTeb(void);

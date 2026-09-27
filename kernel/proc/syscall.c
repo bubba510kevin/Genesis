@@ -32,6 +32,7 @@
 #include "ksmp.h"
 #include "bkl.h"
 #include "kprintf.h"
+#include "nt_context.h"
 #include "screen.h"
 #include "typesk.h"
 
@@ -2240,6 +2241,8 @@ static process_t *spawn_thread(process_t *parent,
     child->brk_current = parent->brk_current;
     child->mmap_next   = parent->mmap_next;
     child->nt_thread_start = parent->nt_thread_start;
+    child->nt_apc_dispatcher = parent->nt_apc_dispatcher;
+    child->nt_exc_dispatcher = parent->nt_exc_dispatcher;
 
     /* Credentials. A thread IS its process as far as identity goes - POSIX
      * and NT agree on that - and this copy was missing: fork learned it
@@ -2926,6 +2929,8 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     personality_t new_personality = PERSONALITY_LINUX;
     uint64        new_gs_base   = 0;
     uint64        new_thread_start = 0;
+    uint64        new_apc_dispatcher = 0;
+    uint64        new_exc_dispatcher = 0;
     uint64        new_tls_va = 0, new_tls_pages = 0;
     uint64        tls_entry_via_ntdll = 0;
     /* Both zero for a static binary, and both are read unconditionally below.
@@ -3022,6 +3027,8 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
         info.phentsize     = 0;
         new_personality    = PERSONALITY_WINDOWS;
         new_thread_start   = pe.thread_start;
+        new_apc_dispatcher = pe.apc_dispatcher;
+        new_exc_dispatcher = pe.exception_dispatcher;
 
         /* The TEB and PEB, built by the kernel before the image runs -
          * exactly as NT does it, and it has to be that way round:
@@ -3312,6 +3319,9 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
      * every exec, ELF included (0), because it is an address in the image
      * being thrown away. */
     p->nt_thread_start = new_thread_start;
+    p->nt_apc_dispatcher = new_apc_dispatcher;
+    p->nt_exc_dispatcher = new_exc_dispatcher;
+    nt_apc_flush(p);                     /* addresses in the old image */
     /* The main thread's implicit-TLS area, in the space just installed (the
      * old one's is gone with it). */
     p->nt_tls_va    = new_tls_va;

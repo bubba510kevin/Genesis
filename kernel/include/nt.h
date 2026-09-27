@@ -186,6 +186,24 @@ struct syscall_frame;
  * for an abandoned mutant; STATUS_INVALID_PARAMETER_MIX for one object
  * listed twice in a wait-all. */
 #define NT_SYS_WAIT_MULTIPLE         0x24
+
+/* User-mode APCs and the context machinery under them (nt_context.h).
+ *
+ * NtQueueApcThread(HANDLE Thread, PPS_APC_ROUTINE Routine, PVOID Arg1,
+ *                  PVOID Arg2, PVOID Arg3) queues Routine(Arg1, Arg2, Arg3)
+ * on a thread of this process. It runs when that thread next waits
+ * ALERTABLY (NtWaitForSingleObject/NtWaitForMultipleObjects/NtDelayExecution
+ * with Alertable TRUE - the wait then returns STATUS_USER_APC) or calls
+ * NtTestAlert: the kernel enters ntdll!KiUserApcDispatcher with a CONTEXT on
+ * the user stack, and the dispatcher's NtContinue(Context, TRUE) resumes the
+ * interrupted call's return - or runs the next queued APC first.
+ *
+ * NtContinue(PCONTEXT, BOOLEAN TestAlert) resumes ring 3 in exactly the
+ * given context, every register included (it leaves by iretq, not SYSRET).
+ * Does not return on success. */
+#define NT_SYS_CONTINUE              0x25
+#define NT_SYS_QUEUE_APC             0x26
+#define NT_SYS_TEST_ALERT            0x27
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -294,6 +312,7 @@ struct syscall_frame;
 #define STATUS_THREAD_IS_TERMINATING  0xC000004Bu
 #define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 #define STATUS_WAIT_0             0x00000000u
+#define STATUS_USER_APC           0x000000C0u
 #define STATUS_INVALID_PARAMETER_1 0xC00000EFu
 #define STATUS_INVALID_PARAMETER_3 0xC00000F1u
 #define STATUS_INVALID_PARAMETER_MIX 0xC0000030u

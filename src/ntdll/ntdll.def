@@ -23,6 +23,12 @@ EXPORTS
     NtResetEvent
     NtWaitForSingleObject
     NtWaitForMultipleObjects
+; --- contexts and APCs ---
+    NtContinue
+    NtQueueApcThread
+    NtTestAlert
+    RtlCaptureContext
+    KiUserApcDispatcher
     NtCreateSemaphore
     NtReleaseSemaphore
     NtCreateMutant

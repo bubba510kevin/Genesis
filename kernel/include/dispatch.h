@@ -105,8 +105,11 @@ void dispatch_owner_exited(int pid);
 #define DISPATCH_WAIT_MAX        64          /* MAXIMUM_WAIT_OBJECTS */
 #define DISPATCH_WAIT_ABANDONED  0x80        /* + index */
 #define DISPATCH_WAIT_DUPLICATE  (-33)
+/* An ALERTABLE wait (alertable non-zero) also ends - taking nothing - when
+ * the calling thread has a user APC queued: DISPATCH_WAIT_APC. */
+#define DISPATCH_WAIT_APC        (-1000)
 int dispatch_wait_multiple(object_t **objs, int n, int wait_all,
-                           uint64 deadline);
+                           int alertable, uint64 deadline);
 
 /* Look up a named dispatcher object. Returns it with a reference taken, or
  * NULL. `name` is the leaf under \BaseNamedObjects. */
