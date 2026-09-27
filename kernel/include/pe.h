@@ -265,6 +265,14 @@ typedef struct {
     struct {
         uint64 module_base, start, end, zero_fill, index_addr, callbacks;
     } tls[8];
+    /* Every image in the process - the executable first, then each DLL in
+     * load order - for the module table published in the PEB (teb.h,
+     * NT_PEB_MODULES_OFFSET), which is how ntdll finds the unwind tables
+     * of the code an exception passes through. */
+    int    mod_count;
+    struct {
+        uint64 base, size;
+    } mods[PE_MAX_MODULES + 1];
 } pe_info_t;
 
 /* Cheap enough to call on every execve: reads two magic numbers and nothing

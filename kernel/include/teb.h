@@ -231,6 +231,25 @@ typedef struct {
     nt_tls_module_t mod[NT_TLS_MAX_MODULES];
 } nt_tls_table_t;
 
+/* The loaded images, for ntdll: RtlLookupFunctionEntry needs to know which
+ * module a code address is in to find that module's .pdata (its exception
+ * directory, which ntdll reads from the mapped headers). Published after the
+ * TLS table in the same PEB page, and in the same way - once, at exec. */
+#define NT_PEB_MODULES_OFFSET   0xA00
+#define NT_MODULES_MAGIC        0x444F4D47u   /* "GMOD" */
+#define NT_MAX_MODULES          16
+
+typedef struct {
+    uint64 base;
+    uint64 size;             /* SizeOfImage */
+} nt_module_entry_t;
+
+typedef struct {
+    uint32 magic;
+    uint32 count;
+    nt_module_entry_t mod[NT_MAX_MODULES];
+} nt_module_table_t;
+
 /* Each thread's TLS area. Thread slot i (the NT_THREAD_SLOTS scheme) uses
  * area i; the main thread uses NT_TLS_MAIN_SLOT. 64KB each, which bounds
  * one thread's implicit TLS - a program needing more is refused at exec. */
@@ -240,6 +259,7 @@ typedef struct {
 
 /* Write `table` into the PEB of the space (called at exec). */
 int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table);
+int nt_modules_publish(address_space_t *as, const nt_module_table_t *table);
 
 /* Build a thread's TLS area from the table in the PEB and point its TEB
  * (at teb_va) at it. `*pages_out` is 0 when the process has no implicit

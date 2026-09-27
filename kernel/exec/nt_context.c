@@ -7,6 +7,7 @@
 #include "paging.h"
 #include "process.h"
 #include "sched.h"
+#include "screen.h"
 #include "syscall.h"
 #include "typesk.h"
 #include "waitq.h"
@@ -351,5 +352,148 @@ uint64 nt_continue(struct syscall_frame *f, uint64 ctx_ptr,
             c.rsp = sp;
         }
     }
+    ntctx_resume(&c);
+}
+
+/* --- exceptions ------------------------------------------------------------ */
+
+typedef struct {
+    uint32 code;
+    uint32 flags;
+    uint64 record;                   /* a nested EXCEPTION_RECORD, or 0   */
+    uint64 address;
+    uint32 nparams;
+    uint32 pad;
+    uint64 info[15];
+} nt_exception_record_t;
+
+typedef char nt_exception_record_layout[(sizeof(nt_exception_record_t) == 0x98 &&
+    __builtin_offsetof(nt_exception_record_t, address) == 0x10 &&
+    __builtin_offsetof(nt_exception_record_t, info) == 0x20) ? 1 : -1];
+
+#define EXCEPTION_NONCONTINUABLE 0x1u
+
+/* Put CONTEXT + record + machine frame on the stack below c->rsp (see the
+ * layout in nt_context.h). Returns the dispatcher's RSP, or 0. */
+static uint64 exception_frame(const nt_context_t *c,
+                              const nt_exception_record_t *rec) {
+    uint64 sp = ntctx_push(c, c->rsp, NT_EXC_FRAME_EXTRA);
+    uint64 *mf;
+
+    if (sp == 0) {
+        return 0;
+    }
+    copy((void *)(sp + NT_EXC_RECORD_OFFSET), rec, sizeof(*rec));
+    mf = (uint64 *)(sp + NT_EXC_MACHFRAME_OFFSET);
+    mf[0] = c->rip;
+    mf[1] = USER_CS;
+    mf[2] = c->eflags;
+    mf[3] = c->rsp;
+    mf[4] = USER_SS;
+    return sp;
+}
+
+int nt_exception_deliver(struct interrupt_frame *f, uint64 cr2) {
+    process_t *me = proc_current();
+    nt_exception_record_t rec;
+    nt_context_t c;
+    uint64 sp;
+
+    if (me == NULL || me->personality != PERSONALITY_WINDOWS ||
+        me->nt_exc_dispatcher == 0) {
+        return 0;
+    }
+    zero(&rec, sizeof(rec));
+    switch (f->vector) {
+    case 0:  rec.code = 0xC0000094u; break;   /* INTEGER_DIVIDE_BY_ZERO     */
+    case 1:  rec.code = 0x80000004u; break;   /* SINGLE_STEP                */
+    case 3:  rec.code = 0x80000003u; break;   /* BREAKPOINT                 */
+    case 4:  rec.code = 0xC0000095u; break;   /* INTEGER_OVERFLOW           */
+    case 5:  rec.code = 0xC000008Cu; break;   /* ARRAY_BOUNDS_EXCEEDED      */
+    case 6:  rec.code = 0xC000001Du; break;   /* ILLEGAL_INSTRUCTION        */
+    case 16: rec.code = 0xC0000090u; break;   /* FLOAT_INVALID_OPERATION    */
+    case 17: rec.code = 0x80000002u; break;   /* DATATYPE_MISALIGNMENT      */
+    case 19: rec.code = 0xC00002B5u; break;   /* FLOAT_MULTIPLE_TRAPS       */
+    case 13:
+        /* A protection fault reports as an access violation to an unknown
+         * address, which is what NT does: all ones. */
+        rec.code = 0xC0000005u;
+        rec.nparams = 2;
+        rec.info[0] = 0;
+        rec.info[1] = ~0ULL;
+        break;
+    case 14:
+        rec.code = 0xC0000005u;               /* ACCESS_VIOLATION           */
+        rec.nparams = 2;
+        /* 0 read, 1 write, 8 execute (DEP) - from the #PF error code. */
+        rec.info[0] = (f->error_code & 0x10) ? 8 : (f->error_code & 0x2) ? 1 : 0;
+        rec.info[1] = cr2;
+        break;
+    default:
+        return 0;
+    }
+    ntctx_capture_intr(&c, f);
+    if (f->vector == 3) {
+        /* int3 is a trap - RIP is past it. NT reports the breakpoint AT
+         * the instruction, in the record and in the context; a handler that
+         * wants to go on steps past it itself. */
+        c.rip -= 1;
+    }
+    rec.address = c.rip;
+
+    sp = exception_frame(&c, &rec);
+    if (sp == 0) {
+        return 0;                  /* nowhere to put it: die as before */
+    }
+    f->rip = me->nt_exc_dispatcher;
+    f->rsp = sp;
+    /* Into the dispatcher without the trap flag - single-stepping ntdll is
+     * not what a debuggee's TF asked for - and with DF clear, as the ABI
+     * requires on entry to any function. */
+    f->rflags &= ~(0x100ULL | 0x400ULL);
+    return 1;
+}
+
+uint64 nt_raise_exception(struct syscall_frame *f, uint64 rec_ptr,
+                          uint64 ctx_ptr, uint64 first_chance) {
+    process_t *me = proc_current();
+    nt_exception_record_t rec;
+    nt_context_t c;
+    uint64 sp;
+
+    (void)f;
+    if (!user_mapped(rec_ptr, sizeof(rec)) ||
+        !user_mapped(ctx_ptr, NT_CONTEXT_SIZE)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    copy(&rec, (const void *)rec_ptr, sizeof(rec));
+    if (rec.nparams > 15) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    copy(&c, (const void *)ctx_ptr, NT_CONTEXT_SIZE);
+
+    if (!(uint8)first_chance) {
+        /* Last chance, and nobody took it: the process dies with the
+         * exception code as its exit status, and says why - an unhandled
+         * exception with no report is the hardest kind of crash to find. */
+        print_string("\n[process ", 0x0E);
+        print_hex((uint32)me->pid, 0x0E);
+        print_string(": unhandled exception ", 0x0E);
+        print_hex(rec.code, 0x0E);
+        print_string(" at ", 0x0E);
+        print_hex64(rec.address, 0x0E);
+        print_string("]\n", 0x0E);
+        return syscall_exit_group(rec.code & 0xFF, f);
+    }
+    if (me->nt_exc_dispatcher == 0 || !ntctx_sanitize(&c)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    sp = exception_frame(&c, &rec);
+    if (sp == 0) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    c.rip = me->nt_exc_dispatcher;
+    c.rsp = sp;
+    c.eflags &= ~(0x100u | 0x400u);
     ntctx_resume(&c);
 }

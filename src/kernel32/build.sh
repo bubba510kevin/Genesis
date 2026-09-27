@@ -26,7 +26,7 @@ if [ ! -f ../ntdll/libntdll.a ]; then
 fi
 
 CFLAGS="-std=c99 -Wall -Wextra -Os -ffreestanding -fno-builtin \
-        -fno-stack-protector -fno-asynchronous-unwind-tables"
+        -fno-stack-protector"
 
 # --image-base 0x181000000: above ntdll's 0x180000000 and far enough not to
 # overlap it. Two DLLs at one preferred base is exactly the case .reloc exists
@@ -43,7 +43,8 @@ $CC $CFLAGS -c proc.c -o proc.o
 $CC $CFLAGS -c thread.c -o thread.o
 $CC $CFLAGS -c sysinfo.c -o sysinfo.o
 $CC $CFLAGS -c tls.c -o tls.o
-$CC $LDFLAGS -o kernel32.dll err.o file.o proc.o thread.o sysinfo.o tls.o kernel32.def ../ntdll/libntdll.a
+$CC $CFLAGS -c except.c -o except.o
+$CC $LDFLAGS -o kernel32.dll err.o file.o proc.o thread.o sysinfo.o tls.o except.o kernel32.def ../ntdll/libntdll.a
 
 mkdir -p "$ROOT/root/wsr/System32"
 cp kernel32.dll "$ROOT/root/wsr/System32/kernel32.dll"

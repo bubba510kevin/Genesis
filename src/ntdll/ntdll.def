@@ -29,6 +29,20 @@ EXPORTS
     NtTestAlert
     RtlCaptureContext
     KiUserApcDispatcher
+; --- structured exception handling ---
+    NtRaiseException
+    KiUserExceptionDispatcher
+    RtlLookupFunctionEntry
+    RtlVirtualUnwind
+    RtlDispatchException
+    RtlUnwindEx
+    RtlUnwind
+    RtlRaiseException
+    RtlRaiseStatus
+    RtlAddVectoredExceptionHandler
+    RtlRemoveVectoredExceptionHandler
+    RtlSetUnhandledExceptionFilter
+    __C_specific_handler
     NtCreateSemaphore
     NtReleaseSemaphore
     NtCreateMutant

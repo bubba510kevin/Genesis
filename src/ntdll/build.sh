@@ -22,7 +22,7 @@ fi
 python3 mknums.py
 
 CFLAGS="-std=c99 -Wall -Wextra -Os -ffreestanding -fno-builtin \
-        -fno-stack-protector -fno-asynchronous-unwind-tables"
+        -fno-stack-protector"
 
 # --image-base 0x180000000 is where a 64-bit DLL conventionally lands, above
 # an executable's 0x140000000 so the two do not collide before anything

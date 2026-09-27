@@ -204,6 +204,12 @@ struct syscall_frame;
 #define NT_SYS_CONTINUE              0x25
 #define NT_SYS_QUEUE_APC             0x26
 #define NT_SYS_TEST_ALERT            0x27
+
+/* NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN FirstChance) - see
+ * nt_raise_exception in nt_context.h. ntdll's own RtlRaiseException
+ * dispatches in user mode and calls this only with FirstChance FALSE, when
+ * nothing handled it: the process then ends with the exception code. */
+#define NT_SYS_RAISE_EXCEPTION       0x28
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 

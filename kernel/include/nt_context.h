@@ -95,6 +95,33 @@ void nt_apc_flush(process_t *t);          /* thread exit: drop them all */
  * for RAX, or `status` unchanged when nothing was delivered. */
 uint64 nt_apc_deliver(struct syscall_frame *f, uint64 status);
 
+/* --- exceptions (ROADMAP 14(c)) ------------------------------------------
+ *
+ * A fault in ring 3 of a Windows process becomes an exception the process
+ * handles itself: an EXCEPTION_RECORD and the faulting CONTEXT on the user
+ * stack, and the thread sent into ntdll!KiUserExceptionDispatcher. The
+ * layout at the dispatcher's RSP (all of it described by the dispatcher's
+ * own unwind info, so an unwind passes through it to the faulting frame):
+ *
+ *   +0x000  CONTEXT                (0x4D0)
+ *   +0x4D0  EXCEPTION_RECORD       (0x98, padded to 0xA0)
+ *   +0x570  machine frame          RIP, CS, RFLAGS, RSP, SS
+ *
+ * Returns 1 if the fault was handed over (the frame is rewritten; iretq
+ * goes to the dispatcher), 0 if it cannot be - not a Windows process, no
+ * dispatcher, or no stack left to put it on - and the caller kills the
+ * thread as before. */
+#define NT_EXC_RECORD_OFFSET    0x4D0
+#define NT_EXC_MACHFRAME_OFFSET 0x570
+#define NT_EXC_FRAME_EXTRA      (0x570 + 0x30 - NT_CONTEXT_SIZE)
+int nt_exception_deliver(struct interrupt_frame *f, uint64 cr2);
+
+/* NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN FirstChance).
+ * FirstChance TRUE dispatches it like a fault; FALSE means nothing in the
+ * process handled it, and the process ends with its exception code. */
+uint64 nt_raise_exception(struct syscall_frame *f, uint64 rec_ptr,
+                          uint64 ctx_ptr, uint64 first_chance);
+
 /* NtContinue(PCONTEXT, BOOLEAN TestAlert) and NtTestAlert(). */
 uint64 nt_continue(struct syscall_frame *f, uint64 ctx_ptr, uint64 test_alert);
 uint64 nt_test_alert(struct syscall_frame *f);

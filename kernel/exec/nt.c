@@ -1439,6 +1439,11 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
         case NT_SYS_TEST_ALERT:
             return nt_test_alert(frame);
 
+        case NT_SYS_RAISE_EXCEPTION:
+            return nt_trace(frame->rax,
+                            nt_raise_exception(frame, frame->r10, frame->rdx,
+                                               frame->r8));
+
         case NT_SYS_WAIT_MULTIPLE: {
             uint64 timeout = 0;
 

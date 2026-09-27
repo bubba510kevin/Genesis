@@ -63,6 +63,7 @@ NT_STUB_X(NtWaitForMultipleObjects, NT_SYS_WAIT_MULTIPLE);
 NT_STUB_X(NtContinue,              NT_SYS_CONTINUE);
 NT_STUB_X(NtQueueApcThread,        NT_SYS_QUEUE_APC);
 NT_STUB_X(NtTestAlert,             NT_SYS_TEST_ALERT);
+NT_STUB_X(NtRaiseException,        NT_SYS_RAISE_EXCEPTION);
 NT_STUB_X(NtCreateSemaphore,       NT_SYS_CREATE_SEMAPHORE);
 NT_STUB_X(NtReleaseSemaphore,      NT_SYS_RELEASE_SEMAPHORE);
 NT_STUB_X(NtCreateMutant,          NT_SYS_CREATE_MUTANT);

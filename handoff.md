@@ -38,6 +38,17 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
   (`CreateMutexW`, `ReleaseMutex`) with **abandonment** (`WAIT_ABANDONED` when
   the owner dies), `CREATE_SUSPENDED` / `SuspendThread` / `ResumeThread`
   (NT syscalls 0x22/0x23), and `TerminateThread` on another thread.
+- **Dispatcher objects, completed** (item 14(b)): `WaitForMultipleObjects`
+  (wait-any; all-or-nothing wait-all), events and semaphores in kernel32,
+  **APCs** (`QueueUserAPC`, alertable `SleepEx`/`WaitFor*Ex`). Underneath:
+  `kernel/exec/nt_context.c` captures a thread's registers into a real Win64
+  `CONTEXT` on its stack, and `NtContinue` restores every register by
+  leaving through `iretq`.
+- **Structured exception handling** (item 14(c)): a fault in a Windows
+  process goes to `ntdll!KiUserExceptionDispatcher`; ntdll has the x64
+  unwinder (`RtlVirtualUnwind`, `RtlUnwindEx`, `__C_specific_handler`),
+  vectored handlers and the unhandled filter. Tested with real clang-built
+  `__try`/`__except`/`__finally` (`src/winseh`).
 - **Networking** (item 6): TCP + lo0, Linux-ABI sockets, **DHCP** with renewal.
 - **gnfs v2**: big files, rename, snapshots; ZFS removed.
 
@@ -53,20 +64,16 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
   will hit it; the table is scanned linearly by the scheduler, so raising it
   far means a run queue.
 
-### 2. Item 14(b) — dispatcher objects, completed
-`WaitForMultipleObjects` (wait-any and wait-all), alertable waits and **APCs**
-(`QueueUserAPC`, `NtQueueApcThread`, APC delivery on alertable wait / return
-to user mode). I/O completion and thread termination lean on APCs.
-`NtWaitForAlertByThreadId` (nt_sys.c) is a good pattern for the kernel side.
+### 2. Loose ends of 14(b)/(c) — small, pick up alongside 14(d)
+See the STILL OPEN note under item 14(c) in `ROADMAP.md`: MinGW C++
+exceptions are untested (libgcc's SEH unwinder needs a CRT - `malloc`,
+`abort` - that this tree does not have yet; once one exists, a `throw`/
+`catch` test belongs in `src/winseh`); nested dispatch
+(`EXCEPTION_NESTED_CALL`); `EXCEPTION_EXECUTE_HANDLER` from the unhandled
+filter should unwind (run `__finally`s) before exiting; stack overflow
+(`STATUS_STACK_OVERFLOW` needs a guard page, 14(d)).
 
-### 3. Item 14(c) — structured exception handling (x64 table-based)
-`RtlDispatchException`, `RtlUnwindEx`, `RtlVirtualUnwind` over `.pdata`/
-`.xdata`, `KiUserExceptionDispatcher` entry from the kernel on a fault in a
-Windows process (today a fault kills it), vectored handlers,
-`RaiseException`, `SetUnhandledExceptionFilter`. Not optional: `__try` is
-everywhere in real Windows code, and MinGW's C++ exceptions use it.
-
-### 4. Items 14(d)–(f) — memory, loader, kernel32
+### 3. Items 14(d)–(f) — memory, loader, kernel32
 - (d) NT page-state model (reserve/commit, `VirtualProtect`, `VirtualQuery`),
   Section objects / `MapViewOfFile`.
 - (e) `LdrLoadDll`/`LdrGetProcedureAddress` at run time (`LoadLibrary`,
@@ -75,7 +82,7 @@ everywhere in real Windows code, and MinGW's C++ exceptions use it.
   `WideCharToMultiByte`, environment, console API, time/locale, file API
   breadth. Test with real MinGW programs, not only purpose-built ones.
 
-### 5. Then the graphical stack — 14(g) onward
+### 4. Then the graphical stack — 14(g) onward
 Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
 (PS/2 first; USB later), user32, COM, comctl32, a shell. See item 14.
 
@@ -112,6 +119,10 @@ Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
   Restore `vendsrc/sys/dev/{rl,re}` if that driver must change.
 
 ## Rules learned the hard way
+- **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
+  generated from it). In use: `0x01`-`0x28`. Work on the display/mouse side
+  (14(h)/(j)), if done in parallel, was asked to start at `0x40` so the two
+  never collide.
 - **Never wait for time while holding the big kernel lock.** The PIT tick
   goes only to the BSP; an AP spinning in `hlt` with the lock held starves
   the BSP of the lock and so of the tick. Use `bkl_wait_for_interrupt()` or a
@@ -130,7 +141,7 @@ Everything builds and runs in WSL (Debian) against this working copy
 (`build/b.sh` is a local wrapper and is not in git - `python3 build.py all`
 does the same). On a bare Linux box - a cloud container, say - the tools are
 `apt-get install nasm qemu-system-x86 gcc-mingw-w64-x86-64 musl-tools
-dosfstools mtools`, and each line below is the part in quotes, run from the
+dosfstools mtools clang` (clang builds `seh.exe`: GCC has no `__try`), and each line below is the part in quotes, run from the
 repository root. Rebuilding changes the committed binaries under `root/`
 and `src/` whenever the toolchain version differs; commit only those whose
 source changed.
@@ -154,6 +165,8 @@ subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
 | `thr` (`thr.exe`) | 45 passed | 45 passed |
 | `smp` (`smp.exe`) | 61 passed | 57 passed |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
+| `wait` (`wait.exe`) | 46 passed | 46 passed |
+| `seh` (`seh.exe`) | 17 passed | 17 passed |
 | boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, no `FAILED` | same |
 | host (`tests/host/run.sh`) | exit 0 | |
 

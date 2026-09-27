@@ -139,6 +139,16 @@ typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID parameter);
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
 
+/* --- structured exception handling (except.c) ---------------------------- */
+void   WINAPI RaiseException(DWORD code, DWORD flags, DWORD nargs,
+                             const ULONG_PTR *args);
+PTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(
+    PTOP_LEVEL_EXCEPTION_FILTER filter);
+LONG   WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info);
+PVOID  WINAPI AddVectoredExceptionHandler(DWORD first,
+                                          PVECTORED_EXCEPTION_HANDLER fn);
+DWORD  WINAPI RemoveVectoredExceptionHandler(PVOID handle);
+
 /* --- error reporting (err.c) --------------------------------------------
  *
  * Every failure in this DLL goes through here. Returning the code as well as

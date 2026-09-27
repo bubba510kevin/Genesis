@@ -3045,6 +3045,24 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
             return (uint64)-12;   /* -ENOMEM */
         }
 
+        /* The module table, for ntdll's exception unwinder. */
+        {
+            nt_module_table_t mt;
+            int k;
+
+            mt.magic = NT_MODULES_MAGIC;
+            mt.count = 0;
+            for (k = 0; k < NT_MAX_MODULES; k++) {
+                mt.mod[k].base = mt.mod[k].size = 0;
+            }
+            for (k = 0; k < pe.mod_count && k < NT_MAX_MODULES; k++) {
+                mt.mod[k].base = pe.mods[k].base;
+                mt.mod[k].size = pe.mods[k].size;
+                mt.count++;
+            }
+            (void)nt_modules_publish(new_space, &mt);
+        }
+
         /* Implicit TLS: lay out one thread's area (the pointer array, then
          * each module's block, 16-aligned), publish the table in the PEB for
          * every later thread and for ntdll's callbacks, and build the main
@@ -3357,6 +3375,17 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     frame->rip    = (interp_entry != 0) ? interp_entry : info.entry;
     frame->rflags = 0x202;    /* IF set, bit 1 reserved-one; a clean start */
     syscall_set_user_rsp(stack);
+    if (new_personality == PERSONALITY_WINDOWS) {
+        /* A PE's entry point is entered as a Win64 FUNCTION: RSP 8 mod 16,
+         * as if a call had just pushed a return address - a zero one here,
+         * which is also where an exception unwinder's walk ends - with the
+         * 32-byte home area above it. The argv block the ELF path builds
+         * is not what a PE reads (it has the PEB), and its 16-aligned RSP
+         * is exactly wrong: compiled code that keeps SSE values on the
+         * stack with movaps takes #GP on its first one. */
+        *(uint64 *)((stack & ~0xFULL) - 40) = 0;
+        syscall_set_user_rsp((stack & ~0xFULL) - 40);
+    }
     if (tls_entry_via_ntdll != 0) {
         /* A PE with TLS callbacks: into RtlUserThreadStart(RDX = the image's
          * entry), on a Win64-shaped stack - 40 bytes below the aligned top

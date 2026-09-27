@@ -103,7 +103,7 @@ def main():
 
     commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
                                 "/bin/smp.exe", "/bin/tls.exe",
-                                "/bin/wait.exe"]
+                                "/bin/wait.exe", "/bin/seh.exe"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)
