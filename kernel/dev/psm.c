@@ -50,10 +50,14 @@
 
 #define PSM_ACK               0xFA
 
-/* Ticks (10ms each) after which a half-received packet is abandoned. At a
- * 100Hz report rate the bytes of one packet arrive within a millisecond of
- * each other, so anything this late is the start of the next packet. */
-#define PSM_GAP_TICKS  5
+/* Ticks (10ms each) after which a half-received packet is abandoned: half a
+ * second, Linux psmouse's HZ/2. A real mouse sends a packet's bytes within a
+ * millisecond of each other, so this is generous - and it has to be. It was
+ * 50ms first, and under single-CPU QEMU the controller loopback the selftest
+ * injects through delivers each byte up to ~200ms late (real input does not),
+ * so every test packet was discarded as abandoned. Half a second still
+ * separates a lost byte from the next packet, which is all this is for. */
+#define PSM_GAP_TICKS  50
 
 struct psm_softc {
     device_t          dev;
