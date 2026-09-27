@@ -116,9 +116,53 @@ DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
     if (st == STATUS_SUCCESS) {
         return WAIT_OBJECT_0;
     }
+    if (st == STATUS_ABANDONED_WAIT_0) {
+        /* The caller owns the mutex now - the previous owner died with it. */
+        return WAIT_ABANDONED;
+    }
     if (st == STATUS_TIMEOUT) {
         return WAIT_TIMEOUT;
     }
     k32_set_error_from_status(st);
     return WAIT_FAILED;
+}
+
+/* --- mutexes ----------------------------------------------------------- */
+
+HANDLE WINAPI CreateMutexW(LPVOID security, BOOL initial_owner, LPCWSTR name) {
+    HANDLE h = NULL_PTR;
+    NTSTATUS st;
+
+    (void)security;                 /* no inheritable handles yet */
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    st = NtCreateMutant(&h, MUTANT_ALL_ACCESS, NULL_PTR,
+                        initial_owner ? 1 : 0);
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return NULL_PTR;
+    }
+    SetLastError(ERROR_SUCCESS);    /* not ERROR_ALREADY_EXISTS: it is new */
+    return h;
+}
+
+HANDLE WINAPI CreateMutexA(LPVOID security, BOOL initial_owner, LPCSTR name) {
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    return CreateMutexW(security, initial_owner, NULL_PTR);
+}
+
+BOOL WINAPI ReleaseMutex(HANDLE mutex) {
+    NTSTATUS st = NtReleaseMutant(mutex, NULL_PTR);
+
+    if (!NT_SUCCESS(st)) {
+        /* STATUS_MUTANT_NOT_OWNED - the caller does not hold it. */
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
 }

@@ -787,6 +787,12 @@ static uint64 nt_wait_single(uint64 handle, uint64 alertable,
     if (rc == 0) {
         return STATUS_SUCCESS;
     }
+    if (rc == 1) {
+        /* Acquired, from an owner that died holding it. Success-shaped
+         * (NT_SUCCESS is true) but not STATUS_SUCCESS, so a caller that
+         * checks for exactly WAIT_OBJECT_0 notices. */
+        return STATUS_ABANDONED_WAIT_0;
+    }
     if (rc == -110) {
         /* A SUCCESS-shaped code. NT_SUCCESS(STATUS_TIMEOUT) is true, so a
          * caller that only tests NT_SUCCESS and then uses the object has a

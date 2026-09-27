@@ -198,6 +198,11 @@ NTSTATUS NtCreateMutant(HANDLE *MutantHandle, DWORD DesiredAccess,
  * one you do not hold is STATUS_MUTANT_NOT_OWNED, not a no-op. */
 NTSTATUS NtReleaseMutant(HANDLE MutantHandle, LONG *PreviousCount);
 
+#define MUTANT_ALL_ACCESS            0x001F0001u
+/* A wait that acquired a mutant whose owner died holding it. A SUCCESS code:
+ * the caller owns the mutant now, but what it guards may be half-updated. */
+#define STATUS_ABANDONED_WAIT_0      0x00000080u
+
 /* --- threads ------------------------------------------------------------- */
 
 #define STATUS_PENDING               0x00000103u   /* STILL_ACTIVE */

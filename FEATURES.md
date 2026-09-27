@@ -296,8 +296,12 @@ initialised template, plus TLS callbacks for `DLL_PROCESS_ATTACH`,
 `DLL_THREAD_ATTACH/DETACH` and `DLL_PROCESS_DETACH`. `TlsFree` clears the slot
 in every thread, as Windows does.
 
+**Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
+`ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
+released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.
+
 **Not yet:** `CREATE_SUSPENDED`/`ResumeThread`, terminating *another* thread,
-and marking a mutex *abandoned* when its owner thread dies.
+named mutexes (`OpenMutex`).
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used

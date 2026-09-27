@@ -592,6 +592,10 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
     if (p == NULL) {
         return;
     }
+    /* Mutexes it still holds are abandoned now, not when the slot is
+     * reaped: a thread blocked on one must not wait for a reaper. Any
+     * thread, not only NT ones - kernel code takes mutants too. */
+    dispatch_owner_exited(p->pid);
     if (p->nt_thread_obj != NULL) {
         thread_object_record_cpu(p->nt_thread_obj, p->cpu_ticks);
         thread_object_exited(p->nt_thread_obj, exit_code);

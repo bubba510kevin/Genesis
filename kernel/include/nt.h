@@ -260,6 +260,7 @@ struct syscall_frame;
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035u
 #define STATUS_OBJECT_TYPE_MISMATCH  0xC0000024u
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
+#define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 
 /* EVENT_TYPE. Upstream's spelling and upstream's values: the difference is
  * visible to a waiter, so a program that passes the wrong one gets a

@@ -110,6 +110,20 @@ static DWORD WINAPI quick(LPVOID param) {
     return (DWORD)(SIZE_T)param;
 }
 
+static HANDLE mutex;
+static volatile int holding;
+
+static DWORD WINAPI holder(LPVOID param) {
+    /* Twice, so its death has a recursion depth to throw away. */
+    WaitForSingleObject(mutex, INFINITE);
+    WaitForSingleObject(mutex, INFINITE);
+    holding = 1;
+    while (!go) {
+    }
+    ExitThread((DWORD)(SIZE_T)param);        /* still holding it */
+    return 0;                                /* not reached */
+}
+
 static DWORD WINAPI forever(LPVOID param) {
     (void)param;
     for (;;) {
@@ -226,6 +240,33 @@ void start(void) {
           GetExitCodeThread(h[0], &code) && code == 7,
           "released, it finishes, and the wait sees it");
     CloseHandle(h[0]);
+
+    /* --- a mutex whose owner dies holding it ----------------------------- */
+    mutex = CreateMutexW(NULL_PTR, 0, NULL_PTR);
+    check(mutex != NULL_PTR, "CreateMutexW");
+    go = 0;
+    holding = 0;
+    h[0] = CreateThread(NULL_PTR, 0, holder, (LPVOID)(SIZE_T)9, 0, NULL_PTR);
+    while (h[0] != NULL_PTR && !holding) {
+    }
+    check(WaitForSingleObject(mutex, 0) == WAIT_TIMEOUT,
+          "while another thread holds it, a zero-timeout wait times out");
+    check(!ReleaseMutex(mutex) && GetLastError() == ERROR_NOT_OWNER,
+          "and ReleaseMutex by a non-owner fails with ERROR_NOT_OWNER");
+    /* Released while this thread is BLOCKED on it - the case that hangs if
+     * nobody abandons it. */
+    go = 1;
+    check(WaitForSingleObject(mutex, 5000) == WAIT_ABANDONED,
+          "its owner exits holding it: a blocked waiter gets WAIT_ABANDONED");
+    check(WaitForSingleObject(mutex, 0) == WAIT_OBJECT_0,
+          "the new owner's recursive take is ordinary - abandonment is "
+          "reported once");
+    check(ReleaseMutex(mutex) && ReleaseMutex(mutex) && !ReleaseMutex(mutex),
+          "released twice, not four times: the dead owner's depth went with "
+          "it");
+    WaitForSingleObject(h[0], INFINITE);
+    CloseHandle(h[0]);
+    CloseHandle(mutex);
 
     /* --- more threads than slots, over time ------------------------------ */
     ok = 1;

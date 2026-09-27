@@ -84,6 +84,13 @@ int  thread_object_cpu(object_t *obj, uint64 *cpu_ticks);
 
 int dispatch_create_named(const char *name, object_t *obj);
 
+/* Thread `pid` has died: every mutant it still owns is released and marked
+ * ABANDONED, and its waiters are woken. The next take of such a mutant
+ * returns 1 from ob_wait rather than 0 - NT's WAIT_ABANDONED - and clears
+ * the mark. Idempotent: called from every exit path (proc_nt_thread_exit,
+ * kthread_exit), some of which run twice for one thread. */
+void dispatch_owner_exited(int pid);
+
 /* Look up a named dispatcher object. Returns it with a reference taken, or
  * NULL. `name` is the leaf under \BaseNamedObjects. */
 object_t *dispatch_open_named(const char *name);

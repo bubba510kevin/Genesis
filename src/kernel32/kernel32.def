@@ -52,6 +52,9 @@ EXPORTS
     GetThreadId
     GetExitCodeThread
     WaitForSingleObject
+    CreateMutexW
+    CreateMutexA
+    ReleaseMutex
 ; --- processors, affinity, priorities, time (sysinfo.c) ---
     GetSystemInfo
     GetNativeSystemInfo
