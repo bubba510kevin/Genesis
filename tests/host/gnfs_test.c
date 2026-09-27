@@ -1432,7 +1432,8 @@ static void test_chmod_special_bits(void) {
         free(image);
         return;
     }
-    check(fs_chmod(&f, S, 04755u) == -13, "a stranger may not chmod it");
+    check(fs_chmod(&f, S, 04755u) == -1,
+         "a stranger may not chmod it - -EPERM, POSIX's errno for chmod, not the -EACCES an access check gives");
     check(fs_chmod(&f, U, 04755u) == 0 && (f.mode & 07777) == 04755u,
          "its owner sets setuid - the bit is really there now");
     check(fs_chmod(&f, U, 0755u) == 0 && (f.mode & 07777) == 0755u,

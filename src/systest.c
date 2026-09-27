@@ -2148,6 +2148,277 @@ static void test_namespace(void) {
     check(!exists("/tdir"), "and the volume is back to how it started");
 }
 
+/* --- gnfs: ownership and permissions, from ring 3 ---------------------------
+ *
+ * The permission model built on gnfs - creator ownership, create/delete
+ * gates on the parent, chmod with special bits, chown's give-away rule,
+ * umask, setgid and sticky directories, and the supreme privilege - was
+ * checked by the host suite against the VFS directly. That proves the
+ * policy and nothing about the plumbing: that each syscall hands the right
+ * credential down, that umask is applied where the syscall says, that
+ * (uid_t)-1 means "keep". This section is the plumbing check, and it is
+ * the one that would catch a syscall passing NULL (the kernel, which is
+ * never refused) where it meant the caller.
+ *
+ * Every refusal is asked of a CHILD that has dropped to a real uid - as
+ * test_acls explains, root is the one identity for which every answer is
+ * yes - and the errno comes back as the child's exit status, compared
+ * exactly: -EACCES and -EPERM are different answers here on purpose.
+ *
+ * The volume is found by what statfs says (gnfs's f_namelen is 60; FAT's
+ * is 12, ZFS's 255), not by drive letter, and it is a fresh image every
+ * run - build.py makes one - so this section can mutate it freely. */
+
+#define SYS_chmod      90
+#define SYS_fchmod     91
+#define SYS_chown      92
+#define SYS_fchown     93
+#define SYS_statfs    137
+#define EACCES         13
+#define O_WRONLY        1
+#define O_CREAT      0100
+#define GNFS_NAMELEN   60
+
+#define PR_GENESIS_GRANT_SUPREME  0x47454e01L
+#define PR_GENESIS_REVOKE_SUPREME 0x47454e02L
+#define PR_GENESIS_QUERY_SUPREME  0x47454e03L
+
+enum {
+    OP_CREAT = 1, OP_MKDIR, OP_UNLINK, OP_RMDIR, OP_CHMOD, OP_CHOWN,
+    OP_FCHMOD, OP_FCHOWN, OP_ACCESS_W, OP_GRANT_SUPREME
+};
+
+/* Do one operation as (uid, gid) in a child, and return what it returned:
+ * 0, or a negative errno. -200 means the child could not even take on the
+ * identity, which is a failure of the test and not an answer. */
+static i64 as_user(u32 uid, u32 gid, int op, const char *path, i64 a, i64 b) {
+    i64 pid, status = 0, code;
+
+    pid = sc2(SYS_clone, 0, 0);
+    if (pid == 0) {
+        i64 r = -ENOSYS, fd;
+
+        /* gid first: once the uid is dropped, setgid is no longer root's
+         * to call. */
+        if (sc1(SYS_setgid, gid) != 0 || sc1(SYS_setuid, uid) != 0) {
+            sc1(SYS_exit_group, 200);
+        }
+        switch (op) {
+        case OP_CREAT:
+            r = sc3(SYS_open, path, O_WRONLY | O_CREAT, a);
+            if (r >= 0) { sc1(SYS_close, r); r = 0; }
+            break;
+        case OP_MKDIR:  r = sc2(SYS_mkdir, path, a);            break;
+        case OP_UNLINK: r = sc1(SYS_unlink, path);              break;
+        case OP_RMDIR:  r = sc1(SYS_rmdir, path);               break;
+        case OP_CHMOD:  r = sc2(SYS_chmod, path, a);            break;
+        case OP_CHOWN:  r = sc3(SYS_chown, path, a, b);         break;
+        case OP_FCHMOD:
+        case OP_FCHOWN:
+            fd = sc3(SYS_open, path, O_RDONLY, 0);
+            if (fd < 0) { r = fd; break; }
+            r = (op == OP_FCHMOD) ? sc2(SYS_fchmod, fd, a)
+                                  : sc3(SYS_fchown, fd, a, b);
+            sc1(SYS_close, fd);
+            break;
+        case OP_ACCESS_W:
+            r = sc4(SYS_faccessat, (u64)AT_FDCWD, path, 2 /* W_OK */, 0);
+            break;
+        case OP_GRANT_SUPREME:
+            r = sc2(SYS_prctl, PR_GENESIS_GRANT_SUPREME, a);
+            break;
+        }
+        sc1(SYS_exit_group, r < 0 ? (int)((-r) & 0xFF) : 0);
+        __builtin_unreachable();
+    }
+    if (pid < 0) {
+        return -201;
+    }
+    sc4(SYS_wait4, -1, &status, 0, 0);
+    code = (status >> 8) & 0xFF;
+    return code == 0 ? 0 : -code;
+}
+
+static u32 st_mode_of(const char *path) {
+    u8 st[144];
+
+    return sc2(SYS_stat, path, st) == 0 ? *(u32 *)(st + 24) : 0xFFFFFFFFu;
+}
+
+static u32 st_uid_of(const char *path) {
+    u8 st[144];
+
+    return sc2(SYS_stat, path, st) == 0 ? *(u32 *)(st + 28) : 0xFFFFFFFFu;
+}
+
+static u32 st_gid_of(const char *path) {
+    u8 st[144];
+
+    return sc2(SYS_stat, path, st) == 0 ? *(u32 *)(st + 32) : 0xFFFFFFFFu;
+}
+
+static void test_gnfs_perms(void) {
+    char base[8] = "/mnt/?";
+    char p[64], q[64];
+    u8   sfs[128];
+    char c;
+    int  found = 0;
+    i64  old_umask, fd;
+
+    section("gnfs: ownership and permissions from ring 3");
+
+    for (c = 'd'; c <= 'z'; c++) {
+        base[5] = c;
+        if (sc2(SYS_statfs, base, sfs) == 0 &&
+            *(u64 *)(sfs + 64) == GNFS_NAMELEN) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        out("  skip  no gnfs volume is mounted - build.py attaches one; "
+            "attach one and rerun\n");
+        return;
+    }
+    out("  (gnfs volume at ");
+    out(base);
+    out(")\n");
+
+    old_umask = sc1(SYS_umask, 022);
+
+    /* --- umask, applied by open(O_CREAT) and mkdir ----------------------- */
+    sc1(SYS_umask, 027);
+    path_at(p, base, "/um");
+    fd = sc3(SYS_open, p, O_WRONLY | O_CREAT, 0666);
+    check(fd >= 0, "root creates a file with mode 0666 under umask 027");
+    if (fd >= 0) sc1(SYS_close, fd);
+    check_eq(st_mode_of(p) & 07777, 0640, "and gets 0640 - the umask applied");
+    path_at(p, base, "/umd");
+    check_eq(sc2(SYS_mkdir, p, 0777), 0, "mkdir with 0777 under umask 027");
+    check_eq(st_mode_of(p) & 07777, 0750, "gets 0750");
+    sc1(SYS_umask, 022);
+    path_at(p, base, "/um2");
+    fd = sc3(SYS_open, p, O_WRONLY | O_CREAT, 0600);
+    if (fd >= 0) sc1(SYS_close, fd);
+    check_eq(st_mode_of(p) & 07777, 0600,
+             "a requested 0600 is honoured - not the fixed 0644 of before");
+
+    /* --- the creator owns it; creating needs the parent ------------------ */
+    path_at(p, base, "/pt");
+    check_eq(sc2(SYS_mkdir, p, 0755), 0, "root makes <gnfs>/pt, 0755");
+    path_at(q, base, "/pt/x");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0644, 0), -EACCES,
+             "uid 1000 may not create in root's 0755 directory");
+    check_eq(sc3(SYS_chown, p, 1000, 1000), 0,
+             "root chowns <gnfs>/pt to uid 1000");
+    check_eq(st_uid_of(p), 1000, "and stat agrees");
+
+    path_at(q, base, "/pt/mine");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0666, 0), 0,
+             "now uid 1000 creates <gnfs>/pt/mine");
+    check_eq(st_uid_of(q), 1000, "it is owned by uid 1000, the creator");
+    check_eq(st_gid_of(q), 1000, "in group 1000, the creator's gid");
+    check_eq(st_mode_of(q) & 07777, 0644,
+             "and 0666 under the inherited umask 022 is 0644");
+    check_eq(as_user(1000, 1000, OP_ACCESS_W, p, 0, 0), 0,
+             "access(W_OK) on its own 0755 directory says yes (it used to "
+             "ask for ACE_DELETE_CHILD that nothing granted)");
+
+    /* --- chmod, chown, and their fd forms -------------------------------- */
+    check_eq(as_user(1000, 1000, OP_CHMOD, q, 0600, 0), 0,
+             "the owner may chmod it");
+    check_eq(st_mode_of(q) & 07777, 0600, "to 0600");
+    check_eq(as_user(2000, 2000, OP_CHMOD, q, 0777, 0), -EPERM,
+             "a stranger may not - -EPERM, POSIX's errno for chmod");
+    check_eq(as_user(1000, 1000, OP_FCHMOD, q, 0640, 0), 0,
+             "fchmod through a descriptor works too");
+    check_eq(st_mode_of(q) & 07777, 0640, "to 0640");
+    check_eq(as_user(1000, 1000, OP_CHOWN, q, 2000, -1), -EPERM,
+             "the owner may NOT chown it away to uid 2000");
+    check_eq(as_user(1000, 1000, OP_FCHOWN, q, 2000, -1), -EPERM,
+             "nor through fchown");
+    check_eq(st_uid_of(q), 1000, "and it is still uid 1000's");
+
+    /* --- deleting needs the parent --------------------------------------- */
+    check_eq(as_user(2000, 2000, OP_UNLINK, q, 0, 0), -EACCES,
+             "a stranger may not unlink it");
+    check(exists(q), "and it is still there");
+    path_at(q, base, "/pt/sub");
+    check_eq(sc2(SYS_mkdir, q, 0755), 0,
+             "root makes a subdirectory inside uid 1000's directory");
+    check_eq(as_user(2000, 2000, OP_RMDIR, q, 0, 0), -EACCES,
+             "a stranger may not rmdir it");
+    check_eq(as_user(1000, 1000, OP_RMDIR, q, 0, 0), 0,
+             "the PARENT's owner may, though root made it");
+    path_at(q, base, "/pt/mine");
+    check_eq(as_user(1000, 1000, OP_UNLINK, q, 0, 0), 0,
+             "and uid 1000 may unlink its own file");
+    check(!exists(q), "which is really gone");
+
+    /* --- the special bits ------------------------------------------------ */
+    path_at(q, base, "/pt/prog");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0755, 0), 0,
+             "uid 1000 creates <gnfs>/pt/prog");
+    check_eq(as_user(1000, 1000, OP_CHMOD, q, 04755, 0), 0,
+             "and chmods it setuid");
+    check_eq(st_mode_of(q) & 07777, 04755, "stat shows 04755");
+    check_eq(sc3(SYS_chown, q, -1, 50), 0,
+             "root moves it into group 50 - (uid_t)-1 keeps the owner");
+    check_eq(st_uid_of(q), 1000, "the owner really was kept");
+    check_eq(as_user(1000, 1000, OP_CHMOD, q, 02755, 0), 0,
+             "uid 1000, not in group 50, chmods it 02755 and is not refused");
+    check_eq(st_mode_of(q) & 07777, 0755,
+             "but setgid was silently dropped - no group-50 program for it");
+
+    path_at(p, base, "/proj");
+    check_eq(sc2(SYS_mkdir, p, 0777), 0, "root makes <gnfs>/proj");
+    check_eq(sc3(SYS_chown, p, -1, 50), 0, "in group 50");
+    check_eq(sc2(SYS_chmod, p, 02777), 0, "and makes it setgid, 02777");
+    path_at(q, base, "/proj/f");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0644, 0), 0,
+             "uid 1000 creates a file in it");
+    check_eq(st_gid_of(q), 50,
+             "which is in group 50 - the directory's, not uid 1000's");
+    path_at(q, base, "/proj/d");
+    check_eq(as_user(1000, 1000, OP_MKDIR, q, 0755, 0), 0,
+             "and a directory");
+    check(st_gid_of(q) == 50 && (st_mode_of(q) & 02000),
+          "which is group 50 AND setgid, so the rule carries on down");
+
+    path_at(p, base, "/tmp");
+    check_eq(sc2(SYS_mkdir, p, 0777), 0, "root makes <gnfs>/tmp");
+    check_eq(sc2(SYS_chmod, p, 01777), 0, "sticky, 01777");
+    path_at(q, base, "/tmp/a");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0644, 0), 0,
+             "uid 1000 creates a file in it");
+    check_eq(as_user(2000, 2000, OP_UNLINK, q, 0, 0), -EPERM,
+             "uid 2000 may NOT delete it - -EPERM, the sticky bit");
+    check_eq(as_user(1000, 1000, OP_UNLINK, q, 0, 0), 0,
+             "its owner may");
+
+    /* --- the supreme privilege (handoff item 6) -------------------------- */
+    check_eq(as_user(1000, 1000, OP_GRANT_SUPREME, 0, 1000, 0), -EPERM,
+             "a non-root process may not grant ITSELF supreme");
+    check_eq(sc2(SYS_prctl, PR_GENESIS_QUERY_SUPREME, 0), -1,
+             "and nobody holds it after the refused attempt");
+    path_at(q, base, "/pt/gift");
+    check_eq(as_user(1000, 1000, OP_CREAT, q, 0644, 0), 0,
+             "uid 1000 creates <gnfs>/pt/gift");
+    check_eq(as_user(1000, 1000, OP_CHOWN, q, 3000, -1), -EPERM,
+             "and may not give it to uid 3000 - the control");
+    check_eq(sc2(SYS_prctl, PR_GENESIS_GRANT_SUPREME, 1000), 0,
+             "root grants supreme to uid 1000");
+    check_eq(as_user(1000, 1000, OP_CHOWN, q, 3000, -1), 0,
+             "and now uid 1000 CAN give it away");
+    check_eq(st_uid_of(q), 3000, "it belongs to uid 3000");
+    check_eq(sc2(SYS_prctl, PR_GENESIS_REVOKE_SUPREME, 0), 0,
+             "root revokes it");
+    check_eq(sc2(SYS_prctl, PR_GENESIS_QUERY_SUPREME, 0), -1,
+             "and nobody holds it again");
+
+    sc1(SYS_umask, old_umask);
+}
+
 /* --- main --------------------------------------------------------------- */
 
 void _start(void) {
@@ -2185,6 +2456,7 @@ void _start(void) {
     test_wx();
     test_audit_gapfill();
     test_namespace();
+    test_gnfs_perms();
 
     out("\nsystest: ");
     out_i64(passes);

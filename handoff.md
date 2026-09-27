@@ -163,9 +163,11 @@ right where the work stopped):
    - **Still open:** chown should clear suid/sgid (POSIX) — harmless until
      exec honours those bits, must land with that; moving a directory to a
      new parent should need write on the directory itself (".." changes);
-     none of this is exercised from ring 3 yet (systest doesn't touch gnfs
-     and doesn't run at boot) — the umask path in particular is only
-     reasoned about.
+     ~~none of this exercised from ring 3~~ — **DONE**: systest's
+     `test_gnfs_perms` (57 checks, as real uids, on `/mnt/f`) covers every
+     item above end to end through the real syscalls, plus the supreme
+     grant/refusal; two planted plumbing bugs (unlink passing NULL, umask
+     not applied) each fail it.
 2. Snapshot-aware allocation (Unit 2) — the allocator needs to know about
    every *retained* root record's bitmap, not just the live one.
 3. The dataset directory (Unit 2) — multiple named filesystems in one gnfs
@@ -173,7 +175,8 @@ right where the work stopped):
 4. Indirect blocks (Unit 2) — lift the 48KB file cap; one bounded indirect
    block, matching classic Unix inode design.
 5. `rename(2)` on gnfs — currently NULL.
-6. The ring-3 test for `PR_GENESIS_GRANT_SUPREME`'s `-EPERM` gate (Unit 1).
+6. ~~The ring-3 test for `PR_GENESIS_GRANT_SUPREME`'s `-EPERM` gate~~ —
+   **DONE 2026-09-26**, in systest's gnfs section (below).
 7. SACL/auditing — bigger, lower priority.
 
 **The actual next milestone toward THE GOAL**, once the above is cleared or
@@ -191,19 +194,37 @@ through WSL Debian, which has everything, pointed at this same working
 copy via `/mnt/c/...` — no separate Gentoo box or SSH needed:
 
 ```
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/genesis/Genesis' && bash tests/host/run.sh"
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/genesis/Genesis' && python3 build.py image"
+wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && bash tests/host/run.sh"
+wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 build.py image"
 ```
 
-To boot-test with a real gnfs disk attached:
+**The full check - boots the real machine and runs the ring-3 suites.**
+`tools/guest_run.py` boots with `build.py run`'s drives (FAT root, both ZFS
+pools, and - since 2026-09-26 - a fresh gnfs volume at `/mnt/f`), types
+`/bin/verif` and `/bin/systest` into the shell over serial, and waits for
+each tally. About five minutes:
 ```
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/genesis/Genesis' && gcc -std=c99 -Wall -Wextra -Ikernel/include -o build/mkgnfs tools/mkgnfs.c kernel/gnfs/gnfs_format.c kernel/gnfs/gnfs_object.c && ./build/mkgnfs build/gnfs.img 4194304"
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/genesis/Genesis' && timeout 25 qemu-system-x86_64 -drive format=raw,file=build/os.img,if=ide,index=0 -drive format=raw,file=build/gnfs.img,if=ide,index=1 -serial stdio -display none -no-reboot"
+wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 tools/guest_run.py > build/guest.txt 2>&1"
+grep -E "^(verification|systest): [0-9]" build/guest.txt   # expect 0 failed on both
 ```
-Look for `gnfs: volume on \Device\HarddiskVolume1, txg 1, ...` and no `FAIL`
-lines anywhere in the boot log.
+As of 2026-09-26: `verification: 160 passed, 0 failed`,
+`systest: 439 passed, 0 failed`.
 
-This machine still has no `.git` at this path (only `/home/kevin/git/Genesis`
-on the old Linux dev box did, per `.claude/settings.local.json`) — worth
-setting up version control here if you haven't since, given how much is now
-riding on this working copy.
+After changing `src/systest.c` (or `src/verif.c`), rebuild it and restage
+the FAT disk - `build_user.sh` stages via `sudo mount`, which needs a
+password, so do the systest part by hand and let `build.py disk` restage
+from `root/` with its own FAT writer (no sudo):
+```
+wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && gcc -std=c99 -Wall -Wextra -O1 -static -no-pie -nostdlib -nostartfiles -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o root/bin/systest src/systest.c && rm -f build/disk.img && python3 build.py disk"
+```
+(`build/disk.img` is regenerated from `root/` that way; the one from before
+2026-09-26 is kept as `build/disk.img.bak-2026-09-26` in case it held
+hand-dropped files.)
+
+**Do NOT boot-test gnfs by putting it on IDE index 1** (an older version of
+this file said to): the first volume to mount becomes `/`, so the empty
+gnfs disk becomes the root, there is no `/bin/busybox` on it, and no
+userland ever runs - the boot looks clean only because nothing ran. Use
+`guest_run.py`, or `build.py run`, which attach it correctly.
+
+Version control: this path is a git repo since 2026-09-26 (branch `main`).

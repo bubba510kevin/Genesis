@@ -576,6 +576,25 @@ def qemu_args():
         os.makedirs(BUILD, exist_ok=True)
         with open(ahci_img, "wb") as fh:
             fh.truncate(16 * 1024 * 1024)
+    # A GNFS VOLUME, fresh every run, for the same reason the pools above
+    # are attached by default: systest's gnfs section (ownership, chmod,
+    # chown, umask, create/delete permission, setgid and sticky directories)
+    # degrades to a loud skip without one, and a skip nobody reads is a test
+    # nobody runs. Fresh rather than persistent because that section mutates
+    # the volume, and a second run against the first run's leftovers would
+    # be testing its own history. On AHCI because IDE's four slots are spoken
+    # for; systest finds it by what statfs says, not by its drive letter.
+    gnfs_img = f"{BUILD}/gnfs-test.img"
+    mkgnfs = f"{BUILD}/mkgnfs"
+    os.makedirs(BUILD, exist_ok=True)
+    run([CC, "-std=c99", "-Wall", "-Wextra", "-Ikernel/include",
+         "-o", mkgnfs, "tools/mkgnfs.c", "kernel/gnfs/gnfs_format.c",
+         "kernel/gnfs/gnfs_object.c"])
+    if os.path.exists(gnfs_img):
+        os.remove(gnfs_img)
+    run([mkgnfs, gnfs_img, str(4 * 1024 * 1024)])
+    ahci_extra.append(gnfs_img)
+
     args += ["-device", "ich9-ahci,id=ahci0"]
     args += ["-drive", f"format=raw,file={ahci_img},if=none,id=ahcidisk"]
     args += ["-device", "ide-hd,drive=ahcidisk,bus=ahci0.0"]

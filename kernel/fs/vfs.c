@@ -948,10 +948,19 @@ int fs_chmod(fs_node_t *n, const struct cred *c, uint32 mode) {
     if (rc != 0) {
         return rc;
     }
+    /* POSIX's errnos, not an access check's. chmod(2) by someone who may
+     * not is -EPERM ("not the owner"), and on a read-only medium -EROFS -
+     * fs_access answers both as -EACCES, which is right for an NT
+     * SetSecurityInfo (fs_setacl) and wrong for chmod. The medium is
+     * checked first, as Linux does: no caller could change it there. */
+    if (!fs_writable_vol(n->vol)) {
+        return -30;                            /* -EROFS */
+    }
     full = acl_chmod_mode(&old_acl, (const cred_t *)c, n->mode, mode);
     acl_apply_chmod(&old_acl, full, &new_acl);
-    return fs_setacl_special(n, c, (const struct acl *)&new_acl,
-                             full & (S_ISUID | S_ISGID | S_ISVTX));
+    rc = fs_setacl_special(n, c, (const struct acl *)&new_acl,
+                           full & (S_ISUID | S_ISGID | S_ISVTX));
+    return (rc == -13) ? -1 : rc;              /* -EACCES -> -EPERM */
 }
 
 /* chown's counterpart to fs_setacl, and deliberately NOT built on it:
