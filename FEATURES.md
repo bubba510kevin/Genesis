@@ -591,9 +591,9 @@ build them), **`RtlWaitOnAddress`/`RtlWakeAddressSingle/All`**,
 | `tls.exe` | Thread-local storage: `TlsAlloc` family including the expansion slots, `FlsAlloc` with callbacks, and implicit `.tls` sections with TLS callbacks for process/thread attach and detach (24 checks) |
 
 ### Not yet ❌
-GUI (user32, gdi32), structured exception handling, the registry, COM,
-`NtCreateProcess` (a Windows program can't start another one yet), and most of
-kernel32. See §20.
+GUI (the precompiled user32/gdi32 and the win32k.sys support under them),
+the registry, COM, `NtCreateProcess` (a Windows program can't start another
+one yet), and most of kernel32. See §20.
 
 ---
 
@@ -863,7 +863,7 @@ Collected in one place so nobody has to discover them the hard way:
 - **No USB** (no controller or HID drivers); input is PS/2 or serial.
 - **No NVMe, no GPT**; ATA is PIO-only.
 - **BusyBox has no applets**, just the shell.
-- **Windows**: no SEH, registry, COM, TLS, child processes, or GUI DLLs;
+- **Windows**: no registry, COM, child processes, or GUI DLL support yet;
   kernel32 is a small subset.
 - **Clock resolution is one timer tick.**
 - `exec` doesn't honour setuid/setgid bits.
@@ -872,35 +872,40 @@ Collected in one place so nobody has to discover them the hard way:
 
 ## 20. The road to the goal
 
-The destination is a **daily-drivable desktop running Genesis's own
-reimplementation of the Windows 7 desktop**, running real Win32 programs. The
-key decision is already made: Genesis will write its own clean-room
-`user32`/`gdi32`/`shell32` against the documented Win32 API, as it already did
-for `ntdll` and `kernel32`, rather than reverse-engineer Windows' undocumented
-`win32k.sys`. ReactOS takes the same approach.
+The destination is a **daily-drivable desktop running the Windows 7 desktop**,
+running real Win32 programs. The key decision is made: Genesis does **not**
+write GUI DLLs or drivers from scratch. It runs the **precompiled** ones —
+Microsoft's own `user32`/`gdi32`/`comctl32`/`shell32` and the `.sys` drivers
+under them, taken from the user's own Windows 7 install — and writes the
+**support** they need: the loader, the NT system calls, and the kernel-mode
+export surface (`ntoskrnl`/`hal` and the per-family port libraries) that
+precompiled drivers, `win32k.sys` included, import. A driver whose source
+exists (FreeBSD, Linux) is ported and modified rather than rewritten.
+`ntdll` and `kernel32` stay Genesis's own: they are the boundary between the
+precompiled binaries and this kernel.
 
 ROADMAP item 14's dependency-ordered list:
 
 | Step | What | Status |
 |---|---|---|
-| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads run on every CPU with Win32 synchronisation; Windows TLS remains |
-| (b) | Dispatcher objects completed: waits blocking threads, APCs | 🟡 objects and waits exist; APCs don't |
-| (c) | Structured exception handling (x64 table-based) | ❌ |
+| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads on every CPU, TLS, suspend/resume/terminate; named mutexes remain |
+| (b) | Dispatcher objects completed: waits blocking threads, APCs | ✅ |
+| (c) | Structured exception handling (x64 table-based) | ✅ C `__try`; C++ exceptions and stack overflow remain |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |
 | (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | ❌ |
 | (f) | kernel32, completed | 🟡 |
 | (g) | advapi32 (registry, security APIs) | ❌ |
-| (h) | The display: a linear framebuffer (VESA/VBE) | ❌ |
-| (i) | gdi32 | ❌ |
-| (j) | user32 (windows, messages, input) | ❌ |
+| (h) | The display: precompiled display drivers under win32k (VGA-class XDDM first) | ❌ |
+| (i) | gdi32 (precompiled; win32k's NtGdi side underneath) | ❌ |
+| (j) | user32 (precompiled; win32k's NtUser side, a mouse driver) | ❌ |
 | (k) | COM/OLE | ❌ |
 | (l) | RPC | ❌ |
-| (m) | comctl32 | ❌ |
+| (m) | comctl32 (precompiled, v5 and v6 SxS) | ❌ |
 | (n) | Session/service architecture (smss, services) | ❌ |
-| (o) | A shell: explorer-like, or a native fallback | ❌ |
+| (o) | The shell: the real explorer.exe/shell32 | ❌ |
 | (p) | NTFS (read at least) | ❌ |
 | (q) | TCP | ✅ |
-| (r) | USB (controllers, HID, mass storage) | ❌ |
+| (r) | USB (FreeBSD's stack ported; precompiled Windows stack later) | ❌ |
 
 ROADMAP.md is candid about the scale: this list is larger than everything built
 so far combined, and ReactOS has worked on almost exactly this problem since

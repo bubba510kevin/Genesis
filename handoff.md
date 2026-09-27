@@ -19,9 +19,14 @@ with NT-style ACLs, and gets its address by DHCP.
 
 **THE GOAL:** a daily-drivable desktop running the Windows 7 DE with real
 Win32 binaries. `ROADMAP.md` item 14 is the dependency-ordered inventory for
-it, (a) through (s). Genesis writes its **own** clean-room user32/gdi32/shell32
-rather than run Microsoft's (those need win32k.sys). Be honest about scale:
-item 14 is bigger than everything built so far.
+it, (a) through (s). **Genesis does not write GUI DLLs or drivers from
+scratch.** It runs the precompiled ones (Microsoft's user32/gdi32/comctl32/
+shell32 and `.sys` drivers, win32k.sys included, from the user's own Windows
+install) and writes the support they need: the loader, NT syscalls, and the
+ntoskrnl/hal/port-library export surface drivers import. Drivers with source
+(FreeBSD, Linux) are ported and modified, not rewritten. ntdll and kernel32
+stay Genesis's own. Be honest about scale: item 14 is bigger than everything
+built so far.
 
 ## Where things stand (2026-09-27)
 
@@ -83,8 +88,11 @@ filter should unwind (run `__finally`s) before exiting; stack overflow
   breadth. Test with real MinGW programs, not only purpose-built ones.
 
 ### 4. Then the graphical stack — 14(g) onward
-Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
-(PS/2 first; USB later), user32, COM, comctl32, a shell. See item 14.
+Registry (advapi32); the ntoskrnl/hal export surface so precompiled drivers
+load (win32k.sys first, then the VGA-class display driver and the
+i8042prt/mouclass input stack); the real gdi32/user32/comctl32/explorer on
+top; COM. Mouse: precompiled stack, or FreeBSD's psm ported meanwhile. See
+item 14.
 
 ### Side work, smaller, any time
 - **An intermittent boot selftest failure, not yet explained**:
@@ -120,9 +128,9 @@ Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x28`. Work on the display/mouse side
-  (14(h)/(j)), if done in parallel, was asked to start at `0x40` so the two
-  never collide.
+  generated from it). In use: `0x01`-`0x28`. Parallel work on the display/input
+  side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
+  (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
   goes only to the BSP; an AP spinning in `hlt` with the lock held starves
   the BSP of the lock and so of the tick. Use `bkl_wait_for_interrupt()` or a
