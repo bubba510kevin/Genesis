@@ -63,22 +63,18 @@ CFLAGS = [
 # Per-subtree include paths, prepended to CFLAGS for sources under the given
 # prefix and for nothing else.
 #
-# This used to be one global "-Ikernel/zfs/compat". That worked only while
-# there was exactly one vendored FreeBSD tree. There are two now, and both
-# want to answer #include <sys/param.h>, <sys/types.h> and <sys/queue.h> -
-# with DIFFERENT files. kernel/zfs/compat/ is the standalone-loader
-# (stand/libsa) flavour the vendored ZFS reader was written against;
-# kernel/bsd/compat/ is the kernel flavour sys/mbuf.h was written against,
-# and its sys/param.h has to define MSIZE/MCLBYTES, which the loader's does
-# not. Making either one global hands the other tree the wrong header, and
-# the failure mode is not a missing-file error - it is a file that parses
-# and is wrong, which is exactly the class of bug the ZFS byte-order note in
-# kernel/zfs/zfs_vendor.c cost an afternoon to find.
+# kernel/bsd/compat/ answers #include <sys/param.h>, <sys/types.h> and
+# <sys/queue.h> the way FreeBSD kernel source expects. It is scoped to
+# kernel/bsd/ rather than made global because kernel/include has its own
+# sys/ directory (sys/bus.h, the Newbus source-compat shim), and a vendored
+# tree's headers must not answer Genesis's own includes - the failure is not
+# a missing file but a file that parses and is wrong. (A second vendored tree,
+# the ZFS reader, had its own compat/ with DIFFERENT sys/param.h; it was
+# removed 2026-09-26, and the per-subtree shape is what made that clean.)
 #
 # Prepended, not appended: these must beat -Ikernel/include, which has its
 # own sys/ directory (sys/bus.h, the Newbus source-compat shim).
 EXTRA_INCLUDES = {
-    "kernel/zfs": ["-Ikernel/zfs/compat"],
     # -D_KERNEL alongside the include path, because FreeBSD kernel source is
     # written to be compiled with it and large parts of these headers are
     # inside "#ifdef _KERNEL". net/if_media.h is entirely so: without the
@@ -112,12 +108,10 @@ VENDOR_WARN_OFF = ["-Wno-sign-compare", "-Wno-unused-parameter",
                    "-Wno-pointer-sign", "-Wno-unused-value"]
 
 EXTRA_WARNINGS = {
-    # kernel/bsd/mbuf.c #includes the vendored .inc files, and
-    # kernel/zfs/zfs_vendor.c #includes the vendored .c files, so in both
-    # cases the vendored code's warnings are attributed to the includer -
-    # which is why the whole subtree is listed rather than just vendor/.
+    # kernel/bsd/mbuf.c #includes the vendored .inc files, so the vendored
+    # code's warnings are attributed to the includer - which is why the whole
+    # subtree is listed rather than just vendor/.
     "kernel/bsd": VENDOR_WARN_OFF,
-    "kernel/zfs": VENDOR_WARN_OFF,
 }
 
 
@@ -213,10 +207,10 @@ def run(cmd):
 def sources(root, ext):
     out = []
     for dirpath, dirnames, files in os.walk(root):
-        # kernel/zfs/vendor/ holds files that upstream #includes into ONE
-        # translation unit (zfsimpl.c includes zfssubr.c, which includes
-        # lzjb.c and the rest). Compiling them separately would be compiling
-        # fragments, so the whole directory is skipped and kernel/zfs/*.c is
+        # A vendor/ directory holds files that upstream #includes into a
+        # wrapper translation unit (kernel/bsd/mbuf.c pulls in
+        # kernel/bsd/vendor/). Compiling them separately would be compiling
+        # fragments, so every vendor/ directory is skipped and the wrapper is
         # what gets built.
         dirnames[:] = [d for d in dirnames if d != "vendor"]
         out.extend(os.path.join(dirpath, f) for f in sorted(files) if f.endswith(ext))
@@ -451,99 +445,37 @@ def qemu_args():
     cmd_image()
     args = ["qemu-system-x86_64",
             "-drive", f"format=raw,file={OS_IMG},if=ide,index=0"]
-    # Drives that will ride the AHCI controller rather than IDE. IDE has four
-    # slots and a ZFS root needs two of them, so the fixture pools move.
+    # Drives that ride the AHCI controller rather than IDE.
     ahci_extra = []
-    zroot_path = f"{BUILD}/zfsroot/pool.img"
-    # Opt-IN, not opt-out. A ZFS root is read-only today, so roughly forty
-    # checks across verif and systest legitimately fail on it - every write,
-    # every mkdir, and statfs, which ZFS has no vtable slot for yet. Defaulting
-    # to it would mean the standard test run reports failures that are correct,
-    # which trains everyone to ignore them.
-    #
-    #   GENESIS_ZFS_ROOT=1 python3 build.py run
-    zfs_root_active = (os.path.exists(zroot_path) and
-                       os.environ.get("GENESIS_ZFS_ROOT", "0") == "1")
 
-    # A ZFS ROOT, when one has been built.
-    #
-    # volume.c's rule is "the first volume that mounts becomes the root", and
-    # volumes are found in disk order - so putting this ahead of the FAT image
-    # is the whole mechanism. It is opt-in rather than default because the FAT
-    # root is what every test in this tree currently assumes, and a read-only
-    # root changes what some of them can do.
-    #
-    # Build it with tests/host/fixtures/mkzfsroot.sh, or set GENESIS_ZFS_ROOT=0
-    # to ignore one that exists.
-    if zfs_root_active:
-        args += ["-drive", f"format=raw,file={zroot_path},if=ide,index=1"]
-        if os.path.exists(DISK_IMG):
-            # index=3 rather than 2, so the ZFS root sorts ahead of the FAT
-            # volume and the pool fixtures keep the slots they had.
-            args += ["-drive", f"format=raw,file={DISK_IMG},if=ide,index=3"]
-    elif os.path.exists(DISK_IMG):
-        # index=1 is the primary slave, which the driver enumerates as ata1.
+    # The FAT16 root. index=1 is the primary slave, which the driver
+    # enumerates as ata1; the first volume to mount becomes the root.
+    if os.path.exists(DISK_IMG):
         args += ["-drive", f"format=raw,file={DISK_IMG},if=ide,index=1"]
 
-    # THE ZFS POOL, as a third drive.
+    # THE gnfs FIXTURE, as the second volume - attached by default, because
+    # the checks that need it degrade silently without it: with no second
+    # volume systest prints "skip" and still reports "all passed", which is
+    # the failure mode this tree has already had once.
     #
-    # ROADMAP item 7's first stated check is "systest's filesystem section
-    # must run identically on both volumes", and it was reachable long before
-    # anyone ran it: the pool fixture has been in the tree, the reader mounts
-    # it unaided, and systest's fs_checks() is already parameterised by base
-    # path. The only missing piece was attaching the disk.
-    #
-    # Attached HERE rather than left to whoever remembers, because the check
-    # degrades silently: with no second volume systest prints "skip - no
-    # second volume is mounted" and still reports "all passed". A test that
-    # reports success whether or not it ran is the failure mode this tree has
-    # already had once, and its own comment in test_volumes says so.
-    #
-    # Unpacked on demand from the gzipped fixture rather than kept unpacked:
-    # it is 128MB inflated and 170KB in the tree.
-    zfs_src = "tests/host/fixtures/genesispool.dat.gz"
-    zfs_img = f"{BUILD}/zfs.img"
-    if os.path.exists(zfs_src):
-        if not os.path.exists(zfs_img):
-            os.makedirs(BUILD, exist_ok=True)
-            with gzip.open(zfs_src, "rb") as src, open(zfs_img, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        # index=2 is the secondary master, which the driver enumerates as ata2 -
-        # unless a ZFS root is in play, in which case IDE's four slots are
-        # already spoken for and this rides the AHCI controller instead. That
-        # is not a workaround: it is the first thing in this tree to use AHCI
-        # for something other than its own selftest.
-        if zfs_root_active:
-            ahci_extra.append(zfs_img)
-        else:
-            args += ["-drive", f"format=raw,file={zfs_img},if=ide,index=2"]
-
-    # THE ACL POOL, as a fourth drive, and attached for the same reason the
-    # third one is: the check degrades silently without it.
-    #
-    # genesispool (index=2) is ZPL version 1 - attributes in a znode_phys_t at
-    # fixed offsets, and no ACL on anything. It cannot exercise the System
-    # Attribute layout walk, and it cannot tell a reader that honours an ACL
-    # apart from one that reports st_mode twice. genesisacl is ZPL version 5
-    # with a real non-trivial ACL on one file; see
-    # tests/host/fixtures/README.md.
-    #
-    # Both, not one instead of the other. The v1 pool is the only fixture
-    # that exercises the pre-SA attribute path, so replacing it would delete
-    # coverage rather than add it.
-    acl_src = "tests/host/fixtures/genesisacl.dat.gz"
-    acl_img = f"{BUILD}/zfsacl.img"
-    if os.path.exists(acl_src):
-        if not os.path.exists(acl_img):
-            os.makedirs(BUILD, exist_ok=True)
-            with gzip.open(acl_src, "rb") as src, open(acl_img, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        # index=3 is the secondary slave, enumerated as ata3 - or an AHCI port,
-        # for the same reason as above.
-        if zfs_root_active:
-            ahci_extra.append(acl_img)
-        else:
-            args += ["-drive", f"format=raw,file={acl_img},if=ide,index=3"]
+    # tests/host/fixtures/gnfsfix.img.gz is built by the kernel's own gnfs
+    # code (tests/host/gnfs_fixture.c) and run.sh proves the committed copy
+    # still matches what gnfs writes. It holds /etc/motd for systest's
+    # "every volume behaves the same" section and secret.txt - mode 0600
+    # with an ACL granting uid 1001 read, which no mode word can say - for its
+    # access-control section; systest's gnfs section then mutates the same
+    # volume as real uids. So it is unpacked FRESH every run: a second run
+    # against the first run's leftovers would be testing its own history.
+    # It mounts at /mnt/d. (It replaced the two ZFS pools that used to sit
+    # here; ZFS was removed from the tree 2026-09-26.)
+    gnfs_src = "tests/host/fixtures/gnfsfix.img.gz"
+    gnfs_img = f"{BUILD}/gnfsfix.img"
+    if os.path.exists(gnfs_src):
+        os.makedirs(BUILD, exist_ok=True)
+        with gzip.open(gnfs_src, "rb") as src, open(gnfs_img, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        # index=2 is the secondary master, enumerated as ata2.
+        args += ["-drive", f"format=raw,file={gnfs_img},if=ide,index=2"]
 
     # An AHCI controller (8086:2922), present for two reasons and used as
     # storage for neither.
@@ -576,25 +508,6 @@ def qemu_args():
         os.makedirs(BUILD, exist_ok=True)
         with open(ahci_img, "wb") as fh:
             fh.truncate(16 * 1024 * 1024)
-    # A GNFS VOLUME, fresh every run, for the same reason the pools above
-    # are attached by default: systest's gnfs section (ownership, chmod,
-    # chown, umask, create/delete permission, setgid and sticky directories)
-    # degrades to a loud skip without one, and a skip nobody reads is a test
-    # nobody runs. Fresh rather than persistent because that section mutates
-    # the volume, and a second run against the first run's leftovers would
-    # be testing its own history. On AHCI because IDE's four slots are spoken
-    # for; systest finds it by what statfs says, not by its drive letter.
-    gnfs_img = f"{BUILD}/gnfs-test.img"
-    mkgnfs = f"{BUILD}/mkgnfs"
-    os.makedirs(BUILD, exist_ok=True)
-    run([CC, "-std=c99", "-Wall", "-Wextra", "-Ikernel/include",
-         "-o", mkgnfs, "tools/mkgnfs.c", "kernel/gnfs/gnfs_format.c",
-         "kernel/gnfs/gnfs_object.c"])
-    if os.path.exists(gnfs_img):
-        os.remove(gnfs_img)
-    run([mkgnfs, gnfs_img, str(4 * 1024 * 1024)])
-    ahci_extra.append(gnfs_img)
-
     args += ["-device", "ich9-ahci,id=ahci0"]
     args += ["-drive", f"format=raw,file={ahci_img},if=none,id=ahcidisk"]
     args += ["-device", "ide-hd,drive=ahcidisk,bus=ahci0.0"]

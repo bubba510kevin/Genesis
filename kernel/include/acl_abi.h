@@ -4,19 +4,15 @@
 /* The NFSv4 access control model, as constants and nothing else.
  *
  * --- why this header is only #defines -------------------------------------
- * It is included from BOTH sides of the compile wall described in
- * kernel/zfs/zfs_genesis.h: from kernel/fs/acl.c, which is built against
- * typesk.h where size_t is `unsigned long long`, and from
- * kernel/zfs/zfs_sa.inc, which is built against kernel/zfs/compat/ where it
- * is `unsigned long`. A header with a typedef in it could not be included
- * from both. A header with no types, no includes and no declarations can,
- * and that is the whole design constraint here.
- *
- * The alternative was to write these numbers twice and add a test that the
- * two copies agree. One copy and no test is better.
+ * It was written to be includable from both sides of a compile wall - the
+ * vendored ZFS reader was built against a libc where size_t was a different
+ * type from typesk.h's - and a header with no types, no includes and no
+ * declarations can sit on both sides of any such wall. ZFS has left the tree
+ * (2026-09-26); the property is kept because it costs nothing and is exactly
+ * what a future vendored filesystem would need.
  *
  * --- why one set of constants serves both personalities -------------------
- * These are the NFSv4 ACL bits, which is what ZFS stores natively. They are
+ * These are the NFSv4 ACL bits, which is what ZFS and gnfs store. They are
  * also, bit for bit, the Windows access mask - the correspondence is not an
  * approximation and it is not Genesis's invention. OpenZFS's own
  * <sys/acl.h> annotates ACE_READ_NAMED_ATTRS with "FILE_READ_EA" and
@@ -167,37 +163,6 @@
 #define ACE_TYPE_FLAGS  (ACE_OWNER | ACE_GROUP | ACE_EVERYONE | \
                          ACE_IDENTIFIER_GROUP)
 
-/* --- the znode pflags this code cares about -------------------------------
- *
- * ZFS_ACL_TRIVIAL means "the ACL says exactly what the mode bits say". It is
- * a fast path with teeth: real ZFS checks it and does not load the ACL at
- * all. A reader that ignores it does needless work; a WRITER that leaves it
- * set after storing a non-trivial ACL has stored an ACL nothing will ever
- * read. tests/host/zplsetacl.c hit exactly that and the fixture README
- * records it. */
-/* Guarded one by one because kernel/zfs/vendor/zfsimpl.h defines the same
- * five, with the same values, and the vendored translation unit includes
- * both. The guards are not papering over a disagreement - if the two ever
- * disagreed the guard would silently pick the vendored one, so the ZFS
- * selftest asserts the values it actually reads. Genesis needs its own copy
- * because kernel/zfs/zfs_vfs.c is on the far side of the wall from
- * zfsimpl.h and cannot include it. */
-#ifndef ZFS_ACL_TRIVIAL
-#define ZFS_ACL_TRIVIAL          0x00000004u
-#endif
-#ifndef ZFS_ACL_PROTECTED
-#define ZFS_ACL_PROTECTED        0x00000010u
-#endif
-#ifndef ZFS_ACL_DEFAULTED
-#define ZFS_ACL_DEFAULTED        0x00000020u
-#endif
-#ifndef ZFS_ACL_AUTO_INHERIT
-#define ZFS_ACL_AUTO_INHERIT     0x00000040u
-#endif
-#ifndef ZFS_NO_EXECS_DENIED
-#define ZFS_NO_EXECS_DENIED      0x00000100u
-#endif
-
 /* --- how many ACEs Genesis will carry for one object ----------------------
  *
  * A bound is required: the ACE stream is variable width, so its length in
@@ -217,126 +182,129 @@
 #define ACL_ACE_MAX 32
 
 
-/* --- and the check that the guards above are not hiding a disagreement --
+/* --- and the check that every value is the ABI's -------------------------
  *
- * Every ACE_ constant here is #ifndef-guarded, because kernel/zfs/vendor/
- * zfsimpl.h defines the same names and the vendored translation unit reads
- * both headers. A guard makes the warning go away - and would also make a
- * genuine mismatch go away, silently, by letting whichever header came
- * first decide a security-relevant bit pattern.
+ * These bits are not Genesis's to choose. The access mask is the SAME field
+ * in NFSv4 and in NT - ACE_READ_DATA and FILE_READ_DATA are both 0x1,
+ * ACE_WRITE_ACL and WRITE_DAC are both 0x40000 - and that shared layout is
+ * what lets one stored ACL be shown as a POSIX mode and as a Windows
+ * SECURITY_DESCRIPTOR without a translation table (kernel/fs/ntsec.c). A
+ * constant typed one bit out would not fail anything; it would grant or
+ * deny the wrong right. So each one is pinned here to the value it MUST
+ * have, as #if/#error so a mistake is a build failure rather than a wrong
+ * answer.
  *
- * So each one is verified against the value it MUST have. This is #if and
- * #error rather than a static assertion on purpose: acl_abi.h declares no
- * types at all (that is what lets the vendored side include it across the
- * size_t wall), and a static assertion is a type.
+ * (These used to be cross-checked against the vendored ZFS reader's own
+ * copy, zfsimpl.h. ZFS left the tree 2026-09-26; the published values are
+ * the reference now, and they are the same numbers.)
  */
 #if ACE_READ_DATA != 0x00000001
-#error "ACE_READ_DATA disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_READ_DATA is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_LIST_DIRECTORY != 0x00000001
-#error "ACE_LIST_DIRECTORY disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_LIST_DIRECTORY is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_WRITE_DATA != 0x00000002
-#error "ACE_WRITE_DATA disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_WRITE_DATA is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ADD_FILE != 0x00000002
-#error "ACE_ADD_FILE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ADD_FILE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_APPEND_DATA != 0x00000004
-#error "ACE_APPEND_DATA disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_APPEND_DATA is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ADD_SUBDIRECTORY != 0x00000004
-#error "ACE_ADD_SUBDIRECTORY disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ADD_SUBDIRECTORY is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_READ_NAMED_ATTRS != 0x00000008
-#error "ACE_READ_NAMED_ATTRS disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_READ_NAMED_ATTRS is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_WRITE_NAMED_ATTRS != 0x00000010
-#error "ACE_WRITE_NAMED_ATTRS disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_WRITE_NAMED_ATTRS is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_EXECUTE != 0x00000020
-#error "ACE_EXECUTE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_EXECUTE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_DELETE_CHILD != 0x00000040
-#error "ACE_DELETE_CHILD disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_DELETE_CHILD is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_READ_ATTRIBUTES != 0x00000080
-#error "ACE_READ_ATTRIBUTES disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_READ_ATTRIBUTES is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_WRITE_ATTRIBUTES != 0x00000100
-#error "ACE_WRITE_ATTRIBUTES disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_WRITE_ATTRIBUTES is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_DELETE != 0x00010000
-#error "ACE_DELETE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_DELETE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_READ_ACL != 0x00020000
-#error "ACE_READ_ACL disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_READ_ACL is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_WRITE_ACL != 0x00040000
-#error "ACE_WRITE_ACL disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_WRITE_ACL is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_WRITE_OWNER != 0x00080000
-#error "ACE_WRITE_OWNER disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_WRITE_OWNER is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SYNCHRONIZE != 0x00100000
-#error "ACE_SYNCHRONIZE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SYNCHRONIZE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ACCESS_ALLOWED_ACE_TYPE != 0x0000
-#error "ACE_ACCESS_ALLOWED_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ACCESS_ALLOWED_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ACCESS_DENIED_ACE_TYPE != 0x0001
-#error "ACE_ACCESS_DENIED_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ACCESS_DENIED_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SYSTEM_AUDIT_ACE_TYPE != 0x0002
-#error "ACE_SYSTEM_AUDIT_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SYSTEM_AUDIT_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SYSTEM_ALARM_ACE_TYPE != 0x0003
-#error "ACE_SYSTEM_ALARM_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SYSTEM_ALARM_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ACCESS_ALLOWED_OBJECT_ACE_TYPE != 0x0005
-#error "ACE_ACCESS_ALLOWED_OBJECT_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ACCESS_ALLOWED_OBJECT_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_ACCESS_DENIED_OBJECT_ACE_TYPE != 0x0006
-#error "ACE_ACCESS_DENIED_OBJECT_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_ACCESS_DENIED_OBJECT_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SYSTEM_AUDIT_OBJECT_ACE_TYPE != 0x0007
-#error "ACE_SYSTEM_AUDIT_OBJECT_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SYSTEM_AUDIT_OBJECT_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SYSTEM_ALARM_OBJECT_ACE_TYPE != 0x0008
-#error "ACE_SYSTEM_ALARM_OBJECT_ACE_TYPE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SYSTEM_ALARM_OBJECT_ACE_TYPE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_FILE_INHERIT_ACE != 0x0001
-#error "ACE_FILE_INHERIT_ACE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_FILE_INHERIT_ACE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_DIRECTORY_INHERIT_ACE != 0x0002
-#error "ACE_DIRECTORY_INHERIT_ACE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_DIRECTORY_INHERIT_ACE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_NO_PROPAGATE_INHERIT_ACE != 0x0004
-#error "ACE_NO_PROPAGATE_INHERIT_ACE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_NO_PROPAGATE_INHERIT_ACE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_INHERIT_ONLY_ACE != 0x0008
-#error "ACE_INHERIT_ONLY_ACE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_INHERIT_ONLY_ACE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_SUCCESSFUL_ACCESS_ACE_FLAG != 0x0010
-#error "ACE_SUCCESSFUL_ACCESS_ACE_FLAG disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_SUCCESSFUL_ACCESS_ACE_FLAG is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_FAILED_ACCESS_ACE_FLAG != 0x0020
-#error "ACE_FAILED_ACCESS_ACE_FLAG disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_FAILED_ACCESS_ACE_FLAG is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_IDENTIFIER_GROUP != 0x0040
-#error "ACE_IDENTIFIER_GROUP disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_IDENTIFIER_GROUP is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_INHERITED_ACE != 0x0080
-#error "ACE_INHERITED_ACE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_INHERITED_ACE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_OWNER != 0x1000
-#error "ACE_OWNER disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_OWNER is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_GROUP != 0x2000
-#error "ACE_GROUP disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_GROUP is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 #if ACE_EVERYONE != 0x4000
-#error "ACE_EVERYONE disagrees with kernel/zfs/vendor/zfsimpl.h - one of the two is wrong about an on-disk bit"
+#error "ACE_EVERYONE is not the NFSv4/NT value - an access right would be granted or denied wrongly"
 #endif
 
 #endif /* ACL_ABI_H */

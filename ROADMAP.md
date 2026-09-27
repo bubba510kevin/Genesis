@@ -198,7 +198,15 @@ Two decisions worth keeping. SOCK_STREAM is refused BY THE PROTOCOL SWITCH - in_
 STILL OPEN: TCP. netinet/tcp_*.c is not vendored. Every dependency it has below it now exists (in_pcb, the socket layer, the routing table, sleep, sysctl, callout, and now a descriptor to hang it on), which is why this is a next step rather than a rewrite. Also still open: listen/accept/getsockname/sendmsg/recvmsg, and there is no DHCP client, so the address is still compiled in — though it is now APPLIED through the real SIOCAIFADDR ioctl, exactly as ifconfig(8) would, rather than assigned to a variable.
 
 
-7. zfs — reads done, permissions done both ways, allocation and commit done, the object layer above them is not
+7. zfs — REMOVED FROM THE TREE 2026-09-26. Everything below is kept as the record of what was learned; none of it is live code any more.
+
+ZFS IS GONE, deliberately. kernel/zfs/ (the vendored FreeBSD reader, its CDDL boundary, the space-map/commit write experiments), kernel/include/zfs.h, the pool fixtures and their OpenZFS-driven build scripts, tests/host/zfs_test.c and the boundary check all left in one commit; the whole of the kernel's dependency on it was one line in flk.c (zfs_init), which is what the one-call opaque entry point was designed to make true. gnfs is the copy-on-write filesystem now, and it took over everything ZFS was carrying that was NOT about ZFS: the ACL fixture (secret.txt, mode 0600 with an extra read grant to uid 1001) is a gnfs image built by the kernel's own gnfs code (tests/host/gnfs_fixture.c) and committed as tests/host/fixtures/gnfsfix.img.gz - run.sh regenerates it and requires it byte-identical - and build.py attaches a fresh copy as /mnt/d, where systest's second-volume and access-control sections now run. The Windows SECURITY_DESCRIPTOR assertions moved with it. On the writable volume the access-control checks got SHARPER, not weaker: "the owner may not write" had been true only because the pool was read-only, and is replaced by "uid 1001's grant is read-only, so its write is refused".
+
+TWO THINGS SURFACED ON THE WAY OUT. (1) gnfs WROTE STALE KERNEL STACK TO DISK: gnfs_dir_init_block set three fields per entry and mkdir built the block in an uninitialised stack buffer, so directory blocks carried whatever the kernel stack last held - found because the fixture refused to come out byte-identical twice; directory blocks and entries are fully zeroed now, and the byte-for-byte fixture check keeps it that way. (2) THE NETWORK STACK WAS LINKING AGAINST ZFS: net/if.c's nvlist_create/nvlist_destroy resolved to the ZFS nvlist library's same-named functions, so SIOCGIFCAPNV got a real list handed to accessors designed to fail. They are netglue.c's own failing stubs now, like the rest of that block.
+
+WHAT WAS LOST, stated rather than implied: reading real OpenZFS pools from external disks, and the two-on-disk-formats ACL decoder with its OpenZFS-built fixtures. Both are in git history.
+
+ORIGINAL ENTRY (history):
 
 Read-only second volume: done. Feature gating on the superblock: done, at
 eighteen read features. Refuse a dirty journal, then write, THEN THE VFS WORK

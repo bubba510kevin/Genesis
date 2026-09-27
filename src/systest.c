@@ -961,10 +961,10 @@ static void test_dirs(void) {
  * volume rather than two similar functions - the only way the claim can be
  * true by construction instead of by inspection.
  *
- * What that buys is worth naming. The FAT root and a ZFS pool have nothing in
- * common below the vtable: 8.3 names folded to upper case against arbitrary
- * ones, a cluster chain against a dnode tree, a directory that is a fixed
- * array against a ZAP. If the same checks pass on both, the abstraction is
+ * What that buys is worth naming. The FAT root and the gnfs volume have
+ * nothing in common below the vtable: 8.3 names folded to upper case against
+ * arbitrary ones, a cluster chain against a copy-on-write object table, a
+ * directory that is a fixed array against gnfs's directory blocks. If the same checks pass on both, the abstraction is
  * real; if one of them needs its own version of a check, that is the
  * abstraction leaking and the check is where it leaked. */
 
@@ -988,7 +988,7 @@ static void path_at(char *out, const char *base, const char *rel) {
 }
 
 /* Case-insensitive, because the two volumes disagree about case and both are
- * right: FAT folds to 8.3 upper case, ZFS stores the name it was given. A
+ * right: FAT folds to 8.3 upper case, gnfs stores the name it was given. A
  * check that demanded one of those would be asserting the filesystem rather
  * than the interface. */
 static int mem_has_ci(const char *hay, u64 n, const char *needle) {
@@ -1066,7 +1066,7 @@ static void fs_checks(const char *base) {
 /* Every volume the mount table has, found the way a program would: by asking
  * whether the mount point is there. */
 static void test_volumes(void) {
-    static const char *bases[] = { "", "/mnt/d", "/mnt/e" };
+    static const char *bases[] = { "", "/mnt/d" };
     u8  st[144];
     u64 i;
     int ran = 0;
@@ -1089,8 +1089,9 @@ static void test_volumes(void) {
         /* Said out loud rather than passed over. A second volume is a disk
          * that has to be attached, so its absence is a fact about this
          * machine and not a failure - but a suite that stayed silent about it
-         * would report the same "all passed" whether the ZFS half ran or not,
-         * which is the failure mode this tree has already had once. */
+         * would report the same "all passed" whether the second-volume half
+         * ran or not, which is the failure mode this tree has already had
+         * once. build.py attaches the gnfs fixture there by default. */
         section("filesystem on a second volume");
         out("  skip  no second volume is mounted - attach one and rerun\n");
     }
@@ -1104,13 +1105,14 @@ static void test_volumes(void) {
  * the wrong identity to test an access check with, so this section forks
  * children and drops them to real uids before asking.
  *
- * It runs against /mnt/e, the ZPL v5 pool, because it is the only mounted
- * filesystem with a stored ACL. secret.txt there is mode 0600 owned by uid
- * 1000, with an ACL that additionally grants uid 1001 read - see
- * tests/host/fixtures/README.md. The whole point of that file is that the two
- * views disagree: a kernel consulting st_mode denies uid 1001, a kernel
- * consulting the ACL allows it, and this is where the difference is visible
- * from userland rather than from a unit test.
+ * It runs against /mnt/d, the gnfs fixture build.py attaches (see
+ * tests/host/fixtures/README.md): secret.txt there is mode 0600 owned by uid
+ * 1000, with an ACL that additionally grants uid 1001 READ. The whole point
+ * of that file is that the two views disagree: a kernel consulting st_mode
+ * denies uid 1001, a kernel consulting the ACL allows it, and this is where
+ * the difference is visible from userland rather than from a unit test.
+ * (Until 2026-09-26 the same file sat on two ZFS pools; ZFS left the tree
+ * and gnfs, which stores the same NFSv4 ACLs, carries it now.)
  *
  * setuid is one-way here (there is no saved-set-user-id - see sys_setuid), so
  * each identity needs its own child. That is not a workaround: a test that
@@ -1154,8 +1156,8 @@ static void test_acls(void) {
 
     section("access control");
 
-    if (sc2(SYS_stat, "/mnt/e/secret.txt", st) != 0) {
-        out("  skip  /mnt/e is not mounted - the ACL fixture is not attached\n");
+    if (sc2(SYS_stat, "/mnt/d/secret.txt", st) != 0) {
+        out("  skip  /mnt/d is not mounted - the ACL fixture is not attached\n");
         return;
     }
 
@@ -1168,7 +1170,7 @@ static void test_acls(void) {
 
     /* A control, so the check above is about THIS file rather than about
      * every file getting the same new constant. */
-    if (sc2(SYS_stat, "/mnt/e/open.txt", st) == 0) {
+    if (sc2(SYS_stat, "/mnt/d/open.txt", st) == 0) {
         check_eq(*(u32 *)(st + 24) & 07777, 0666,
                  "while open.txt on the same volume is 0666 - the modes are "
                  "per-file, not one new constant replacing an old one");
@@ -1176,67 +1178,49 @@ static void test_acls(void) {
     }
 
     /* --- root, the identity every other test in this file runs as --------- */
-    check_eq(open_as(0, "/mnt/e/secret.txt", 0), 0, "root may read secret.txt");
+    check_eq(open_as(0, "/mnt/d/secret.txt", 0), 0, "root may read secret.txt");
 
     /* --- the owner -------------------------------------------------------- */
-    check_eq(open_as(1000, "/mnt/e/secret.txt", 0), 0,
+    check_eq(open_as(1000, "/mnt/d/secret.txt", 0), 0,
              "uid 1000 owns it and may read it");
-    check_eq(open_as(1000, "/mnt/e/secret.txt", 1), 1,
-             "and may not WRITE it - the volume is read-only, which no ACL "
-             "can override");
+    check_eq(open_as(1000, "/mnt/d/secret.txt", 1), 0,
+             "and may open it for WRITING - owner@ grants write, and gnfs is "
+             "a writable volume");
 
     /* --- the discriminating pair ------------------------------------------
      *
      * These two are the reason the fixture exists. Both users are strangers
      * to a mode word: neither owns the file and neither is in its group, so
      * mode 0600 says no to both. The ACL says yes to one of them. */
-    check_eq(open_as(1001, "/mnt/e/secret.txt", 0), 0,
+    check_eq(open_as(1001, "/mnt/d/secret.txt", 0), 0,
              "uid 1001 may read a mode-0600 file it does not own - the ACL "
              "grants it, and no mode word can say that");
-    check_eq(open_as(1002, "/mnt/e/secret.txt", 0), 1,
+    check_eq(open_as(1002, "/mnt/d/secret.txt", 0), 1,
              "uid 1002 may not - so it is that one ACE, not a blanket allow");
 
-    /* --- the SAME grant, from the OLDER on-disk format --------------------
-     *
-     * /mnt/d is genesispool, ZPL version 1: no System Attribute registry, the
-     * ACL packed into the znode's own bonus buffer as fixed 12-byte entries
-     * whose fields are in a different ORDER from the modern ones. Its
-     * secret.txt carries the same four entries as /mnt/e's.
-     *
-     * Two volumes, two encodings, one answer. If these disagreed, one of the
-     * two decoders would be wrong and the host suite's field-by-field checks
-     * would not necessarily say which - this says it from userland, where
-     * only the result is visible. */
-    if (sc2(SYS_stat, "/mnt/d/secret.txt", st) == 0) {
-        check_eq(*(u32 *)(st + 28), 1000,
-                 "the v1 pool's secret.txt is owned by uid 1000 too");
-        check_eq(*(u32 *)(st + 24) & 07777, 0600, "and is also 0600");
-        check_eq(open_as(1001, "/mnt/d/secret.txt", 0), 0,
-                 "uid 1001 may read it - the pre-SA ACL grants the same thing "
-                 "the v5 one does");
-        check_eq(open_as(1002, "/mnt/d/secret.txt", 0), 1,
-                 "and uid 1002 may not, on that volume too");
-        check_eq(open_as(1002, "/mnt/d/hello.txt", 0), 0,
-                 "while a file on it with NO stored ACL falls back to its "
-                 "mode, and 0644 lets the stranger in");
-    } else {
-        out("  skip  /mnt/d is not mounted - the v1 fixture is not attached\n");
-    }
+    /* And the grant is exactly as wide as it says. On a read-only volume a
+     * write refusal proved nothing about the ACL; on gnfs it is the ACL
+     * talking: uid 1001's entry names READ_DATA and nothing else, and the
+     * deny-everyone@ entry after it catches the write. */
+    check_eq(open_as(1001, "/mnt/d/secret.txt", 1), 1,
+             "uid 1001 may NOT open it for writing - its grant is read only");
 
     /* --- and a file with no interesting ACL at all ------------------------ */
-    check_eq(open_as(1002, "/mnt/e/readable.txt", 0), 0,
+    check_eq(open_as(1002, "/mnt/d/readable.txt", 0), 0,
              "the same stranger may read readable.txt, which is 0644");
-    check_eq(open_as(1002, "/mnt/e/etc/motd", 0), 0,
+    check_eq(open_as(1002, "/mnt/d/readable.txt", 1), 1,
+             "but not write it");
+    check_eq(open_as(1002, "/mnt/d/etc/motd", 0), 0,
              "and descend into a 0755 directory to reach a file");
 
     /* --- access(2) must agree with open(2) -------------------------------- */
-    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/e/secret.txt",
+    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/d/secret.txt",
                  4 /*R_OK*/, 0), 0,
              "access(R_OK) as root agrees with open");
-    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/e/secret.txt",
-                 2 /*W_OK*/, 0), -13,
-             "access(W_OK) is refused on a read-only volume");
-    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/e/secret.txt",
+    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/d/secret.txt",
+                 2 /*W_OK*/, 0), 0,
+             "access(W_OK) as root says yes on a writable volume");
+    check_eq(sc4(SYS_faccessat, (u64)AT_FDCWD, (u64)"/mnt/d/secret.txt",
                  0 /*F_OK*/, 0), 0,
              "and F_OK asks only whether it exists");
 
@@ -2267,8 +2251,9 @@ static void test_namespace(void) {
  * exactly: -EACCES and -EPERM are different answers here on purpose.
  *
  * The volume is found by what statfs says (gnfs's f_namelen is 60; FAT's
- * is 12, ZFS's 255), not by drive letter, and it is a fresh image every
- * run - build.py makes one - so this section can mutate it freely. */
+ * is 12), not by drive letter. It is the ACL fixture volume, unpacked fresh
+ * every run by build.py, so this section can mutate it freely - it runs
+ * after test_volumes and test_acls have read it as shipped. */
 
 #define SYS_chmod      90
 #define SYS_fchmod     91

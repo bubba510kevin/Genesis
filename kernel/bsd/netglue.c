@@ -380,13 +380,21 @@ void if_clone_addgroup(struct ifnet *ifp, struct if_clone *ifc) {
  */
 MALLOC_DEFINE(M_NVLIST, "nvlist", "NVList");
 
-/* nvlist_create/nvlist_destroy are NOT here: kernel/zfs/zfs_nvlist.c already
- * defines both, for the completely unrelated nvlist format ZFS stores its
- * pool configuration in. That is a genuine name collision between two
- * subsystems that both borrowed Solaris's spelling, and one definition is
- * all a link gets. net/if.c reaches neither of them - it only calls the
- * accessors below - so leaving ZFS's in place is correct and the alternative
- * (renaming one) would mean editing vendored code. */
+/* nvlist_create/nvlist_destroy used to be absent from here, because the
+ * vendored ZFS reader defined both (for the unrelated nvlist format ZFS
+ * keeps its pool configuration in) and one definition is all a link gets.
+ * That arrangement was quietly WRONG as well as fragile: ZFS's
+ * nvlist_create SUCCEEDED, so SIOCGIFCAPNV got a real list handed to the
+ * failing accessors below instead of the clean ENOMEM this block promises.
+ * ZFS left the tree (2026-09-26), the link broke on exactly these two names,
+ * and they fail here now like everything else in this block. */
+struct nvlist *nvlist_create(int flags) {
+    (void)flags;
+    return (NULL);
+}
+void  nvlist_destroy(struct nvlist *nvl) {
+    (void)nvl;                       /* nothing was ever created */
+}
 int   nvlist_error(const struct nvlist *nvl) { (void)nvl; return (ENOTSUP); }
 bool  nvlist_exists_bool(const struct nvlist *nvl, const char *name) {
     (void)nvl; (void)name;

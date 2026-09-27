@@ -83,7 +83,8 @@ int part_run_tests(const char *image_dir);
 int volume_run_tests(const char *image);
 int bcache_run_tests(void);
 int gnfs_run_tests(void);
-int zfs_run_tests(const char *fixture_dir, const char *fat_image);
+int gnfs_fixture_run_tests(void);
+int gnfs_fixture_write(const char *path);
 
 static int failures;
 
@@ -577,6 +578,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* Not a test run: write the gnfs ACL fixture and stop. See
+     * tests/host/gnfs_fixture.c - run.sh uses this to prove the committed
+     * fixture is exactly what the kernel's own gnfs code produces. */
+    if (argc == 3 && strcmp(argv[1], "--gnfs-fixture") == 0) {
+        return gnfs_fixture_write(argv[2]) == 0 ? 0 : 1;
+    }
+
     test_pmm_respects_the_map();
     test_pmm_exhaustion();
     test_alloc_below();
@@ -645,11 +653,10 @@ int main(int argc, char **argv) {
         printf("\nfat write: skipped (no writable image argument)\n");
     }
 
-    /* Last among the filesystem suites: it mounts four pools and the mount
-     * slots are never released (see ZFSFS_MAX in zfs_vfs.c), so anything
-     * after it would be probing against a full table. */
-    failures += zfs_run_tests(argc > 3 ? argv[3] : NULL,
-                              argc > 1 ? argv[1] : NULL);
+    /* The ACL fixture the guest mounts as /mnt/d - and the Windows
+     * SECURITY_DESCRIPTOR view of its secret.txt, which used to be checked
+     * against a ZFS pool before ZFS left the tree. */
+    failures += gnfs_fixture_run_tests();
 
     printf("\n%s\n", failures ? "FAILURES" : "all checks passed");
     return failures ? 1 : 0;

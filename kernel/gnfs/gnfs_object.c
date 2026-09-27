@@ -62,14 +62,29 @@ static int names_equal(const char *a, uint64 alen, const char *b, uint8 blen) {
     return 1;
 }
 
+/* Every byte, not just the three fields a reader looks at. The block goes to
+ * disk whole, and it used to be built in a stack buffer with only objnum,
+ * is_dir and name_len set per entry - so the name bytes, the reserved bytes
+ * and the tail past the last whole entry (4096 is not a multiple of the
+ * entry size) carried whatever the kernel stack last held onto the medium:
+ * kernel memory leaking into a filesystem any user can read raw. Found when
+ * the gnfs ACL fixture refused to come out byte-identical twice. */
 void gnfs_dir_init_block(uint8 *block) {
     uint64 i;
-    gnfs_dirent_t *ents = (gnfs_dirent_t *)block;
 
-    for (i = 0; i < GNFS_DIRENTS_PER_BLOCK; i++) {
-        ents[i].objnum   = GNFS_OBJNUM_NONE;
-        ents[i].is_dir   = 0;
-        ents[i].name_len = 0;
+    for (i = 0; i < GNFS_BLOCK_SIZE; i++) {
+        block[i] = 0;
+    }
+}
+
+/* One entry back to all-zero - what a never-used slot looks like - so a
+ * removed name does not linger on disk after its entry is gone. */
+static void dirent_clear(gnfs_dirent_t *e) {
+    uint8 *b = (uint8 *)e;
+    uint64 i;
+
+    for (i = 0; i < sizeof(*e); i++) {
+        b[i] = 0;
     }
 }
 
@@ -116,6 +131,7 @@ int gnfs_dir_add(uint8 *block, const char *name, uint64 name_len,
         return -ENOSPC;
     }
 
+    dirent_clear(&ents[free_slot]);
     ents[free_slot].objnum   = objnum;
     ents[free_slot].is_dir   = (uint8)(is_dir ? 1 : 0);
     ents[free_slot].name_len = (uint8)name_len;
@@ -134,9 +150,7 @@ int gnfs_dir_remove(uint8 *block, const char *name, uint64 name_len) {
             continue;
         }
         if (names_equal(name, name_len, ents[i].name, ents[i].name_len)) {
-            ents[i].objnum   = GNFS_OBJNUM_NONE;
-            ents[i].is_dir   = 0;
-            ents[i].name_len = 0;
+            dirent_clear(&ents[i]);
             return 0;
         }
     }

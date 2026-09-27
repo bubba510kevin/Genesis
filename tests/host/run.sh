@@ -130,53 +130,6 @@ python3 tools/fatfs.py "$OUT/test.img" "$FIX" >/dev/null
 mkdir -p "$OUT/imgs"
 python3 tests/host/mkimg.py "$OUT/imgs"
 
-# ZFS pool fixtures. Three were written by real OpenZFS years ago and ship in
-# its test suite; the fourth was built by tests/host/mkzpl.c through libzpool,
-# which is OpenZFS's own code. See tests/host/fixtures/README.md - the point
-# of all four is that this tree did not write them.
-mkdir -p "$OUT/zfs"
-for f in tests/host/fixtures/*.dat.gz; do
-    gunzip -c "$f" > "$OUT/zfs/$(basename "$f" .gz)"
-done
-
-# The vendored ZFS reader is compiled SEPARATELY, against kernel/zfs/compat/
-# rather than against kernel/include. That is not tidiness: typesk.h typedefs
-# size_t to `unsigned long long` and the compat world (gcc's stddef.h) says
-# `unsigned long`, and one translation unit cannot hold both. The two sides
-# meet only through kernel/zfs/zfs_genesis.h, which names neither.
-gcc -std=gnu99 -g -Wall -c -Ikernel/zfs/compat -Ikernel/include \
-    kernel/zfs/zfs_vendor.c -o "$OUT/zfs_vendor.o"
-gcc -std=gnu99 -g -Wall -c -Ikernel/zfs/compat -Ikernel/include \
-    kernel/zfs/zfs_nvlist.c -o "$OUT/zfs_nvlist.o"
-gcc -std=gnu99 -g -Wall -c -Ikernel/zfs/compat -Ikernel/include \
-    kernel/zfs/zfs_lz4.c -o "$OUT/zfs_lz4.o"
-gcc -std=gnu99 -g -Wall -c -Ikernel/zfs/compat -Ikernel/include \
-    kernel/zfs/zfs_list.c -o "$OUT/zfs_list.o"
-gcc -std=gnu99 -g -Wall -c -Ikernel/zfs/compat \
-    kernel/zfs/zfs_shim.c -o "$OUT/zfs_shim.o"
-gcc -std=c99 -g -Wall -Wextra -c -I"$OUT/include" -Ikernel/zfs \
-    kernel/zfs/zfs_vfs.c -o "$OUT/zfs_vfs.o"
-
-# The vendored ZFS reader is built as its own objects, with its own include
-# path. It has to be: kernel/zfs/compat/ is a miniature libc where size_t is
-# `unsigned long`, and typesk.h says `unsigned long long`. The two cannot be
-# on one command line, which is the same wall zfs_genesis.h describes.
-#
-# -w, and that is deliberate rather than lazy: these files are vendored
-# unmodified and warn about signedness and unused parameters in code nobody
-# here is going to change. The GENESIS side of the boundary (zfs_vfs.c) is
-# built with the same -Wall -Wextra as everything else.
-ZFSOBJ=""
-if [ -d kernel/zfs/vendor ]; then
-  for u in zfs_vendor zfs_nvlist zfs_lz4 zfs_list zfs_shim; do
-    gcc -std=gnu99 -g -w -c -Ikernel/zfs/compat -Ikernel/include "kernel/zfs/$u.c" -o "$OUT/$u.o"
-    ZFSOBJ="$ZFSOBJ $OUT/$u.o"
-  done
-  gcc -std=c99 -Wall -Wextra -g -c -I"$OUT/include" -Ikernel/zfs \
-      kernel/zfs/zfs_vfs.c -o "$OUT/zfs_vfs.o"
-  ZFSOBJ="$ZFSOBJ $OUT/zfs_vfs.o"
-fi
-
 gcc -std=c99 -Wall -Wextra -g -no-pie -fno-pie \
     -I"$OUT/include" -Itests/host \
     "$OUT/pmm.c" "$OUT/paging.c" "$OUT/e820.c" "$OUT/keyboard.c" "$OUT/waitq.c" "$OUT/pipe.c" "$OUT/pe.c" "$OUT/fat.c" "$OUT/path.c" "$OUT/object.c" "$OUT/kstack.c" "$OUT/ns.c" "$OUT/devices.c" "$OUT/ntproc.c" "$OUT/rtc.c" "$OUT/part.c" "$OUT/device.c" "$OUT/bcache.c" \
@@ -189,8 +142,7 @@ gcc -std=c99 -Wall -Wextra -g -no-pie -fno-pie \
     tests/host/part_test.c tests/host/dev_stub.c tests/host/time_stub.c \
     tests/host/kernel_stub.c tests/host/fat_write_test.c \
     tests/host/volume_test.c tests/host/bcache_test.c \
-    tests/host/gnfs_test.c \
-    tests/host/zfs_test.c tests/host/zfs_stub.c $ZFSOBJ -Ikernel/zfs \
+    tests/host/gnfs_test.c tests/host/gnfs_fixture.c \
     -o "$OUT/vmm_test"
 
 # A separate, writable copy of the FAT fixture for the write tests. Made by
@@ -198,12 +150,29 @@ gcc -std=c99 -Wall -Wextra -g -no-pie -fno-pie \
 # identical at the start and any difference the write tests see is theirs.
 cp "$OUT/test.img" "$OUT/test-rw.img"
 
-"$OUT/vmm_test" "$OUT/test.img" "$OUT/imgs" "$OUT/zfs" "$OUT/test-rw.img"
+"$OUT/vmm_test" "$OUT/test.img" "$OUT/imgs" "" "$OUT/test-rw.img"
 
-# The CDDL boundary. Not a unit test - a grep over the tree - but it fails the
-# run for the same reason the tests do, because a boundary nothing checks is a
-# boundary that has already moved.
-python3 tests/host/check_zfs_boundary.py
+# The gnfs ACL fixture the guest mounts as /mnt/d (tests/host/gnfs_fixture.c).
+# Committed gzipped so build.py needs nothing but the tree, and REGENERATED
+# here by the kernel's own gnfs code and compared byte for byte - so the
+# committed image cannot drift from what the current gnfs would write. After
+# an intentional format change, refresh it with UPDATE_FIXTURES=1.
+"$OUT/vmm_test" --gnfs-fixture "$OUT/gnfsfix.img"
+if [ "${UPDATE_FIXTURES:-0}" = 1 ]; then
+    gzip -9 -n -c "$OUT/gnfsfix.img" > tests/host/fixtures/gnfsfix.img.gz
+    echo "gnfs fixture: tests/host/fixtures/gnfsfix.img.gz refreshed"
+fi
+gunzip -c tests/host/fixtures/gnfsfix.img.gz > "$OUT/gnfsfix.committed" || {
+    echo "gnfs fixture: tests/host/fixtures/gnfsfix.img.gz is missing -" \
+         "run with UPDATE_FIXTURES=1" >&2
+    exit 1
+}
+cmp -s "$OUT/gnfsfix.img" "$OUT/gnfsfix.committed" || {
+    echo "gnfs fixture: the committed image differs from what gnfs writes" \
+         "now - rerun with UPDATE_FIXTURES=1 if the change is intended" >&2
+    exit 1
+}
+echo "gnfs fixture: committed image matches the kernel's gnfs output"
 
 # What FAT16 can actually represent, checked against root/ BEFORE an image is
 # built from it. ROADMAP item 10: the /wsr System32-vs-system32 collision

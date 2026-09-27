@@ -67,7 +67,6 @@ void pcache_report(uint8 color);
 #include "ksmp.h"
 #include "klock.h"
 #include "gnfs.h"
-#include "zfs.h"
 
 /* Physical end of the kernel image, from linker.ld. `end` is a 64-bit VIRTUAL
  * address now, so the PMM - which works in physical frames - must use this or
@@ -375,22 +374,15 @@ static void storage_init(void) {
      * disk rather than a boot-order mistake. */
     volume_register_fs("fat16", fatfs_probe);
 
-    /* And ZFS, which is the whole of what the rest of the kernel knows about
-     * kernel/zfs/: one call, no types, no headers. The CDDL code is reached
-     * through a function pointer the probe table already had, so deleting the
-     * directory deletes the feature and breaks this line and nothing else.
+    /* gnfs, the native COW filesystem: kernel/include/gnfs.h is its one-call
+     * opaque entry point - no types, no headers beyond that one. Registered
+     * after FAT, which matters only for speed: probe order is a speed
+     * question, not a correctness one.
      *
-     * Registered AFTER FAT, which matters only for speed: a FAT volume is
-     * identified by its boot sector, while a ZFS probe on one reads four
-     * 112KB labels before deciding no. */
-    zfs_init();
-
-    /* gnfs, the native COW filesystem: kernel/include/gnfs.h is its own
-     * one-call opaque entry point, the same shape as zfs_init above, even
-     * though kernel/gnfs/ carries none of kernel/zfs/'s CDDL boundary
-     * concerns - the pattern is worth reusing on its own merits. Registered
-     * after ZFS for the same reason ZFS is registered after FAT: probe order
-     * here is a speed question, not a correctness one. */
+     * The vendored ZFS reader used to register here too, through the same
+     * one-call shape (zfs_init), and was removed 2026-09-26; gnfs carries the
+     * copy-on-write filesystem and the ACL fixtures it used to. That shape
+     * is why removing it was one line here and a directory. */
     gnfs_init();
 
     volume_init();
