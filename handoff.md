@@ -179,6 +179,15 @@ right where the work stopped):
    **DONE 2026-09-26**, in systest's gnfs section (below).
 7. SACL/auditing — bigger, lower priority.
 
+**Multithreading (item 14(a)) — STARTED 2026-09-26: Win32 threads work.**
+`CreateThread`/`ExitThread`/`WaitForSingleObject`/`GetExitCodeThread`, each
+thread with its own TEB and stack, starting in `ntdll!RtlUserThreadStart`.
+`src/winthread/thr.exe` checks it (16/16). Also fixed two older clone()-thread
+bugs: threads ran as root, and exited threads were never freed. Full record:
+ROADMAP.md item 14(a), "STARTED 2026-09-26". Next inside (a): TLS
+(`TlsAlloc`), raising MAX_PROCESSES (16, shared by all processes and
+threads), mutant abandonment, then running user code on the second CPU.
+
 **The actual next milestone toward THE GOAL**, once the above is cleared or
 if you want to jump straight at it: **real multithreading** — item 14(a),
 and per its own ordering the biggest single missing prerequisite before any
@@ -208,7 +217,9 @@ wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && p
 grep -E "^(verification|systest): [0-9]" build/guest.txt   # expect 0 failed on both
 ```
 As of 2026-09-26: `verification: 160 passed, 0 failed`,
-`systest: 439 passed, 0 failed`.
+`systest: 443 passed, 0 failed`, `thr: 16 passed, 0 failed` (guest_run.py
+now also runs `/bin/thr.exe` by default and accepts any `name: N passed`
+tally).
 
 After changing `src/systest.c` (or `src/verif.c`), rebuild it and restage
 the FAT disk - `build_user.sh` stages via `sudo mount`, which needs a

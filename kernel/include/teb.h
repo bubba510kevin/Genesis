@@ -164,4 +164,39 @@ typedef struct {
  * truncating a command line into something that parses differently. */
 int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc);
 
+/* --- threads after the first ---------------------------------------------
+ *
+ * Every NtCreateThreadEx thread gets a TEB of its own and a user stack of
+ * its own, in two fixed regions of the process's address space, indexed by
+ * a slot number. A slot is free when its TEB page is unmapped; a thread's
+ * exit unmaps both (proc_nt_thread_exit), which is what frees it.
+ *
+ *   TEBs:   NT_THREAD_TEB_BASE   + slot * NT_THREAD_TEB_STRIDE
+ *           just past the main thread's block (TEB, PEB, parameters), and
+ *           below USER_MMAP_BASE.
+ *   stacks: NT_THREAD_STACK_BASE + slot * NT_THREAD_STACK_STRIDE
+ *           1MB per slot. The stack occupies the TOP of its slot and the
+ *           slot's lowest page is never mapped, so running off the end of
+ *           one thread's stack faults instead of walking into the next's.
+ *
+ * Fixed regions rather than the mmap allocator because mmap_next is a bump
+ * pointer that never comes back down: a program that creates and joins a
+ * thread in a loop would walk it off the end of the region. */
+#define NT_THREAD_SLOTS          64
+#define NT_THREAD_TEB_BASE       0x0000000021000000ULL
+#define NT_THREAD_TEB_STRIDE     (NT_TEB_PAGES * 0x1000ULL)
+#define NT_THREAD_STACK_BASE     0x0000000050000000ULL
+#define NT_THREAD_STACK_STRIDE   0x0000000000100000ULL   /* 1MB */
+#define NT_THREAD_STACK_DEFAULT  0x0000000000010000ULL   /* 64KB, as main */
+
+/* Build a TEB for a non-first thread at `teb_va` (page-aligned; maps and
+ * zeroes NT_TEB_PAGES there). Its PEB pointer is the process's. 0 or a
+ * negative errno. */
+int nt_thread_teb_init(address_space_t *as, uint64 teb_va, uint64 stack_top,
+                       uint64 stack_size, int pid, int tid);
+
+/* Map `pages` zeroed, writable user pages at `va`. -ENOMEM if anything is
+ * already mapped there or a frame cannot be had. */
+int nt_map_zeroed(address_space_t *as, uint64 va, uint64 pages);
+
 #endif

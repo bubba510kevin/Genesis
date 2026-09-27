@@ -44,6 +44,14 @@ EXPORTS
     FreeEnvironmentStringsW
     GetCurrentDirectoryW
     GetModuleHandleW
+; --- threads and waiting ---
+    CreateThread
+    ExitThread
+    GetCurrentThread
+    GetCurrentThreadId
+    GetThreadId
+    GetExitCodeThread
+    WaitForSingleObject
 ; --- memory ---
     GetProcessHeap
     HeapAlloc

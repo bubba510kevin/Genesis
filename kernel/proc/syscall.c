@@ -1923,6 +1923,101 @@ static uint64 sys_fork(struct syscall_frame *frame) {
     return (uint64)child->pid;
 }
 
+/* --- a new thread of `parent`'s group -------------------------------------
+ *
+ * What every thread shares with its creator and what it gets of its own,
+ * in one place, because there are two ways to make one - clone() with the
+ * thread flags, and NtCreateThreadEx - and they must not disagree about
+ * what a thread IS. The caller supplies how it starts: the frame it will
+ * return to ring 3 through, its user stack, and its two thread-pointer
+ * bases. Not enqueued; the caller does that once anything else it writes
+ * (a tid into user memory, an NT handle) is in place.
+ *
+ * NULL if the table is full. */
+static process_t *spawn_thread(process_t *parent,
+                               const struct syscall_frame *start,
+                               uint64 user_rsp, uint64 fs_base,
+                               uint64 gs_base) {
+    process_t *child = proc_alloc(parent->pid);
+
+    if (child == NULL) {
+        return NULL;
+    }
+
+    /* The three shares, and the ownership flags that stop teardown undoing
+     * them. Set together, in one place, because the pointer and the flag
+     * describing it are two halves of one fact - and the version of this
+     * where they disagree is a descriptor table freed while three threads
+     * are still reading through it. */
+    child->space        = parent->space;
+    child->shares_space = 1;
+    child->handles      = parent->handles;
+    child->owns_files   = 0;
+    child->sig_handlers = parent->sig_handlers;
+    child->owns_sighand = 0;
+
+    /* Every thread of a group reports the group leader's pid from getpid().
+     * The slot's own pid is the tid. musl caches getpid()'s answer, so two
+     * threads seeing two different values does not fail here - it fails
+     * later, somewhere that has no visible connection to threading. */
+    child->tgid        = parent->tgid;
+    child->personality = parent->personality;
+    child->pgid        = parent->pgid;
+    child->brk_base    = parent->brk_base;
+    child->brk_current = parent->brk_current;
+    child->mmap_next   = parent->mmap_next;
+    child->nt_thread_start = parent->nt_thread_start;
+
+    /* Credentials. A thread IS its process as far as identity goes - POSIX
+     * and NT agree on that - and this copy was missing: fork learned it
+     * (see the same block in sys_fork, and the bug it records), the thread
+     * path did not, and proc_alloc hands every new slot uid 0. So a thread
+     * created by a process that had dropped to uid 1000 ran as ROOT. Nothing
+     * noticed while no thread asked an access question; the first one that
+     * opened a file would have been answered for the wrong user. */
+    child->uid          = parent->uid;
+    child->gid          = parent->gid;
+    child->sid          = parent->sid;
+    child->umask        = parent->umask;
+    child->ngroups      = parent->ngroups;
+    {
+        uint32 g;
+        for (g = 0; g < CRED_NGROUPS; g++) {
+            child->groups[g] = parent->groups[g];
+        }
+    }
+
+    /* The MASK is inherited and is per-thread from here on; the DISPOSITIONS
+     * are shared through the pointer above. That split is POSIX's, and it is
+     * the reason sig_blocked stayed a plain field when sig_handlers became a
+     * pointer. */
+    child->sig_blocked = parent->sig_blocked;
+    {
+        uint64 i;
+        for (i = 0; i < PATH_MAX_LEN; i++) {
+            child->cwd[i] = parent->cwd[i];
+        }
+    }
+    fpu_save(child->thread.fpu_state);
+
+    /* Per-thread CPU state, restored by proc_activate_stack on every switch
+     * like fs_base always was. */
+    child->thread.fs_base = fs_base;
+    child->thread.gs_base = gs_base;
+
+    child->thread.saved_rsp =
+        thread_bootstrap_stack(child->thread.kstack_top, start);
+    child->saved_user_rsp = user_rsp;
+    return child;
+}
+
+process_t *proc_spawn_thread(process_t *parent,
+                             const struct syscall_frame *start,
+                             uint64 user_rsp, uint64 fs_base,
+                             uint64 gs_base) {
+    return spawn_thread(parent, start, user_rsp, fs_base, gs_base);
+}
+
 /* --- clone ---------------------------------------------------------------
  *
  * Two jobs behind one number, and telling them apart is the whole of this
@@ -1983,66 +2078,25 @@ static uint64 sys_clone(struct syscall_frame *frame) {
         return (uint64)-22;
     }
 
-    child = proc_alloc(parent->pid);
-    if (child == NULL) {
-        return (uint64)-11;              /* -EAGAIN: the table is full */
-    }
-
-    /* The three shares, and the ownership flags that stop teardown undoing
-     * them. Set together, in one place, because the pointer and the flag
-     * describing it are two halves of one fact - and the version of this
-     * where they disagree is a descriptor table freed while three threads
-     * are still reading through it. */
-    child->space        = parent->space;
-    child->shares_space = 1;
-    child->handles      = parent->handles;
-    child->owns_files   = 0;
-    child->sig_handlers = parent->sig_handlers;
-    child->owns_sighand = 0;
-
-    /* Every thread of a group reports the group leader's pid from getpid().
-     * The slot's own pid is the tid. musl caches getpid()'s answer, so two
-     * threads seeing two different values does not fail here - it fails
-     * later, somewhere that has no visible connection to threading. */
-    child->tgid        = parent->tgid;
-    child->personality = parent->personality;
-    child->pgid        = parent->pgid;
-    child->brk_base    = parent->brk_base;
-    child->brk_current = parent->brk_current;
-    child->mmap_next   = parent->mmap_next;
-
-    /* The MASK is inherited and is per-thread from here on; the DISPOSITIONS
-     * are shared through the pointer above. That split is POSIX's, and it is
-     * the reason sig_blocked stayed a plain field when sig_handlers became a
-     * pointer. */
-    child->sig_blocked = parent->sig_blocked;
-    {
-        uint64 i;
-        for (i = 0; i < PATH_MAX_LEN; i++) {
-            child->cwd[i] = parent->cwd[i];
-        }
-    }
-    fpu_save(child->thread.fpu_state);
-
-    /* CLONE_SETTLS. musl passes the new thread's pthread struct here and
-     * every __thread access in that thread resolves through it, so a thread
-     * created without this reads another thread's TLS - or, on the first
-     * thread, garbage. It is per-thread CPU state, so it goes in thread_t and
-     * is restored by proc_activate_stack like fs_base always was. */
-    child->thread.fs_base = (flags & CLONE_SETTLS) ? tls : parent->thread.fs_base;
-    child->thread.gs_base = parent->thread.gs_base;
-
     /* The new thread starts at the same instruction with rax = 0 - the same
      * arrangement fork uses - but on the stack the CALLER supplied rather
      * than on a copy of its own. That single difference is what makes this a
-     * thread rather than a process. */
+     * thread rather than a process.
+     *
+     * CLONE_SETTLS: musl passes the new thread's pthread struct here and
+     * every __thread access in that thread resolves through it, so a thread
+     * created without it reads another thread's TLS. */
     {
         struct syscall_frame child_frame = *frame;
 
         child_frame.rax = 0;
-        child->thread.saved_rsp =
-            thread_bootstrap_stack(child->thread.kstack_top, &child_frame);
-        child->saved_user_rsp = child_sp;
+        child = spawn_thread(parent, &child_frame, child_sp,
+                             (flags & CLONE_SETTLS) ? tls
+                                                    : parent->thread.fs_base,
+                             parent->thread.gs_base);
+    }
+    if (child == NULL) {
+        return (uint64)-11;              /* -EAGAIN: the table is full */
     }
 
     /* CLONE_PARENT_SETTID writes the new tid where the CREATOR can see it,
@@ -2161,6 +2215,13 @@ static void kill_thread_group(process_t *p, int status) {
     }
 }
 
+uint64 syscall_exit_group(uint64 status, struct syscall_frame *frame) {
+    /* The others first, while this thread still owns the tables the retire
+     * path reads - see SYS_exit_group's case for why the order matters. */
+    kill_thread_group(proc_current(), (int)(status & 0xFF));
+    return syscall_exit_process(status, frame);
+}
+
 uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame) {
     process_t *p = proc_current();
 
@@ -2179,6 +2240,13 @@ uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame) {
         futex_wake_addr(p->clear_child_tid);
         p->clear_child_tid = 0;
     }
+
+    /* The NT equivalent of the handshake above: signal the Thread object
+     * that WaitForSingleObject(hThread) is blocked on, and give back this
+     * thread's private TEB and stack. A no-op for anything NtCreateThreadEx
+     * did not make. NtTerminateThread has already recorded the full 32-bit
+     * code by the time it gets here; this code only lands if nothing did. */
+    proc_nt_thread_exit(p, (uint32)status);
 
     /* Zombie, not freed: the status is still wanted. What CAN go now is
      * everything that holds a resource - descriptors, and the address space
@@ -2202,12 +2270,30 @@ uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame) {
      * is sitting in wait4. The flag is what keeps this from disturbing a
      * parent blocked on something else - waking a process that was waiting
      * for the keyboard would send it round its own loop for nothing. */
-    {
+    /* A THREAD's exit tells nobody: it is not a child, its creator did
+     * not fork it, and Linux sends no signal for it. It used to send its
+     * creator SIGCHLD, and a program with a SIGCHLD handler saw a child
+     * exit that no wait could ever find. */
+    if (p->tgid == p->pid) {
         process_t *parent = proc_find(p->ppid);
 
         if (parent != NULL) {
             signal_send(parent, SIGCHLD);
             if (parent->waiting_for_child) {
+                sched_wake(parent);
+            }
+        }
+    } else {
+        /* But a thread may be the LAST of a group whose leader already
+         * exited alone - and that leader only becomes reapable now (see
+         * proc_reap_child). Its parent's wait4 re-checks on waking, so a
+         * wake that turns out early costs one pass round its loop. */
+        process_t *leader = proc_find(p->tgid);
+
+        if (leader != NULL && leader->state == PROC_ZOMBIE) {
+            process_t *parent = proc_find(leader->ppid);
+
+            if (parent != NULL && parent->waiting_for_child) {
                 sched_wake(parent);
             }
         }
@@ -2566,6 +2652,7 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     elf_info_t info;
     personality_t new_personality = PERSONALITY_LINUX;
     uint64        new_gs_base   = 0;
+    uint64        new_thread_start = 0;
     /* Both zero for a static binary, and both are read unconditionally below.
      * interp_entry is a SEPARATE variable from info.entry rather than an
      * overwrite of it, because the two addresses are different and both are
@@ -2659,6 +2746,7 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
         info.phnum         = 0;
         info.phentsize     = 0;
         new_personality    = PERSONALITY_WINDOWS;
+        new_thread_start   = pe.thread_start;
 
         /* The TEB and PEB, built by the kernel before the image runs -
          * exactly as NT does it, and it has to be that way round:
@@ -2896,6 +2984,10 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     /* Set from the branch that chose the loader, above, so the tag and the
      * image can never disagree about what was actually mapped. */
     p->personality = new_personality;
+    /* Where NtCreateThreadEx will start this image's threads. Replaced on
+     * every exec, ELF included (0), because it is an address in the image
+     * being thrown away. */
+    p->nt_thread_start = new_thread_start;
 
     stack = user_stack_create(USER_STACK_TOP, USER_STACK_SIZE,
                               ec->argv, ec->envp,

@@ -63,3 +63,8 @@ NT_STUB_X(NtCreateSemaphore,       NT_SYS_CREATE_SEMAPHORE);
 NT_STUB_X(NtReleaseSemaphore,      NT_SYS_RELEASE_SEMAPHORE);
 NT_STUB_X(NtCreateMutant,          NT_SYS_CREATE_MUTANT);
 NT_STUB_X(NtReleaseMutant,         NT_SYS_RELEASE_MUTANT);
+
+/* Threads - ROADMAP item 14(a). */
+NT_STUB_X(NtCreateThreadEx,        NT_SYS_CREATE_THREAD);
+NT_STUB_X(NtTerminateThread,       NT_SYS_TERMINATE_THREAD);
+NT_STUB_X(NtQueryInformationThread, NT_SYS_QUERY_THREAD);

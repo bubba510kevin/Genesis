@@ -11,6 +11,8 @@ src/kernel32/kernel32.dll
 src/kernel32/libkernel32.a
 src/k32demo/*.o
 src/k32demo/k32.exe
+src/winthread/*.o
+src/winthread/thr.exe
 
 # Build output and generated artifacts
 build/

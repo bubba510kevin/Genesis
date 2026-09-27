@@ -241,6 +241,13 @@ typedef struct {
     uint32 section_count;
     int    relocated;        /* non-zero if .reloc had to be applied        */
     int    has_imports;      /* non-zero if the import directory is present */
+
+    /* ntdll!RtlUserThreadStart in the linked image, or 0 if the executable
+     * did not pull in an ntdll that exports it. Where NtCreateThreadEx starts
+     * every new thread - the same job PspUserThreadStartup's lookup of it
+     * does on NT - found here because this is the one moment the module
+     * list exists. */
+    uint64 thread_start;
 } pe_info_t;
 
 /* Cheap enough to call on every execve: reads two magic numbers and nothing

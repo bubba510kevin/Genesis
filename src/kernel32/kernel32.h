@@ -119,6 +119,17 @@ typedef DWORD *LPDWORD;
 
 #define MEM_RELEASE          0x00008000u
 
+/* Threads and waiting. */
+typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID parameter);
+#define CREATE_SUSPENDED     0x00000004u
+#define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
+#define THREAD_ALL_ACCESS    0x001FFFFFu
+#define STILL_ACTIVE         0x00000103u
+#define INFINITE             0xFFFFFFFFu
+#define WAIT_OBJECT_0        0x00000000u
+#define WAIT_TIMEOUT         0x00000102u
+#define WAIT_FAILED          0xFFFFFFFFu
+
 /* --- error reporting (err.c) --------------------------------------------
  *
  * Every failure in this DLL goes through here. Returning the code as well as
@@ -164,6 +175,17 @@ BOOL   WINAPI HeapFree(HANDLE heap, DWORD flags, LPVOID address);
 LPVOID WINAPI VirtualAlloc(LPVOID address, SIZE_T size, DWORD type,
                            DWORD protect);
 BOOL   WINAPI VirtualFree(LPVOID address, SIZE_T size, DWORD type);
+
+/* Threads (thread.c) */
+HANDLE WINAPI CreateThread(LPVOID security, SIZE_T stack_size,
+                           LPTHREAD_START_ROUTINE start, LPVOID parameter,
+                           DWORD flags, LPDWORD thread_id);
+void   WINAPI ExitThread(DWORD code);
+HANDLE WINAPI GetCurrentThread(void);
+DWORD  WINAPI GetCurrentThreadId(void);
+DWORD  WINAPI GetThreadId(HANDLE thread);
+BOOL   WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code);
+DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
 
 /* --- shared internals ---------------------------------------------------- */
 

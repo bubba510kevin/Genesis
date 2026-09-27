@@ -162,6 +162,32 @@ typedef struct process {
      * stopped running, and a write before it stops is a lie. */
     uint64           clear_child_tid;
 
+    /* --- an NT thread ------------------------------------------------------
+     *
+     * What NtCreateThreadEx gave this thread beyond what clone() gives a
+     * POSIX one, and what its exit has to undo.
+     *
+     * nt_thread_obj is the waitable half (OBJ_THREAD): the thread holds one
+     * reference so it can signal the object when it dies, and each handle
+     * holds its own. NULL for the main thread of an NT process - nothing
+     * created it through NtCreateThreadEx, so nothing holds a handle to wait
+     * on - and for every POSIX task.
+     *
+     * nt_teb_va / nt_stack_lo / nt_stack_pages name this thread's private TEB
+     * and user stack inside the SHARED address space, so they can be
+     * unmapped when it exits rather than leaking a slot per thread for the
+     * life of the process. 0 for a thread that has none of its own.
+     *
+     * nt_thread_start is ntdll's RtlUserThreadStart in this process's image,
+     * found by the PE loader at execve; every NtCreateThreadEx thread begins
+     * there. Inherited by the threads of the group. 0 for a process with no
+     * ntdll, which therefore cannot create NT threads. */
+    struct object   *nt_thread_obj;
+    uint64           nt_teb_va;
+    uint64           nt_stack_lo;
+    uint64           nt_stack_pages;
+    uint64           nt_thread_start;
+
     thread_t        thread;
 
     /* --- kernel thread ---------------------------------------------------
@@ -405,6 +431,14 @@ void proc_retire(process_t *p, int exit_status);
  * same reason vmm_space_destroy does. */
 void proc_free(process_t *p);
 
+/* The NT half of a thread's death: signal its Thread object with
+ * `exit_code` (a no-op if something already did - the first code wins) and
+ * drop the thread's reference to it, and unmap its private TEB and user
+ * stack from the shared address space. Safe to call more than once and on
+ * a task that is not an NT thread. Called by both exit paths - the thread's
+ * own and proc_retire - so no way of dying skips it. */
+void proc_nt_thread_exit(process_t *p, uint32 exit_code);
+
 /* Look up by pid, or NULL. */
 process_t *proc_find(int pid);
 
@@ -445,8 +479,28 @@ void genesis_supreme_uid_set(int uid);
  * space, and execve switches explicitly. */
 void proc_set_current(process_t *p);
 
-/* First exited-but-unreaped child of `p`, or NULL. */
+/* A new, NOT YET ENQUEUED thread of `parent`'s group: shares its address
+ * space, descriptors, signal dispositions and credentials; starts by
+ * returning to ring 3 through `start` on user stack `user_rsp`, with the
+ * given FS and GS bases. The one constructor behind both clone()'s thread
+ * shape and NtCreateThreadEx, so the two cannot disagree about what a
+ * thread shares. NULL if the table is full. */
+process_t *proc_spawn_thread(process_t *parent,
+                             const struct syscall_frame *start,
+                             uint64 user_rsp, uint64 fs_base,
+                             uint64 gs_base);
+
+/* First exited-but-unreaped child of `p`, or NULL. A child that is a
+ * thread-group leader is not offered while any of its threads still runs. */
 process_t *proc_reap_child(process_t *p);
+
+/* Free every exited NON-LEADER thread (tgid != pid). Threads are not
+ * children - wait4 never reports them - so without this each one that ever
+ * exited held a process slot until reboot, and a program that created and
+ * joined threads in a loop ran the table out after a dozen. Called from
+ * schedule(), beside kthread_reap, where the dead thread is guaranteed not
+ * to be the one running. */
+void proc_reap_threads(void);
 
 /* Table access by index, for a scheduler that scans rather than links. NULL
  * for an unused slot. */

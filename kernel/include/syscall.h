@@ -460,6 +460,11 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame);
  * asked for them; only the call NUMBER differs, and that is what the
  * personality table is for. */
 uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame);
+
+/* exit_group: retire every other thread of the caller's group, then exit
+ * the caller. What ends a PROCESS, as opposed to one thread of it - SYS_
+ * exit_group, and NtTerminateProcess. */
+uint64 syscall_exit_group(uint64 status, struct syscall_frame *frame);
 int    user_ptr_ok(uint64 p);
 
 /* Whether [p, p+len) is entirely inside the user half. Not the same question

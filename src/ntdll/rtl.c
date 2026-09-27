@@ -252,6 +252,35 @@ void LdrInitializeThunk(void) {
     teb->LastErrorValue = 0;
 }
 
+/* --- threads -------------------------------------------------------------
+ *
+ * Where every thread NtCreateThreadEx makes begins, as on NT - the kernel
+ * finds this export when it links the image, and starts the thread here
+ * rather than at the caller's function. That is what lets a start routine
+ * simply RETURN: there is nowhere for it to return to except here, and
+ * this turns the return value into the thread's exit code.
+ *
+ * The first parameter is not a parameter. NT enters this with StartRoutine
+ * in RCX and Parameter in RDX; Genesis leaves ring 0 by SYSRET, which puts
+ * the return address in RCX, so the kernel passes StartRoutine in RDX and
+ * Parameter in R8 instead - the second and third Win64 argument registers.
+ * Nothing outside this function can see the difference. */
+void RtlUserThreadStart(PVOID rcx_is_not_an_argument,
+                        PUSER_THREAD_START_ROUTINE StartRoutine,
+                        PVOID Parameter) {
+    (void)rcx_is_not_an_argument;
+    RtlExitUserThread(StartRoutine(Parameter));
+}
+
+/* Ends the calling thread. Never returns: if the kernel ever refused, the
+ * thread has nowhere left to go, and spinning is visible where returning
+ * into a garbage frame would not be. */
+void RtlExitUserThread(NTSTATUS ExitStatus) {
+    NtTerminateThread(NtCurrentThread(), ExitStatus);
+    for (;;) {
+    }
+}
+
 /* The DLL's entry point. Named for what MinGW's linker expects by default so
  * that -nostdlib does not also mean --entry on the command line. Does
  * nothing: there is no per-DLL initialisation to run, and the loader that

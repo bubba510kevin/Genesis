@@ -26,6 +26,10 @@ EXPORTS
     NtReleaseSemaphore
     NtCreateMutant
     NtReleaseMutant
+; --- threads ---
+    NtCreateThreadEx
+    NtTerminateThread
+    NtQueryInformationThread
 ; --- the runtime library ---
     NtCurrentTeb
     RtlInitUnicodeString
@@ -33,3 +37,5 @@ EXPORTS
     RtlAllocateHeap
     RtlFreeHeap
     LdrInitializeThunk
+    RtlUserThreadStart
+    RtlExitUserThread

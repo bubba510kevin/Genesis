@@ -22,12 +22,13 @@
  * whether a signal means "set" or "release".
  */
 
-#define DISPATCH_MAX 32
+#define DISPATCH_MAX 64   /* events, semaphores, mutants AND one per NT thread */
 
 typedef enum {
     D_EVENT = 0,
     D_SEMAPHORE,
-    D_MUTANT
+    D_MUTANT,
+    D_THREAD
 } disp_kind_t;
 
 typedef struct dispatcher {
@@ -46,6 +47,13 @@ typedef struct dispatcher {
      * count, which is what makes this not a semaphore of one. */
     int          owner;
     int          depth;
+
+    /* Thread. `signalled` (shared with Event) is "has exited"; these two
+     * are what NtQueryInformationThread reports - the tid, and the full
+     * 32-bit exit code, which is NOT the process_t's exit_status: that is
+     * a POSIX wait status and keeps only eight bits. */
+    int          tid;
+    uint32       exit_code;
 
     wait_queue_t q;
 } dispatcher_t;
@@ -67,6 +75,8 @@ static dispatcher_t *disp_alloc(disp_kind_t kind) {
             d->limit     = 0;
             d->owner     = 0;
             d->depth     = 0;
+            d->tid       = 0;
+            d->exit_code = 0;
             waitq_init(&d->q);
             return d;
         }
@@ -99,6 +109,8 @@ static int disp_ready(const dispatcher_t *d, int who) {
          * half is the recursion, and leaving it out is the bug where a thread
          * deadlocks against a mutant it is already holding. */
         return d->owner == 0 || d->owner == who;
+    case D_THREAD:
+        return d->signalled;
     }
     return 0;
 }
@@ -126,6 +138,11 @@ static void disp_consume(dispatcher_t *d, int who) {
     case D_MUTANT:
         d->owner = who;
         d->depth++;
+        break;
+    case D_THREAD:
+        /* Nothing to take. A thread stays exited, so EVERY waiter gets
+         * through - the notification-event shape, not the synchronisation
+         * one. */
         break;
     }
 }
@@ -276,6 +293,14 @@ static int disp_signal(object_t *obj, int op, int64 count, int64 *prev) {
             d->owner = 0;
         }
         break;
+
+    case D_THREAD:
+        /* Only the thread's own exit signals it (thread_object_exited),
+         * never a caller: NtSetEvent on a thread handle is a type error,
+         * and letting it through would release a WaitForSingleObject on a
+         * thread that is still running. */
+        rc = -22;
+        break;
     }
 
     if (rc == 0) {
@@ -337,6 +362,15 @@ static const object_type_t semaphore_type = {
 static const object_type_t mutant_type = {
     .name    = "Mutant",
     .klass   = OBJ_MUTANT,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
+static const object_type_t thread_type = {
+    .name    = "Thread",
+    .klass   = OBJ_THREAD,
     .poll    = disp_poll,
     .wait    = disp_wait,
     .signal  = disp_signal,
@@ -406,6 +440,66 @@ object_t *mutant_create(int owned) {
         d->in_use = 0;
     }
     return obj;
+}
+
+/* --- threads ------------------------------------------------------------- */
+
+object_t *thread_object_create(int tid) {
+    dispatcher_t *d = disp_alloc(D_THREAD);
+    object_t *obj;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    d->tid = tid;
+    obj = ob_create(&thread_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+void thread_object_exited(object_t *obj, uint32 exit_code) {
+    dispatcher_t *d;
+    uint64 flags;
+
+    if (obj == NULL || obj->type != &thread_type) {
+        return;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d == NULL || !d->in_use) {
+        return;
+    }
+    flags = intr_disable();
+    /* First exit wins. A thread is retired at most once, but the retire
+     * path and the thread's own exit can both reach here for one thread
+     * (exit_group racing NtTerminateThread), and the code the thread asked
+     * for is the one to keep. */
+    if (!d->signalled) {
+        d->exit_code = exit_code;
+        d->signalled = 1;
+        waitq_wake_all(&d->q);
+    }
+    intr_restore(flags);
+}
+
+int thread_object_query(object_t *obj, int *tid, uint32 *exit_code) {
+    dispatcher_t *d;
+
+    if (obj == NULL || obj->type != &thread_type) {
+        return -22;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d == NULL || !d->in_use) {
+        return -22;
+    }
+    if (tid != NULL) {
+        *tid = d->tid;
+    }
+    if (exit_code != NULL) {
+        *exit_code = d->exit_code;
+    }
+    return d->signalled;
 }
 
 /* --- naming -------------------------------------------------------------- */
@@ -486,6 +580,7 @@ void dispatch_init(void) {
     (void)ob_register_type(&event_type);
     (void)ob_register_type(&semaphore_type);
     (void)ob_register_type(&mutant_type);
+    (void)ob_register_type(&thread_type);
 
     /* After \ObjectTypes exists, and after the three above are registered -
      * this is the sweep that publishes everything anybody registered before

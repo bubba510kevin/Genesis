@@ -98,7 +98,7 @@ def main():
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
 
-    commands = sys.argv[1:] or ["/bin/verif", "/bin/systest"]
+    commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)
@@ -133,7 +133,7 @@ def main():
             # through and quit QEMU under it - reporting fewer passes and no
             # failures, which is the worst thing a test runner can do.
             pos = wait_for(log,
-                           r"^(verification|systest): \d+ passed, \d+ failed",
+                           r"^[A-Za-z0-9_.-]+: \d+ passed, \d+ failed",
                            600, since=pos)
             if pos < 0:
                 print(f"guest_run: {cmd} produced no tally", file=sys.stderr)

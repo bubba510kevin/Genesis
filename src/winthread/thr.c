@@ -1,0 +1,272 @@
+/* thr.exe - Win32 threads, from a Windows program that knows nothing about
+ * Genesis. ROADMAP item 14(a)'s ring-3 check.
+ *
+ * Imports kernel32.dll alone, like k32.exe: CreateThread, WaitForSingleObject,
+ * GetExitCodeThread and the rest, exactly as any Win32 program calls them.
+ * What it proves is the thing a single-threaded process cannot show:
+ *
+ *   - a thread really runs, concurrently, with its own stack;
+ *   - it has its OWN TEB - GetCurrentThreadId and GetLastError are per
+ *     thread, which they cannot be while every thread reads one GS:0;
+ *   - a start routine that RETURNS ends the thread with that value
+ *     (RtlUserThreadStart), and ExitThread does the same from deeper down;
+ *   - its handle is waitable, is unsignalled while it runs (WAIT_TIMEOUT,
+ *     STILL_ACTIVE) and signalled after, with the exit code intact;
+ *   - more threads can be created over a process's life than there are
+ *     slots at once - dead ones are reclaimed, TEB and stack included;
+ *   - ExitProcess ends the process even with a thread still running.
+ *
+ * Every check prints ok/FAIL, and the last line is a tally in systest's
+ * shape so tools/guest_run.py can wait for it.
+ */
+
+#include "../kernel32/kernel32.h"
+
+static HANDLE out;
+static int passes, failures;
+
+static void say(const char *s) {
+    DWORD n = 0, written = 0;
+
+    while (s[n] != '\0') {
+        n++;
+    }
+    WriteFile(out, s, n, &written, NULL_PTR);
+}
+
+static void say_u(DWORD v) {
+    char buf[12];
+    int i = 11;
+
+    buf[i] = '\0';
+    do {
+        buf[--i] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+    say(&buf[i]);
+}
+
+static void check(int cond, const char *what) {
+    say(cond ? "  ok    " : "  FAIL  ");
+    say(what);
+    say("\r\n");
+    if (cond) passes++; else failures++;
+}
+
+/* --- the workers -------------------------------------------------------- */
+
+#define WORKERS 4
+#define ROUNDS  2000
+
+static volatile LONG counter;
+static volatile DWORD seen_tid[WORKERS];
+static volatile int   own_error_ok[WORKERS];
+static volatile int   stack_ok[WORKERS];
+
+static DWORD WINAPI worker(LPVOID param) {
+    int i = (int)(SIZE_T)param;
+    int r;
+    char probe;                              /* an address on THIS stack */
+    /* Through kernel32's forwarder rather than ntdll's own export, so this
+     * program keeps importing kernel32 alone. */
+    PTEB teb = (PTEB)K32CurrentTeb();
+
+    seen_tid[i] = GetCurrentThreadId();
+    stack_ok[i] = ((SIZE_T)&probe < (SIZE_T)teb->StackBase &&
+                   (SIZE_T)&probe >= (SIZE_T)teb->StackLimit);
+
+    /* Set, then do enough work that the scheduler will have run the other
+     * workers in between, then read back. One shared TEB would hand back
+     * whichever worker wrote last. */
+    SetLastError(1000 + (DWORD)i);
+    for (r = 0; r < ROUNDS; r++) {
+        __sync_fetch_and_add(&counter, 1);
+    }
+    own_error_ok[i] = (GetLastError() == 1000 + (DWORD)i);
+
+    return 100 + (DWORD)i;                   /* RtlUserThreadStart's job */
+}
+
+static void deeper_exit(void) {
+    ExitThread(55);                          /* never returns */
+}
+
+static DWORD WINAPI exiter(LPVOID param) {
+    (void)param;
+    deeper_exit();
+    return 1;                                /* not reached */
+}
+
+static volatile int go;
+
+static DWORD WINAPI waiter(LPVOID param) {
+    (void)param;
+    while (!go) {
+    }
+    return 7;
+}
+
+static DWORD WINAPI quick(LPVOID param) {
+    return (DWORD)(SIZE_T)param;
+}
+
+static DWORD WINAPI forever(LPVOID param) {
+    (void)param;
+    for (;;) {
+        __asm__ volatile ("" ::: "memory");  /* a loop, not UB to delete */
+    }
+    return 0;                                /* not reached */
+}
+
+void start(void) {
+    HANDLE h[WORKERS];
+    DWORD tid_reported[WORKERS];
+    DWORD main_tid, code;
+    int i, j, ok;
+
+    out = GetStdHandle(STD_OUTPUT_HANDLE);
+    say("thr: Win32 threads\r\n");
+
+    main_tid = GetCurrentThreadId();
+    SetLastError(7);
+
+    /* --- four workers, concurrently -------------------------------------- */
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        h[i] = CreateThread(NULL_PTR, 0, worker, (LPVOID)(SIZE_T)i, 0,
+                            &tid_reported[i]);
+        if (h[i] == NULL_PTR) {
+            ok = 0;
+        }
+    }
+    check(ok, "CreateThread x4 returns four handles");
+    if (!ok) {
+        say("thr: cannot continue without threads\r\n");
+        ExitProcess(1);
+    }
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (WaitForSingleObject(h[i], INFINITE) != WAIT_OBJECT_0) {
+            ok = 0;
+        }
+    }
+    check(ok, "WaitForSingleObject returns WAIT_OBJECT_0 for each");
+
+    check(counter == WORKERS * ROUNDS,
+          "the shared counter saw every increment from every thread");
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (!GetExitCodeThread(h[i], &code) || code != 100 + (DWORD)i) {
+            ok = 0;
+        }
+    }
+    check(ok, "each exit code is its start routine's RETURN value");
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (seen_tid[i] == 0 || seen_tid[i] == main_tid ||
+            seen_tid[i] != tid_reported[i] ||
+            GetThreadId(h[i]) != tid_reported[i]) {
+            ok = 0;
+        }
+        for (j = 0; j < i; j++) {
+            if (seen_tid[j] == seen_tid[i]) {
+                ok = 0;
+            }
+        }
+    }
+    check(ok, "every thread has its own id - from its own TEB - matching "
+              "what CreateThread and GetThreadId report");
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (!own_error_ok[i]) {
+            ok = 0;
+        }
+    }
+    check(ok, "GetLastError is per thread: each read back its own value");
+    check(GetLastError() == 7,
+          "and the main thread's is untouched by all four");
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (!stack_ok[i]) {
+            ok = 0;
+        }
+    }
+    check(ok, "each thread runs on its own stack, inside its TEB's bounds");
+
+    ok = 1;
+    for (i = 0; i < WORKERS; i++) {
+        if (!CloseHandle(h[i])) {
+            ok = 0;
+        }
+    }
+    check(ok, "the handles close");
+
+    /* --- ExitThread from inside a call ----------------------------------- */
+    h[0] = CreateThread(NULL_PTR, 0, exiter, NULL_PTR, 0, NULL_PTR);
+    check(h[0] != NULL_PTR &&
+          WaitForSingleObject(h[0], INFINITE) == WAIT_OBJECT_0 &&
+          GetExitCodeThread(h[0], &code) && code == 55,
+          "ExitThread(55) from a nested call ends the thread with 55");
+    CloseHandle(h[0]);
+
+    /* --- a running thread's handle is not signalled ---------------------- */
+    h[0] = CreateThread(NULL_PTR, 0, waiter, NULL_PTR, 0, NULL_PTR);
+    check(h[0] != NULL_PTR &&
+          WaitForSingleObject(h[0], 0) == WAIT_TIMEOUT,
+          "a zero-timeout wait on a RUNNING thread is WAIT_TIMEOUT");
+    check(GetExitCodeThread(h[0], &code) && code == STILL_ACTIVE,
+          "and its exit code reads STILL_ACTIVE");
+    go = 1;
+    check(WaitForSingleObject(h[0], INFINITE) == WAIT_OBJECT_0 &&
+          GetExitCodeThread(h[0], &code) && code == 7,
+          "released, it finishes, and the wait sees it");
+    CloseHandle(h[0]);
+
+    /* --- more threads than slots, over time ------------------------------ */
+    ok = 1;
+    for (i = 0; i < 40; i++) {
+        HANDLE q = CreateThread(NULL_PTR, 0, quick, (LPVOID)(SIZE_T)i, 0,
+                                NULL_PTR);
+
+        if (q == NULL_PTR ||
+            WaitForSingleObject(q, INFINITE) != WAIT_OBJECT_0 ||
+            !GetExitCodeThread(q, &code) || code != (DWORD)i) {
+            ok = 0;
+            say("  (failed at thread ");
+            say_u((DWORD)i);
+            say(")\r\n");
+            if (q != NULL_PTR) {
+                CloseHandle(q);
+            }
+            break;
+        }
+        CloseHandle(q);
+    }
+    check(ok, "forty threads created and joined one after another - more "
+              "than the process table holds at once, so dead ones are "
+              "really reclaimed");
+
+    /* --- refusals --------------------------------------------------------- */
+    check(CreateThread(NULL_PTR, 0, worker, NULL_PTR, CREATE_SUSPENDED,
+                       NULL_PTR) == NULL_PTR &&
+          GetLastError() == ERROR_CALL_NOT_IMPLEMENTED,
+          "CREATE_SUSPENDED is refused, not silently ignored");
+
+    /* --- ExitProcess with a thread still running ------------------------- */
+    h[0] = CreateThread(NULL_PTR, 0, forever, NULL_PTR, 0, NULL_PTR);
+    check(h[0] != NULL_PTR, "a thread that never ends is started");
+    say("  (ExitProcess now, with it still running - the shell prompt "
+        "coming back is the check)\r\n");
+
+    say("\r\nthr: ");
+    say_u((DWORD)passes);
+    say(" passed, ");
+    say_u((DWORD)failures);
+    say(" failed\r\n");
+    ExitProcess((DWORD)failures);
+}

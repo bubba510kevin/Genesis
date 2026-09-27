@@ -11,6 +11,8 @@
 #include "syscall.h"
 #include "waitq.h"
 #include "process.h"
+#include "dispatch.h"
+#include "teb.h"
 #include "tty.h"
 #include "typesk.h"
 
@@ -137,6 +139,11 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->owns_sighand = 1;
     current->tgid         = current->pid;
     current->clear_child_tid = 0;
+    current->nt_thread_obj   = NULL;
+    current->nt_teb_va       = 0;
+    current->nt_stack_lo     = 0;
+    current->nt_stack_pages  = 0;
+    current->nt_thread_start = 0;
     current->run_ticks       = 0;
     current->sleep_ticks     = 0;
     current->cpu_ticks       = 0;
@@ -246,16 +253,59 @@ static int is_kernel_thread(const process_t *t) {
     return t->is_kthread != 0;
 }
 
+/* Non-zero while any OTHER task of `leader`'s thread group is not yet a
+ * zombie. A group leader that has exited (SYS_exit, one thread) while its
+ * threads run on is not reapable: reaping frees the slot, and the leader
+ * owns the address space, so wait4 would destroy the memory the rest of the
+ * group is executing in. Linux keeps such a leader a zombie until the group
+ * is empty, and so does this. */
+static int group_has_live_threads(const process_t *leader) {
+    int i;
+
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        const process_t *t = &table[i];
+
+        if (t == leader || t->state == PROC_UNUSED ||
+            t->state == PROC_ZOMBIE || is_kernel_thread(t)) {
+            continue;
+        }
+        if (t->tgid == leader->pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 process_t *proc_reap_child(process_t *p) {
     int i;
 
     for (i = 0; i < MAX_PROCESSES; i++) {
         if (table[i].state == PROC_ZOMBIE && table[i].ppid == p->pid &&
-            !is_kernel_thread(&table[i]) && !is_thread_of(&table[i], p)) {
+            !is_kernel_thread(&table[i]) && !is_thread_of(&table[i], p) &&
+            !group_has_live_threads(&table[i])) {
             return &table[i];
         }
     }
     return NULL;
+}
+
+void proc_reap_threads(void) {
+    int i;
+
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = &table[i];
+
+        /* A non-leader thread that has exited. Its status is nobody's -
+         * wait4 does not report threads - so there is nothing to keep the
+         * slot for. `current` is skipped for the reason kthread_reap skips
+         * it: the dying thread may still be the one standing on its own
+         * kernel stack, and proc_free would pull it out from under it. */
+        if (t == current || t->state != PROC_ZOMBIE ||
+            is_kernel_thread(t) || t->tgid == t->pid) {
+            continue;
+        }
+        proc_free(t);
+    }
 }
 
 int proc_has_children(const process_t *p) {
@@ -348,6 +398,11 @@ process_t *proc_alloc(int ppid) {
             p->owns_sighand  = 1;
             p->tgid          = p->pid;
             p->clear_child_tid = 0;
+            p->nt_thread_obj   = NULL;
+            p->nt_teb_va       = 0;
+            p->nt_stack_lo     = 0;
+            p->nt_stack_pages  = 0;
+            p->nt_thread_start = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
@@ -404,6 +459,11 @@ void proc_retire(process_t *p, int exit_status) {
     }
     p->exit_status = exit_status;
     p->state       = PROC_ZOMBIE;
+
+    /* An NT thread retired from outside - its process exiting, or a fault
+     * it could not survive - still has waiters on its Thread object, and
+     * they must be released now rather than when the slot is reaped. */
+    proc_nt_thread_exit(p, (uint32)exit_status);
 
     /* Off any wait queue, before anything else.
      *
@@ -466,6 +526,40 @@ void proc_retire(process_t *p, int exit_status) {
     sched_dequeue(p);
 }
 
+void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
+    uint64 i;
+
+    if (p == NULL) {
+        return;
+    }
+    if (p->nt_thread_obj != NULL) {
+        thread_object_exited(p->nt_thread_obj, exit_code);
+        ob_deref(p->nt_thread_obj);
+        p->nt_thread_obj = NULL;
+    }
+    /* The stack and TEB live in an address space the rest of the group is
+     * still using, so they go page by page rather than with the space. Only
+     * while the space is still there: a thread reaped after its whole group
+     * has gone has nothing left to unmap. The thread itself is either not
+     * running or running on its KERNEL stack, so nothing is still standing
+     * on the user stack being taken away. */
+    if (p->space != NULL && p->space != vmm_kernel_space()) {
+        for (i = 0; i < p->nt_stack_pages; i++) {
+            vmm_unmap_page_in(p->space, p->nt_stack_lo + i * 0x1000ULL,
+                              VMM_FREE_FRAME);
+        }
+        if (p->nt_teb_va != 0) {
+            for (i = 0; i < NT_TEB_PAGES; i++) {
+                vmm_unmap_page_in(p->space, p->nt_teb_va + i * 0x1000ULL,
+                                  VMM_FREE_FRAME);
+            }
+        }
+    }
+    p->nt_stack_pages = 0;
+    p->nt_stack_lo    = 0;
+    p->nt_teb_va      = 0;
+}
+
 void proc_free(process_t *p) {
     if (p == NULL || p == current) {
         return;
@@ -477,6 +571,11 @@ void proc_free(process_t *p) {
      * matters precisely when the slot is recycled, so the last function to
      * touch the slot should be the one that guarantees it. */
     waitq_leave(p);
+    /* Normally a no-op - both exit paths got here first. Repeated for the
+     * same reason as waitq_leave above: a slot freed without passing
+     * through either must not carry a Thread object reference, or a mapped
+     * TEB, into its next life. */
+    proc_nt_thread_exit(p, 0);
     if (p->owns_files) {
         handle_close_all(p->handles);
     }

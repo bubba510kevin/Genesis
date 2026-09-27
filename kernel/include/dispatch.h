@@ -69,6 +69,15 @@ object_t *mutant_create(int owned);
  *
  * Returns 0 and stores the object (caller owns the reference), -EEXIST if the
  * name is taken, or another negative errno. */
+/* An NT thread's waitable half - see OBJ_THREAD in object.h. Created
+ * unsignalled for thread `tid`; thread_object_exited signals it for good
+ * with the thread's 32-bit exit code (the first call wins). query returns
+ * 1 if the thread has exited, 0 if it is still running, or -EINVAL if `obj`
+ * is not a thread; *exit_code is only meaningful after an exit. */
+object_t *thread_object_create(int tid);
+void thread_object_exited(object_t *obj, uint32 exit_code);
+int thread_object_query(object_t *obj, int *tid, uint32 *exit_code);
+
 int dispatch_create_named(const char *name, object_t *obj);
 
 /* Look up a named dispatcher object. Returns it with a reference taken, or

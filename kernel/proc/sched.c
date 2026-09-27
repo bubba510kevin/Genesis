@@ -191,6 +191,9 @@ void schedule(void) {
      * Before pick_next, not after, so a freed slot is not a candidate on the
      * same pass that freed it. */
     kthread_reap();
+    /* And user threads, for the same reason and with the same guarantee -
+     * see proc_reap_threads. */
+    proc_reap_threads();
 
     next = policy->pick_next();
     if (next == NULL || next == prev) {

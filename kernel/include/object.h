@@ -119,7 +119,15 @@ typedef enum {
     /* A BSD socket behind a descriptor. Its own class because stat must
      * report S_IFSOCK - a program that fstat's a descriptor to find out what
      * it is holding gets the wrong answer from any of the others. */
-    OBJ_SOCKET
+    OBJ_SOCKET,
+
+    /* An NT thread, as a handle sees it: a dispatcher object that becomes
+     * signalled - permanently - when the thread exits, and that carries the
+     * exit code. It is NOT the schedulable thing itself (that is a
+     * process_t); it is what WaitForSingleObject on a thread handle waits on
+     * and what GetExitCodeThread reads, and it outlives the thread for as
+     * long as anyone holds a handle to it. */
+    OBJ_THREAD
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

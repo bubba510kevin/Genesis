@@ -73,6 +73,44 @@ struct syscall_frame;
  * kernel/include/ntsec.h for what is and is not a translation. */
 #define NT_SYS_QUERY_SECURITY     0x11
 
+/* --- threads (ROADMAP item 14(a)) ------------------------------------------
+ *
+ * NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK, POBJECT_ATTRIBUTES,
+ *                  HANDLE ProcessHandle, PVOID StartRoutine, PVOID Argument,
+ *                  ULONG CreateFlags, SIZE_T ZeroBits, SIZE_T StackSize,
+ *                  SIZE_T MaximumStackSize, PVOID AttributeList)
+ *
+ * Eleven arguments, seven of them on the stack. ProcessHandle must be
+ * NtCurrentProcess() - another process's threads need NtCreateProcess, which
+ * does not exist - and CreateFlags may not ask for THREAD_CREATE_FLAGS_
+ * CREATE_SUSPENDED, since there is no NtResumeThread to undo it; both are
+ * STATUS_NOT_IMPLEMENTED, not silently ignored.
+ *
+ * The new thread starts in ntdll!RtlUserThreadStart, as on NT, with a
+ * private TEB (GS:0 is its own, so GetCurrentThreadId and GetLastError are
+ * per thread) and a private stack. ONE deliberate difference from NT, in a
+ * place only our own ntdll can see: NT enters RtlUserThreadStart with
+ * StartRoutine in RCX and Argument in RDX. This kernel leaves ring 0 by
+ * SYSRET, which spends RCX on the return RIP, so it passes StartRoutine in
+ * RDX and Argument in R8 instead. */
+#define NT_SYS_CREATE_THREAD      0x12
+
+/* NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus). Only the calling
+ * thread (NtCurrentThread(), or a handle to itself) - terminating ANOTHER
+ * thread asynchronously is the one thread operation even Microsoft's own
+ * documentation says never to use, and doing it safely here would need the
+ * APC machinery (14(b)). STATUS_NOT_IMPLEMENTED for anything else. */
+#define NT_SYS_TERMINATE_THREAD   0x13
+
+/* NtQueryInformationThread(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG)
+ * for ThreadBasicInformation (0) only - which is what GetExitCodeThread and
+ * GetThreadId are built on. Other classes are STATUS_INVALID_INFO_CLASS. */
+#define NT_SYS_QUERY_THREAD       0x14
+
+#define NT_CURRENT_THREAD         0xFFFFFFFFFFFFFFFEULL    /* (HANDLE)-2 */
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
+#define ThreadBasicInformation    0
+
 /* SECURITY_INFORMATION bits, as passed in argument two. */
 #define OWNER_SECURITY_INFORMATION 0x00000001u
 #define GROUP_SECURITY_INFORMATION 0x00000002u
@@ -147,6 +185,11 @@ struct syscall_frame;
 #define STATUS_ACCESS_DENIED      0xC0000022u
 #define STATUS_NAME_TOO_LONG      0xC0000106u
 #define STATUS_NO_MEMORY          0xC0000017u
+#define STATUS_PENDING            0x00000103u  /* also STILL_ACTIVE, 259 */
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
+#define STATUS_INVALID_INFO_CLASS 0xC0000003u
+#define STATUS_NOT_SUPPORTED      0xC00000BBu
+#define STATUS_INSUFFICIENT_RESOURCES 0xC000009Au
 
 /* NTSTATUS values the dispatcher objects need.
  *

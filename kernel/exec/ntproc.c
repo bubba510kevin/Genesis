@@ -155,6 +155,46 @@ int nt_process_init(address_space_t *as, uint64 image_base,
     return 0;
 }
 
+/* --- a TEB for a thread that is not the first ---------------------------
+ *
+ * The same five fields nt_process_init writes for the main thread, into a
+ * fresh block at `teb_va`. The PEB is NOT touched and NOT duplicated: it is
+ * per process, and a second thread's TEB points at the one the main thread's
+ * does - which is exactly what makes GetCurrentProcessId agree across
+ * threads while GetCurrentThreadId does not. */
+int nt_thread_teb_init(address_space_t *as, uint64 teb_va, uint64 stack_top,
+                       uint64 stack_size, int pid, int tid) {
+    nt_teb_t *teb;
+    int rc;
+
+    if (as == NULL || (teb_va & 0xFFF) != 0) {
+        return -22;
+    }
+    rc = map_zeroed(as, teb_va, NT_TEB_PAGES);
+    if (rc != 0) {
+        return rc;
+    }
+    teb = (nt_teb_t *)window(as, teb_va);
+    if (teb == NULL) {
+        return -12;
+    }
+    teb->stack_base        = stack_top;
+    teb->stack_limit       = stack_top - stack_size;
+    teb->self              = teb_va;
+    teb->peb               = NT_PEB_BASE;
+    teb->client_id_process = (uint64)pid;
+    teb->client_id_thread  = (uint64)tid;
+    return 0;
+}
+
+/* Map `pages` zeroed user pages at `va` - a new thread's stack. Exported
+ * for NtCreateThreadEx rather than re-implemented there; same reason as the
+ * TEB above: one function that knows how to put zeroed user memory into a
+ * space through the direct map. */
+int nt_map_zeroed(address_space_t *as, uint64 va, uint64 pages) {
+    return map_zeroed(as, va, pages);
+}
+
 /* --- the parameters block ------------------------------------------------
  *
  * Written through the direct map a page at a time, like everything else that

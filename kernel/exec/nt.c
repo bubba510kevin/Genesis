@@ -9,6 +9,8 @@
 #include "fileobj.h"
 #include "object.h"
 #include "process.h"
+#include "sched.h"
+#include "teb.h"
 #include "screen.h"
 #include "syscall.h"
 #include "tty.h"
@@ -118,8 +120,14 @@ static uint64 nt_terminate_process(uint64 handle, uint64 status,
     }
     /* Straight into the shared exit path. Ending a process is mechanism, not
      * ABI - the reaping, the SIGCHLD to a Linux parent, the vfork resume are
-     * all the same regardless of which number asked. */
-    return syscall_exit_process(status & 0xFF, frame);
+     * all the same regardless of which number asked.
+     *
+     * The GROUP path, not the single-thread one. With threads, "terminate
+     * the process" and "end this thread" came apart: ExitProcess called
+     * with a worker still running used to end only the caller, leaving the
+     * process a zombie leader with a live thread in it - on NT, and here
+     * now, every thread goes. */
+    return syscall_exit_group(status & 0xFF, frame);
 }
 
 
@@ -912,6 +920,256 @@ static uint64 nt_release_mutant(uint64 handle, uint64 prev_ptr) {
     return STATUS_SUCCESS;
 }
 
+/* --- threads (ROADMAP item 14(a)) -------------------------------------------
+ *
+ * See NT_SYS_CREATE_THREAD in nt.h for the contract and the one register
+ * difference from NT. The thread itself is an ordinary task of the process's
+ * thread group - the same kind clone() makes, through the same constructor
+ * (proc_spawn_thread) - plus the three things only an NT thread has: its own
+ * TEB, so GS:0 and everything read through it is per thread; its own stack
+ * in the fixed thread region; and a Thread object for its handle. */
+
+static uint64 nt_create_thread(struct syscall_frame *frame) {
+    process_t *p = proc_current();
+    uint64 handle_out = frame->r10;
+    uint64 process    = frame->r9;
+    uint64 rsp        = syscall_get_user_rsp();
+    uint64 start = 0, arg = 0, flags = 0, stack_size = 0;
+    uint64 pages, stack_top, stack_lo, teb_va, i;
+    struct syscall_frame f;
+    object_t *tobj;
+    process_t *t;
+    int slot = -1;
+
+    if (!nt_stack_arg(rsp, 5, &start) || !nt_stack_arg(rsp, 6, &arg) ||
+        !nt_stack_arg(rsp, 7, &flags) || !nt_stack_arg(rsp, 9, &stack_size)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    flags = (uint32)flags;           /* a ULONG: see nt_stack_arg */
+    if (!user_ptr_ok(handle_out) || !user_ptr_ok(handle_out + 7)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (process != NT_CURRENT_PROCESS) {
+        return STATUS_NOT_IMPLEMENTED;   /* another process: no such thing */
+    }
+    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) {
+        return STATUS_NOT_IMPLEMENTED;   /* nothing could ever resume it */
+    }
+    if (start == 0 || !user_ptr_ok(start)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (p->nt_thread_start == 0 || p->space == NULL ||
+        p->space == vmm_kernel_space()) {
+        return STATUS_NOT_SUPPORTED;     /* no ntdll to start it in */
+    }
+
+    /* The stack: what was asked for, or the main thread's 64KB, rounded to
+     * pages and capped one page short of the slot so the guard page below
+     * it always stays unmapped. Committed up front - there is no demand
+     * paging to grow it later, and a stack that faults at its second page
+     * is worse than a smaller one that is honest about its size. */
+    if (stack_size == 0) {
+        stack_size = NT_THREAD_STACK_DEFAULT;
+    }
+    if (stack_size > NT_THREAD_STACK_STRIDE - 0x1000ULL) {
+        stack_size = NT_THREAD_STACK_STRIDE - 0x1000ULL;
+    }
+    pages = (stack_size + 0xFFFULL) / 0x1000ULL;
+    if (pages < 2) {
+        pages = 2;
+    }
+
+    for (i = 0; i < NT_THREAD_SLOTS; i++) {
+        if (vmm_get_phys_in(p->space, NT_THREAD_TEB_BASE +
+                                      i * NT_THREAD_TEB_STRIDE) == 0) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    teb_va    = NT_THREAD_TEB_BASE + (uint64)slot * NT_THREAD_TEB_STRIDE;
+    stack_top = NT_THREAD_STACK_BASE +
+                ((uint64)slot + 1) * NT_THREAD_STACK_STRIDE;
+    stack_lo  = stack_top - pages * 0x1000ULL;
+
+    if (nt_map_zeroed(p->space, stack_lo, pages) != 0) {
+        for (i = 0; i < pages; i++) {
+            vmm_unmap_page_in(p->space, stack_lo + i * 0x1000ULL,
+                              VMM_FREE_FRAME);
+        }
+        return STATUS_NO_MEMORY;
+    }
+
+    /* How it starts. RtlUserThreadStart(StartRoutine in RDX, Argument in
+     * R8) - see nt.h. Every other register is zeroed rather than inherited
+     * from the creator's syscall, so nothing of the creating thread's
+     * state leaks into the new one's first instruction. RSP is 40 below
+     * the 16-aligned top: a zero return address (a start routine may not
+     * return through it - RtlUserThreadStart never does) with the 32-byte
+     * home area above it, which is exactly the stack a Win64 function
+     * expects to be entered with. */
+    f        = *frame;
+    f.rax    = 0;
+    f.rdi    = 0;
+    f.rsi    = 0;
+    f.rdx    = start;
+    f.r10    = 0;
+    f.r8     = arg;
+    f.r9     = 0;
+    f.rip    = p->nt_thread_start;
+    f.rbx    = 0;
+    f.rbp    = 0;
+    f.r12    = 0;
+    f.r13    = 0;
+    f.r14    = 0;
+    f.r15    = 0;
+
+    t = proc_spawn_thread(p, &f, stack_top - 40, p->thread.fs_base, teb_va);
+    if (t == NULL) {
+        for (i = 0; i < pages; i++) {
+            vmm_unmap_page_in(p->space, stack_lo + i * 0x1000ULL,
+                              VMM_FREE_FRAME);
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    /* Recorded before anything else can fail, so every failure below is
+     * undone by proc_free alone - it runs proc_nt_thread_exit, which unmaps
+     * exactly what these name. */
+    t->nt_stack_lo    = stack_lo;
+    t->nt_stack_pages = pages;
+    if (nt_thread_teb_init(p->space, teb_va, stack_top, pages * 0x1000ULL,
+                           p->tgid, t->pid) != 0) {
+        t->nt_teb_va = teb_va;           /* partially mapped: unmap it too */
+        proc_free(t);
+        return STATUS_NO_MEMORY;
+    }
+    t->nt_teb_va = teb_va;
+
+    /* Two references: the thread's own, dropped when it exits (after it
+     * has signalled the object), and the handle's, dropped by NtClose. */
+    tobj = thread_object_create(t->pid);
+    if (tobj == NULL) {
+        proc_free(t);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    t->nt_thread_obj = tobj;
+    ob_ref(tobj);
+    {
+        uint64 st = nt_handle_out(tobj, handle_out,
+                                  ACCESS_READ | ACCESS_WRITE);
+
+        if (st != STATUS_SUCCESS) {
+            proc_free(t);
+            return st;
+        }
+    }
+
+    t->state = PROC_READY;
+    sched_enqueue(t);
+    return STATUS_SUCCESS;
+}
+
+/* NtTerminateThread(HANDLE, NTSTATUS). The caller itself only - see nt.h. */
+static uint64 nt_terminate_thread(uint64 handle, uint64 status,
+                                  struct syscall_frame *frame) {
+    process_t *p = proc_current();
+
+    if (handle != NT_CURRENT_THREAD && handle != 0) {
+        object_t *obj = nt_object_of(handle);
+
+        if (obj == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if (obj->type->klass != OBJ_THREAD) {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        if (obj != p->nt_thread_obj) {
+            return STATUS_NOT_IMPLEMENTED;   /* another thread: see nt.h */
+        }
+    }
+    /* The full 32-bit code, first - GetExitCodeThread reports it, and the
+     * exit path below only has room for a POSIX status's eight bits. */
+    if (p->nt_thread_obj != NULL) {
+        thread_object_exited(p->nt_thread_obj, (uint32)status);
+    }
+    /* One thread's exit, not the process's: the rest of the group runs on.
+     * (When this is the last thread, the process ends with it - there is
+     * nothing left to run in it - and its parent is told the ordinary way.) */
+    return syscall_exit_process(status & 0xFF, frame);
+}
+
+/* NtQueryInformationThread(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG),
+ * ThreadBasicInformation only. */
+typedef struct {
+    uint32 exit_status;               /* 0x00 STATUS_PENDING while running */
+    uint32 pad0;
+    uint64 teb_base;                  /* 0x08 */
+    uint64 unique_process;            /* 0x10 CLIENT_ID */
+    uint64 unique_thread;             /* 0x18 */
+    uint64 affinity_mask;             /* 0x20 */
+    int32  priority;                  /* 0x28 */
+    int32  base_priority;             /* 0x2C */
+} nt_thread_basic_info_t;
+
+typedef char nt_tbi_layout[(sizeof(nt_thread_basic_info_t) == 0x30 &&
+    __builtin_offsetof(nt_thread_basic_info_t, unique_thread) == 0x18)
+    ? 1 : -1];
+
+static uint64 nt_query_thread(uint64 handle, uint64 info_class,
+                              uint64 buf, uint64 len, uint64 retlen_ptr) {
+    process_t *p = proc_current();
+    nt_thread_basic_info_t tbi;
+
+    if ((uint32)info_class != ThreadBasicInformation) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if ((uint32)len < sizeof(tbi)) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_ptr_ok(buf) || !user_ptr_ok(buf + sizeof(tbi) - 1)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    tbi.pad0           = 0;
+    tbi.unique_process = (uint64)p->tgid;
+    tbi.affinity_mask  = 1;           /* one CPU runs user code */
+    tbi.priority       = 8;           /* THREAD_PRIORITY_NORMAL's base */
+    tbi.base_priority  = 0;
+
+    if (handle == NT_CURRENT_THREAD) {
+        tbi.exit_status   = STATUS_PENDING;
+        tbi.teb_base      = p->thread.gs_base;
+        tbi.unique_thread = (uint64)p->pid;
+    } else {
+        object_t *obj = nt_object_of(handle);
+        uint32 code = 0;
+        int tid = 0, exited;
+        process_t *t;
+
+        if (obj == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+        exited = thread_object_query(obj, &tid, &code);
+        if (exited < 0) {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        tbi.exit_status   = exited ? code : STATUS_PENDING;
+        tbi.unique_thread = (uint64)tid;
+        t = exited ? NULL : proc_find(tid);
+        tbi.teb_base      = (t != NULL && t->tgid == p->tgid)
+                                ? t->thread.gs_base : 0;
+    }
+
+    *(nt_thread_basic_info_t *)buf = tbi;
+    if (retlen_ptr != 0 && user_ptr_ok(retlen_ptr) &&
+        user_ptr_ok(retlen_ptr + 3)) {
+        *(uint32 *)retlen_ptr = (uint32)sizeof(tbi);
+    }
+    return STATUS_SUCCESS;
+}
+
 static uint64 nt_trace(uint64 number, uint64 status) {
 #if NT_TRACE_FAILURES
     if (status != STATUS_SUCCESS) {
@@ -1033,6 +1291,22 @@ uint64 nt_syscall_dispatch(struct syscall_frame *frame) {
             return nt_trace(frame->rax,
                             nt_query_security(frame->r10, frame->rdx,
                                               frame->r8, frame->r9, needed));
+        }
+
+        case NT_SYS_CREATE_THREAD:
+            return nt_trace(frame->rax, nt_create_thread(frame));
+
+        case NT_SYS_TERMINATE_THREAD:
+            /* Not traced: on success it does not return to this caller. */
+            return nt_terminate_thread(frame->r10, frame->rdx, frame);
+
+        case NT_SYS_QUERY_THREAD: {
+            uint64 retlen = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &retlen);
+            return nt_trace(frame->rax,
+                            nt_query_thread(frame->r10, frame->rdx,
+                                            frame->r8, frame->r9, retlen));
         }
 
         default:

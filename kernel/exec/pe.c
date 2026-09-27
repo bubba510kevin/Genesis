@@ -232,6 +232,7 @@ static int validate(const void *image, uint64 size, pe_info_t *info,
     info->relocated      = 0;
     info->has_imports    = opt->number_of_rva_and_sizes > PE_DIR_IMPORT &&
                            opt->directory[PE_DIR_IMPORT].size != 0;
+    info->thread_start   = 0;    /* set only by pe_load_executable's link */
     return PE_OK;
 }
 
@@ -1169,6 +1170,7 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
     if (rc != PE_OK) {
         return rc;
     }
+    info->thread_start = 0;
     if (!info->has_imports) {
         return PE_OK;                    /* nothing to link */
     }
@@ -1183,7 +1185,22 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
         ctx.modules[i].name[0] = '\0';
         ctx.modules[i].base = 0;
     }
-    return resolve_imports(&ctx, info->image_base);
+    rc = resolve_imports(&ctx, info->image_base);
+    if (rc != PE_OK) {
+        return rc;
+    }
+    /* Absent is not an error: a program that imports no ntdll, or an ntdll
+     * too old to export it, links and runs - it just cannot create threads,
+     * and NtCreateThreadEx says so when asked. */
+    {
+        uint64 ntdll = module_lookup(&ctx, "ntdll.dll");
+        uint64 at = 0;
+
+        if (ntdll != 0 && find_export(&ctx, ntdll, "RtlUserThreadStart", &at)) {
+            info->thread_start = at;
+        }
+    }
+    return PE_OK;
 }
 
 /* Kernel-mode driver load - see pe.h. Mirrors pe_load_executable exactly,

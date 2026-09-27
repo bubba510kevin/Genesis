@@ -1729,6 +1729,105 @@ static void test_fork(void) {
              "a second wait4 with no children is -ECHILD");
 }
 
+/* --- real threads, raw -----------------------------------------------------
+ *
+ * clone() with the thread flags, no libc: a new task on a stack of our own
+ * that shares this address space. Two things were wrong with threads and
+ * neither showed while everything ran as root and made one thread:
+ *
+ *   - the thread path did not copy credentials, so a thread created by a
+ *     process that had dropped to uid 1000 ran as uid 0;
+ *   - an exited thread was never freed (wait4 rightly skips threads, and
+ *     nothing else reaped them), so each one held a process slot forever
+ *     and clone failed with -EAGAIN after about a dozen.
+ *
+ * The child's first instructions have to be assembly: it resumes inside
+ * this function's frame on a DIFFERENT stack, where no C frame exists. So
+ * the branch is taken in asm, the child calls `fn` on its fresh stack and
+ * exits with SYS_exit (one thread), and only the parent returns into C.
+ *
+ * Joined with CLONE_CHILD_CLEARTID - the kernel zeroes *ctid when the
+ * thread is gone, which is pthread_join's whole mechanism - so the stack is
+ * never reused while the previous thread is still standing on it. */
+#define CLONE_THREAD_FLAGS (0x100 | 0x200 | 0x400 | 0x800 | 0x10000)
+#define CLONE_CHILD_CLEARTID_F 0x00200000
+
+static u8 thr_stack[16384] __attribute__((aligned(16)));
+static volatile int thr_ctid;
+static volatile i64 thr_seen_uid;
+
+static void thr_body(void) {
+    thr_seen_uid = sc0(SYS_getuid);
+}
+
+static i64 raw_thread(void (*fn)(void)) {
+    i64 ret;
+    register i64 r10 __asm__("r10") = 0;                      /* tls  */
+    register i64 r8  __asm__("r8")  = (i64)&thr_ctid;         /* ctid */
+
+    thr_ctid = 1;
+    __asm__ volatile (
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jnz 1f\n\t"
+        "call *%%rbx\n\t"            /* child: on the new stack */
+        "movl $60, %%eax\n\t"        /* SYS_exit - this thread only */
+        "xorl %%edi, %%edi\n\t"
+        "syscall\n\t"
+        "1:\n\t"
+        : "=a"(ret)
+        : "a"(SYS_clone),
+          "D"(CLONE_THREAD_FLAGS | CLONE_CHILD_CLEARTID_F),
+          "S"(thr_stack + sizeof(thr_stack)), "d"(0),
+          "r"(r10), "r"(r8), "b"(fn)
+        : "rcx", "r11", "memory");
+    if (ret < 0) {
+        thr_ctid = 0;
+        return ret;
+    }
+    while (thr_ctid != 0) {
+        sc0(SYS_sched_yield);
+    }
+    return ret;
+}
+
+static void test_clone_threads(void) {
+    i64 pid, status = 0, r;
+    int i;
+
+    thr_seen_uid = -1;
+    r = raw_thread(thr_body);
+    check(r > 0, "clone with the thread flags makes a thread");
+    check_eq(thr_seen_uid, 0, "which, made by root, runs as root");
+
+    /* In a child, because setuid is one-way. Exit status: 0 all good,
+     * 1 the thread ran as the wrong uid, 2+i clone failed at thread i. */
+    pid = sc2(SYS_clone, 0, 0);
+    if (pid == 0) {
+        if (sc1(SYS_setuid, 1000) != 0) {
+            sc1(SYS_exit_group, 99);
+        }
+        thr_seen_uid = -1;
+        if (raw_thread(thr_body) <= 0) {
+            sc1(SYS_exit_group, 2);
+        }
+        if (thr_seen_uid != 1000) {
+            sc1(SYS_exit_group, 1);
+        }
+        for (i = 0; i < 30; i++) {
+            if (raw_thread(thr_body) <= 0) {
+                sc1(SYS_exit_group, 3 + i);
+            }
+        }
+        sc1(SYS_exit_group, 0);
+    }
+    sc4(SYS_wait4, pid, &status, 0, 0);
+    r = (status >> 8) & 0xFF;
+    check(r != 1, "a thread made by uid 1000 runs as uid 1000, not as root");
+    check_eq(r, 0, "and thirty threads made and joined in turn all succeed - "
+                   "exited threads are reclaimed, not leaked");
+}
+
 static void test_clone(void) {
     i64 pid, reaped;
     int status = 0;
@@ -1747,6 +1846,8 @@ static void test_clone(void) {
 
     check(sc6a(SYS_clone, 0x00000100 /* CLONE_VM */, 0, 0, 0, 0, 0) < 0,
           "a clone asking to share memory is refused, not faked");
+
+    test_clone_threads();
 }
 
 static void test_exec(void) {

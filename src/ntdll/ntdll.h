@@ -46,6 +46,7 @@ typedef unsigned char       BOOLEAN;
 #define NT_SUCCESS(s)  ((NTSTATUS)(s) < 0x80000000u)
 
 #define NtCurrentProcess()  ((HANDLE)(long long)-1)
+#define NtCurrentThread()   ((HANDLE)(long long)-2)
 
 /* ACCESS_MASK. The generic bits are what a caller passes; the kernel maps
  * them onto its own read/write access. */
@@ -197,6 +198,41 @@ NTSTATUS NtCreateMutant(HANDLE *MutantHandle, DWORD DesiredAccess,
  * one you do not hold is STATUS_MUTANT_NOT_OWNED, not a no-op. */
 NTSTATUS NtReleaseMutant(HANDLE MutantHandle, LONG *PreviousCount);
 
+/* --- threads ------------------------------------------------------------- */
+
+#define STATUS_PENDING               0x00000103u   /* STILL_ACTIVE */
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
+#define ThreadBasicInformation       0
+
+typedef DWORD (*PUSER_THREAD_START_ROUTINE)(PVOID Parameter);
+
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID;
+
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS  ExitStatus;
+    PVOID     TebBaseAddress;
+    CLIENT_ID ClientId;
+    SIZE_T    AffinityMask;
+    LONG      Priority;
+    LONG      BasePriority;
+} THREAD_BASIC_INFORMATION;
+
+/* The new thread begins in RtlUserThreadStart, not at StartRoutine; see
+ * kernel/include/nt.h for what the kernel supports and refuses. */
+NTSTATUS NtCreateThreadEx(HANDLE *ThreadHandle, DWORD DesiredAccess,
+                          POBJECT_ATTRIBUTES ObjectAttributes,
+                          HANDLE ProcessHandle, PVOID StartRoutine,
+                          PVOID Argument, DWORD CreateFlags, SIZE_T ZeroBits,
+                          SIZE_T StackSize, SIZE_T MaximumStackSize,
+                          PVOID AttributeList);
+NTSTATUS NtTerminateThread(HANDLE ThreadHandle, NTSTATUS ExitStatus);
+NTSTATUS NtQueryInformationThread(HANDLE ThreadHandle, DWORD InfoClass,
+                                  PVOID Info, DWORD InfoLength,
+                                  DWORD *ReturnLength);
+
 /* --- the runtime library ------------------------------------------------- */
 
 PTEB     NtCurrentTeb(void);
@@ -206,6 +242,7 @@ BOOL     RtlDosPathNameToNtPathName_U(PCWSTR DosName, PUNICODE_STRING NtName,
 PVOID    RtlAllocateHeap(PVOID Heap, DWORD Flags, SIZE_T Size);
 BOOL     RtlFreeHeap(PVOID Heap, DWORD Flags, PVOID Address);
 void     LdrInitializeThunk(void);
+void     RtlExitUserThread(NTSTATUS ExitStatus);
 
 #define HEAP_ZERO_MEMORY 0x00000008u
 
