@@ -39,6 +39,10 @@ DWORD k32_set_error_from_status(NTSTATUS status) {
     case 0xC0000017u:                    /* NO_MEMORY                    */
         code = ERROR_NOT_ENOUGH_MEMORY;  break;
     case 0xC000000Du:                    /* INVALID_PARAMETER            */
+    case 0xC0000030u:                    /* INVALID_PARAMETER_MIX        */
+    case 0xC00000EFu:                    /* INVALID_PARAMETER_1          */
+    case 0xC00000F0u:                    /* INVALID_PARAMETER_2          */
+    case 0xC00000F1u:                    /* INVALID_PARAMETER_3          */
         code = ERROR_INVALID_PARAMETER;  break;
     case 0xC0000106u:                    /* NAME_TOO_LONG                */
         code = ERROR_INSUFFICIENT_BUFFER; break;

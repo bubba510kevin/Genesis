@@ -354,6 +354,23 @@ initialised template, plus TLS callbacks for `DLL_PROCESS_ATTACH`,
 `DLL_THREAD_ATTACH/DETACH` and `DLL_PROCESS_DETACH`. `TlsFree` clears the slot
 in every thread, as Windows does.
 
+**Waiting on several objects ✅** (2026-09-27): `WaitForMultipleObjects`, both
+wait-any (lowest index wins) and wait-all (all or nothing), plus `CreateEvent`,
+`SetEvent`, `ResetEvent`, `CreateSemaphore` and `ReleaseSemaphore` (unnamed).
+
+**Structured exception handling ✅** (2026-09-27): x64 table-based SEH. A
+fault in a Windows program (access violation, divide by zero, breakpoint, ...)
+becomes an exception the program handles itself: `__try`/`__except`/
+`__finally`, `RaiseException`, vectored handlers, `SetUnhandledExceptionFilter`.
+ntdll has the real unwinder (`RtlVirtualUnwind`, `RtlUnwindEx`,
+`__C_specific_handler`); tested with clang-compiled `__try` code. An unhandled
+exception ends the process with a report instead of a silent kill.
+
+**APCs ✅** (2026-09-27): `QueueUserAPC`, and the alertable waits that run
+them - `SleepEx`, `WaitForSingleObjectEx`, `WaitForMultipleObjectsEx`
+(`WAIT_IO_COMPLETION`). Underneath, the kernel can hand a thread a full
+`CONTEXT` on its own stack and `NtContinue` puts every register back.
+
 **Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
 `ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
 released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.

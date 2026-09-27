@@ -369,14 +369,21 @@ DWORD WINAPI SleepEx(DWORD ms, BOOL alertable) {
     LARGE_INTEGER interval;
 
     if (ms == INFINITE) {
-        /* Forever, a long sleep at a time - there is nothing to wake it. */
+        /* Forever, a long sleep at a time - only an APC (alertable) ends
+         * it. */
         for (;;) {
             interval.QuadPart = -36000000000LL;          /* an hour */
-            NtDelayExecution((BOOLEAN)(alertable != 0), &interval);
+            if (NtDelayExecution((BOOLEAN)(alertable != 0), &interval) ==
+                STATUS_USER_APC) {
+                return WAIT_IO_COMPLETION;
+            }
         }
     }
     interval.QuadPart = -(long long)ms * 10000LL;
-    NtDelayExecution((BOOLEAN)(alertable != 0), &interval);
+    if (NtDelayExecution((BOOLEAN)(alertable != 0), &interval) ==
+        STATUS_USER_APC) {
+        return WAIT_IO_COMPLETION;           /* APCs ran; cut short */
+    }
     return 0;
 }
 

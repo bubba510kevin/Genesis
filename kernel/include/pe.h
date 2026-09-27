@@ -250,6 +250,11 @@ typedef struct {
      * does on NT - found here because this is the one moment the module
      * list exists. */
     uint64 thread_start;
+    /* ntdll's KiUserApcDispatcher and KiUserExceptionDispatcher, found the
+     * same way: where the kernel sends a thread to run a user APC, and to
+     * handle an exception. 0 when absent. */
+    uint64 apc_dispatcher;
+    uint64 exception_dispatcher;
 
     /* Implicit TLS: the executable's and every loaded DLL's TLS directory,
      * with indices assigned and written back (see teb.h). count 0: none.
@@ -260,6 +265,14 @@ typedef struct {
     struct {
         uint64 module_base, start, end, zero_fill, index_addr, callbacks;
     } tls[8];
+    /* Every image in the process - the executable first, then each DLL in
+     * load order - for the module table published in the PEB (teb.h,
+     * NT_PEB_MODULES_OFFSET), which is how ntdll finds the unwind tables
+     * of the code an exception passes through. */
+    int    mod_count;
+    struct {
+        uint64 base, size;
+    } mods[PE_MAX_MODULES + 1];
 } pe_info_t;
 
 /* Cheap enough to call on every execve: reads two magic numbers and nothing
