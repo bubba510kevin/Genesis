@@ -61,6 +61,7 @@
 
 #include "timer.h"
 #include "klock.h"
+#include "bkl.h"
 #include "bsd.h"
 
 /* kernel/bsd/kern_time.c - the backing for the VENDORED <sys/time.h>. */
@@ -458,10 +459,17 @@ int net_callout_selftest(void) {
     /* Spin on the tick with interrupts on: net_callout_tick runs from the
      * timer interrupt, so this waits for real ticks rather than driving the
      * wheel by hand - which is the point, since driving it by hand would
-     * test the sweep without testing the wiring into timer.c. */
+     * test the sweep without testing the wiring into timer.c.
+     *
+     * With the big kernel lock RELEASED across each halt. The tick is the
+     * PIT's, delivered to the BSP only, and this code may be running on an
+     * AP: holding the lock through a bare hlt left the BSP spinning for it
+     * with interrupts off - so no tick ever came, and the wait never ended.
+     * A boot hang, found once dhclient's thread made the boot context
+     * migrate. */
     start = timer_ticks_now();
     while (timer_ticks_now() - start < 10) {
-        __asm__ volatile ("hlt");
+        bkl_wait_for_interrupt();
     }
 
     if (fired_count != 2) {
@@ -503,7 +511,7 @@ int net_callout_selftest(void) {
     callout_reset(&test_periodic, 1, test_periodic_handler, 0);
     start = timer_ticks_now();
     while (timer_ticks_now() - start < 10) {
-        __asm__ volatile ("hlt");
+        bkl_wait_for_interrupt();
     }
     if (periodic_count != 3) {
         kprintf_c(0x0C, "callout selftest: periodic ran %d times, "

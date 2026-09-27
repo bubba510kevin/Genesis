@@ -48,6 +48,9 @@ typedef int (*irq_handler_fn)(void *ctx);
  * soon as this returns - register only once the handler is ready to run. */
 int irq_register(uint8 irq, irq_handler_fn handler, void *ctx);
 
+/* Interrupts dispatched on `irq` since boot, claimed or not. */
+uint64 irq_delivered(uint8 irq);
+
 /* Remove ONE registration, matched on the (handler, ctx) pair it was added
  * with. Both, not just the handler: one trampoline function shared by
  * several devices - which is exactly what kernel/lkpi.c does - is one

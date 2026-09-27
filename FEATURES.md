@@ -180,6 +180,13 @@ all on one CPU.
 - **Interrupt binding:** a device line can be moved to any CPU
   (`bus_bind_intr`); the boot self-test moves the NIC's interrupt to CPU 3 and
   sees it arrive there.
+- **Interrupt balancing** (`kernel/arch/irqbalance.c`): at boot every device
+  line is spread across the CPUs, then an `irqbalance` kernel thread re-plans
+  every 2 seconds from how many interrupts each line actually took (heaviest
+  line first, onto the least-loaded CPU; applied only when it cuts the busiest
+  CPU's load by a quarter). A line a driver bound itself is left alone. The
+  self-test checks the planner against known loads and that the NIC's
+  interrupt arrives on the CPU the policy chose.
 - **Ctrl-T** on the console prints every task's state and every CPU's current
   thread.
 
@@ -280,9 +287,17 @@ building this: threads used to run **as root** regardless of who created them,
 and threads that exited were **never freed**, so a program could create only
 about a dozen before hitting "resource unavailable".
 
-**Not yet:** Windows TLS (`TlsAlloc`), `CREATE_SUSPENDED`/`ResumeThread`,
-terminating *another* thread, and marking a mutex *abandoned* when its owner
-thread dies.
+**Thread-local storage ✅** (2026-09-27): `TlsAlloc`/`TlsFree`/`TlsGetValue`/
+`TlsSetValue` (64 slots in the TEB plus 1024 expansion slots), fiber-local
+storage (`FlsAlloc` with destructor callbacks, run on thread exit), and
+**implicit TLS** - `__declspec(thread)` variables in `.tls` sections of the
+program and of every DLL it loads, each thread getting its own copy of the
+initialised template, plus TLS callbacks for `DLL_PROCESS_ATTACH`,
+`DLL_THREAD_ATTACH/DETACH` and `DLL_PROCESS_DETACH`. `TlsFree` clears the slot
+in every thread, as Windows does.
+
+**Not yet:** `CREATE_SUSPENDED`/`ResumeThread`, terminating *another* thread,
+and marking a mutex *abandoned* when its owner thread dies.
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used
@@ -514,9 +529,13 @@ the heap is locked, because threads of one process now run concurrently),
 `LdrInitializeThunk`, `RtlUserThreadStart`, `RtlExitUserThread`, and the
 user-mode synchronisation built for real parallelism (`src/ntdll/sync.c`):
 **critical sections** (spin, then block on an auto-reset event created on
-first contention, as NT does), **SRW locks**, **condition variables**,
-**interlocked SLists**, `RtlGetCurrentProcessorNumber(Ex)` and
-`RtlQueryPerformanceCounter/Frequency`.
+first contention, as NT does), **SRW locks** and **condition variables** (a
+short spin, then sleep in the kernel on the lock word itself through
+`RtlWaitOnAddress` over `NtWaitForAlertByThreadId` - how Windows 8 and later
+build them), **`RtlWaitOnAddress`/`RtlWakeAddressSingle/All`**,
+**interlocked SLists**, `RtlGetCurrentProcessorNumber(Ex)`,
+`RtlQueryPerformanceCounter/Frequency`, the TLS machinery (TLS callbacks,
+`RtlFlsAlloc` family, `LdrShutdownProcess`).
 
 ### kernel32.dll 🟡 (clean-room, `src/kernel32/`)
 | Area | Exports |
@@ -527,7 +546,8 @@ first contention, as NT does), **SRW locks**, **condition variables**,
 | Threads | `CreateThread`, `ExitThread`, `GetCurrentThread`, `GetCurrentThreadId`, `GetThreadId`, `GetExitCodeThread`, `WaitForSingleObject`, `SwitchToThread`, `Sleep`, `SleepEx` |
 | Processors | `GetSystemInfo`, `GetNativeSystemInfo`, `GetActiveProcessorCount`, `GetMaximumProcessorCount`, the group counts, `GetCurrentProcessorNumber(Ex)`, `GetLogicalProcessorInformation(Ex)` |
 | Affinity & priority | `Get/SetProcessAffinityMask`, `SetThreadAffinityMask`, `Set/GetThreadGroupAffinity`, `SetThreadIdealProcessor(Ex)`, `GetThreadIdealProcessorEx`, `Set/GetThreadPriority`, `Set/GetPriorityClass`, `GetProcessTimes`, `GetThreadTimes` |
-| Synchronisation | `Initialize/Enter/TryEnter/Leave/DeleteCriticalSection` (+ `AndSpinCount`, `Ex`), the SRW lock family, `InitializeConditionVariable`, `Wake(All)ConditionVariable`, `SleepConditionVariableCS/SRW`, the SList family. Most are **forwarders** into ntdll, as on Windows |
+| Synchronisation | `Initialize/Enter/TryEnter/Leave/DeleteCriticalSection` (+ `AndSpinCount`, `Ex`), the SRW lock family, `InitializeConditionVariable`, `Wake(All)ConditionVariable`, `SleepConditionVariableCS/SRW`, `WaitOnAddress`, `WakeByAddressSingle/All`, the SList family. Most are **forwarders** into ntdll, as on Windows |
+| Thread-local storage | `TlsAlloc`, `TlsFree`, `TlsGetValue`, `TlsSetValue`, `FlsAlloc`, `FlsFree`, `FlsGetValue`, `FlsSetValue` |
 | Time | `QueryPerformanceCounter/Frequency`, `GetTickCount(64)`, `GetSystemTimeAsFileTime`, `GetSystemTimePreciseAsFileTime` |
 | Memory | `GetProcessHeap`, `HeapAlloc`, `HeapFree`, `VirtualAlloc`, `VirtualFree` |
 
@@ -539,10 +559,11 @@ first contention, as NT does), **SRW locks**, **condition variables**,
 | `k32.exe` | kernel32-only imports two levels deep; command line and parameters |
 | `sync.exe` | Events, semaphores and mutexes by name, through ntdll (29 checks) |
 | `thr.exe` | Win32 threads end to end (16 checks) |
-| `smp.exe` | The multiprocessor from Win32: processor queries, affinity moves, parallel threads, critical sections/SRW/condition variables/SLists and the heap under real contention (53 checks) |
+| `smp.exe` | The multiprocessor from Win32: processor queries, affinity moves, parallel threads, critical sections/SRW/condition variables/SLists and the heap under real contention, `WaitOnAddress`, and SRW waiters that really sleep (61 checks) |
+| `tls.exe` | Thread-local storage: `TlsAlloc` family including the expansion slots, `FlsAlloc` with callbacks, and implicit `.tls` sections with TLS callbacks for process/thread attach and detach (24 checks) |
 
 ### Not yet ❌
-GUI (user32, gdi32), structured exception handling, the registry, COM, TLS,
+GUI (user32, gdi32), structured exception handling, the registry, COM,
 `NtCreateProcess` (a Windows program can't start another one yet), and most of
 kernel32. See §20.
 
@@ -698,8 +719,8 @@ layer is hand-written.
 | **Sockets from user programs**: `socket`, `bind`, `connect` (blocking and non-blocking), `listen`, `accept4`, `shutdown`, `send*`/`recv*` including `sendmsg`/`recvmsg`, socket options, and plain `read`/`write` | ✅ systest runs TCP over lo0: handshake, data both ways, `MSG_PEEK`/`MSG_WAITALL`, half-close, `ECONNREFUSED`, non-blocking connect with `SO_ERROR` |
 | `poll` on sockets | ✅ listeners report `POLLIN` for a waiting connection; connecting sockets report `POLLOUT` when done |
 | NIC | ✅ RTL8139C+ via the unmodified FreeBSD `if_re` driver |
-| Address | 🟡 static `10.0.2.15/24`, gateway `10.0.2.2` (QEMU user networking) |
-| DHCP, IPv6 | ❌ |
+| **DHCP** | ✅ `kernel/bsd/dhcp.c`: DISCOVER / OFFER / REQUEST / ACK at boot; address, netmask, default route and DNS server from the lease; a `dhclient` kernel thread renews at T1 (and starts over if the server refuses). Falls back to static `10.0.2.15/24` if nothing answers. Checked on QEMU's default subnet and on a different one (`GENESIS_NET=10.0.9.0/24` leases `10.0.9.15`) |
+| IPv6 | ❌ |
 
 ---
 
@@ -807,7 +828,7 @@ Collected in one place so nobody has to discover them the hard way:
 - **Kernel code is not preemptible**; a kernel loop that doesn't yield holds
   the big lock and stalls every CPU's system calls.
 - **No GUI**: text console only.
-- **No DHCP, no IPv6.**
+- **No IPv6.**
 - gnfs has one dataset per volume; there are no symlinks on any filesystem;
   FAT is 8.3-only.
 - **No file-backed mmap, no swap, no demand paging.**

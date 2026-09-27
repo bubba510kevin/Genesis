@@ -173,7 +173,13 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->kname       = NULL;
     current->cpu         = 0;
     current->oncpu       = 1;      /* it is running: this is the boot CPU */
-    current->affinity    = ~0ULL;
+    /* The BSP only, until init is started (flk.c widens it). The boot path's
+     * selftests wait on the PIT tick, which only the BSP takes - on an AP,
+     * holding the big kernel lock, such a wait starved the BSP of the lock
+     * and so of the tick it was waiting for: a boot hang, seen once kernel
+     * threads (dhclient) made the boot context migrate. Explicit bindings
+     * (sched_bind, KeSetSystemAffinityThread) still move it, and restore. */
+    current->affinity    = 1ULL;
     current->ideal_cpu   = -1;
     current->is_idle     = 0;
 

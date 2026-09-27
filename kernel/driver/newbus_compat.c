@@ -9,6 +9,7 @@
 #include "kprintf.h"
 #include "ioapic.h"
 #include "ksmp.h"
+#include "irqbalance.h"
 #include <stdarg.h>
 
 /* The FreeBSD Newbus source-compat adapter - see kernel/include/
@@ -575,6 +576,7 @@ int bus_bind_intr(bus_dev_t *dev, bus_resource_t *irq, int cpu) {
     if (ioapic_bind_irq(line, c->apic_id) != 0) {
         return 45;                                    /* EOPNOTSUPP */
     }
+    irq_balance_pin(line);          /* the driver chose; the policy keeps off */
     for (i = 0; i < NEWBUS_INTR_MAX; i++) {
         if (newbus_intrs[i].in_use && newbus_intrs[i].irq == line) {
             newbus_intrs[i].bound_cpu = cpu;

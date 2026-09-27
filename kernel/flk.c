@@ -69,6 +69,7 @@ void pcache_report(uint8 color);
 #include "ksmp.h"
 #include "klock.h"
 #include "gnfs.h"
+#include "irqbalance.h"
 
 /* Physical end of the kernel image, from linker.ld. `end` is a 64-bit VIRTUAL
  * address now, so the PMM - which works in physical frames - must use this or
@@ -1036,6 +1037,10 @@ void flk(void) {
     /* A device interrupt moved to another CPU really arrives there - after
      * net_selftest, which has the NIC up and answering. */
     smp_irq_selftest();
+    /* The policy on top of that mechanism: spread the device lines, start
+     * the thread that re-plans them from measured load, and check both. */
+    irq_balance_start();
+    irq_balance_selftest();
     lock_selftest();
     lock_report(0x0F);
     sched_ule_selftest();
@@ -1092,6 +1097,8 @@ void flk(void) {
      * line. That is the entire rule, and it is easier to keep when the call
      * is the last statement in the boot path rather than buried in a helper
      * that reads like it only mounts a disk. */
+    /* init, and everything it forks, runs anywhere. */
+    (void)sched_set_affinity(proc_current(), ~0ULL);
     start_init_process();
 
     for (;;) {

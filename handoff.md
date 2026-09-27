@@ -1,266 +1,141 @@
 # Handoff — Genesis
 
-*For a subsystem-by-subsystem tour of everything Genesis can do, see
-`FEATURES.md`. This file is about where to pick the work up.*
+*Where to pick the work up. For what already works, subsystem by subsystem,
+see `FEATURES.md`; for why each decision was made, `ROADMAP.md` (item numbers
+are never renumbered — source comments cite them).*
 
-Last updated 2026-09-27. Read this first if you're picking the project back
-up cold. It points at the detailed prose in `ROADMAP.md` rather than
-repeating it — this file is orientation, `ROADMAP.md` is the record.
+Last updated 2026-09-27. Repository: https://github.com/bubba510kevin/Genesis
+(branch `main`).
 
-## What Genesis is
+## What Genesis is, in one paragraph
 
-A from-scratch x86-64 OS kernel (boots on real bare metal and QEMU) that
-deliberately supports three ecosystems at once: native ELF/musl userspace, a
-Windows subsystem (`/wsr`, clean-room `ntdll.dll`/`kernel32.dll`, real PE
-binaries run on it), and three driver models side by side (FreeBSD Newbus,
-Linux via a LinuxKPI shim, Windows WDM/KMDF) — all three run *unmodified*
-vendored driver source against real hardware. Large parts of the kernel are
-real vendored FreeBSD source (`kernel/bsd/`), not reimplementations. (ZFS
-was removed on 2026-09-26; gnfs, the native COW filesystem, replaced it.)
+A from-scratch x86-64 kernel that runs three ecosystems at once: Linux ELF
+binaries (musl, BusyBox), Windows PE binaries on clean-room `ntdll.dll` /
+`kernel32.dll`, and unmodified drivers from three driver models (FreeBSD
+Newbus, Linux via LinuxKPI, Windows WDM). Large parts are real vendored
+FreeBSD (`kernel/bsd/`: the whole IPv4/TCP stack, sockets, `if_re`). It runs
+on every CPU (SMP under a big kernel lock), has its own COW filesystem (gnfs)
+with NT-style ACLs, and gets its address by DHCP.
 
-Engineering culture: self-tests everywhere, bug postmortems live in
-`src/verif.c`, and `ROADMAP.md` is written as dense narrative prose
-explaining *why* each decision was made — item numbers are never renumbered
-because source comments reference them by number.
+**THE GOAL:** a daily-drivable desktop running the Windows 7 DE with real
+Win32 binaries. `ROADMAP.md` item 14 is the dependency-ordered inventory for
+it, (a) through (s). Genesis writes its **own** clean-room user32/gdi32/shell32
+rather than run Microsoft's (those need win32k.sys). Be honest about scale:
+item 14 is bigger than everything built so far.
 
-## THE GOAL
+## Where things stand (2026-09-27)
 
-**A daily-drivable desktop that runs the Windows 7 DE, and can run real Win32
-binaries.** That's the actual destination — not "an interesting kernel
-experiment." Everything else in this file is either progress toward it or a
-side-quest that happened to be useful on the way.
+Done and verified in the latest sessions — details in `ROADMAP.md`:
+- **SMP** (item 13): every CPU runs processes; per-CPU timers, idle threads,
+  affinity, IPIs, targeted TLB shootdown; SMP APIs for all three driver models;
+  **interrupt balancing** (`kernel/arch/irqbalance.c`).
+- **Windows threads + TLS** (item 14(a)): `CreateThread` family, per-thread
+  TEB/stack, `TlsAlloc`/`FlsAlloc`/implicit `.tls` with TLS callbacks.
+- **Win32 synchronisation**: critical sections, SRW locks, condition
+  variables, `WaitOnAddress` — all block in the kernel
+  (`NtWaitForAlertByThreadId`, NT syscalls 0x20/0x21).
+- **Networking** (item 6): TCP + lo0, Linux-ABI sockets, **DHCP** with renewal.
+- **gnfs v2**: big files, rename, snapshots; ZFS removed.
 
-**The full dependency inventory for that goal is `ROADMAP.md` item 14** —
-read it before assuming what's needed. Short version: the single decision
-that determines everything else is that Genesis will write its **own**
-clean-room `user32.dll`/`gdi32.dll`/`shell32.dll` (the same strategy already
-proven at small scale for `ntdll`/`kernel32`) rather than try to run the real
-Microsoft ones, because those talk directly to `win32k.sys` — an entire
-undocumented kernel subsystem Windows Vista+ moved GDI/USER into, and
-reverse-engineering it is the single hardest, buggiest thing ReactOS has
-spent decades on. A clean-room DLL implementing the *documented* export
-surface is indistinguishable to any well-behaved third-party `.exe`.
+## What needs to be done now, in order
 
-**Honest scale check**: item 14 alone (real multithreading, structured
-exception handling, the registry, USER32/GDI32/COM/RPC, a display driver, a
-mouse driver, USB, a session/service architecture, and either a real shell
-namespace or a native fallback shell) is collectively bigger than everything
-built in this tree so far, combined. ReactOS has been working on almost
-exactly this problem since 1996 and still doesn't have a daily-drivable
-modern desktop. That's the honest comparison, not a discouraging one — it
-means this is a real, hard, well-precedented problem, not one this project is
-failing to solve quickly.
+### 1. Finish item 14(a) — threads (small, self-contained)
+- **Mutant abandonment**: a mutex held by a thread that dies must be released
+  with `WAIT_ABANDONED` for the next waiter. The hook is `proc_nt_thread_exit`
+  (`kernel/proc/process.c`); mutant state is in `kernel/obj/dispatch.c`.
+- **`CREATE_SUSPENDED` / `ResumeThread` / `SuspendThread`**: `NtCreateThreadEx`
+  (`kernel/exec/nt.c`) ignores the flag today.
+- **`NtTerminateThread` on another thread** returns `STATUS_NOT_IMPLEMENTED`
+  (`kernel/exec/nt.c`); the killing-a-thread-on-another-CPU machinery already
+  exists for signals — reuse it.
+- **MAX_PROCESSES = 64** (`kernel/include/process.h`) is shared by processes,
+  threads, kthreads and idle threads. Real Win32 programs with thread pools
+  will hit it; the table is scanned linearly by the scheduler, so raising it
+  far means a run queue.
 
-**Where this session's work fits on that path**: not directly on it, but not
-a detour either. The NT ACL/security-descriptor work (Unit 3 below) is
-exactly the foundation item 14(g) — a real `RegGetKeySecurity` or
-`SetNamedSecurityInfo` — would sit on top of. The "supreme" privilege (Unit
-1) is the same kind of primitive real Windows' SYSTEM/TrustedInstaller
-accounts are. None of it is multithreading, SEH, or USER32/GDI32 though —
-those are still fully unstarted, and per item 14's own ordering, real
-multithreading is the biggest single missing prerequisite before any of the
-graphical stack can even begin.
+### 2. Item 14(b) — dispatcher objects, completed
+`WaitForMultipleObjects` (wait-any and wait-all), alertable waits and **APCs**
+(`QueueUserAPC`, `NtQueueApcThread`, APC delivery on alertable wait / return
+to user mode). I/O completion and thread termination lean on APCs.
+`NtWaitForAlertByThreadId` (nt_sys.c) is a good pattern for the kernel side.
 
-## Latest session (2026-09-26 / 27): ZFS out, gnfs v2, TCP, SMP
+### 3. Item 14(c) — structured exception handling (x64 table-based)
+`RtlDispatchException`, `RtlUnwindEx`, `RtlVirtualUnwind` over `.pdata`/
+`.xdata`, `KiUserExceptionDispatcher` entry from the kernel on a fault in a
+Windows process (today a fault kills it), vectored handlers,
+`RaiseException`, `SetUnhandledExceptionFilter`. Not optional: `__try` is
+everywhere in real Windows code, and MinGW's C++ exceptions use it.
 
-In commit order (see `ROADMAP.md` items 6, 7 and 13 for the detail):
-- **ZFS removed**; its test fixtures moved onto gnfs (`tests/host/gnfs_fixture.c`,
-  committed image checked byte-for-byte).
-- **gnfs v2**: ~1GB files (indirect blocks), object reuse, growing directories,
-  rename, incremental commits, snapshots under `/.snapshots`.
-- **TCP + lo0** vendored whole; listen/accept/shutdown/sockopts/sendmsg/recvmsg;
-  the socket boundary translates to Linux's ABI.
-- **SMP**: every CPU runs processes under a big kernel lock; per-CPU timers,
-  idle threads, affinity, targeted shootdowns, interrupt binding; the SMP APIs
-  of all three driver models; Linux affinity syscalls; 11 new NT syscalls,
-  ntdll synchronisation, kernel32's processor/affinity/time surface;
-  `src/winsmp/smp.exe`.
+### 4. Items 14(d)–(f) — memory, loader, kernel32
+- (d) NT page-state model (reserve/commit, `VirtualProtect`, `VirtualQuery`),
+  Section objects / `MapViewOfFile`.
+- (e) `LdrLoadDll`/`LdrGetProcedureAddress` at run time (`LoadLibrary`,
+  `GetProcAddress`), a DLL search path.
+- (f) kernel32 breadth: `CreateProcess`, `MultiByteToWideChar`/
+  `WideCharToMultiByte`, environment, console API, time/locale, file API
+  breadth. Test with real MinGW programs, not only purpose-built ones.
 
-Next, by the goal's ordering: Windows TLS (TlsAlloc) and the rest of item
-14(a), then (b) APCs / WaitForMultipleObjects, then SEH. On the SMP side,
-splitting the big kernel lock only when a measurement asks for it. DHCP is
-the networking loose end.
+### 5. Then the graphical stack — 14(g) onward
+Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
+(PS/2 first; USB later), user32, COM, comctl32, a shell. See item 14.
 
-## Project state — an earlier session, three connected units
+### Side work, smaller, any time
+- **SMP**: split the big kernel lock **only when something measures it** (the
+  `bkl waited` counter and lock_report show contention). No NUMA/hotplug/SMT.
+- **Networking**: IPv6; `SCM_RIGHTS`; a DNS resolver in userland (the DHCP
+  lease already provides the server — `net_dhcp_dns()`).
+- **Filesystems**: chown should clear suid/sgid once exec honours them;
+  moving a directory to a new parent should need write on the directory
+  itself; symlinks; gnfs dataset directory.
+- **Build**: `vendsrc/` (upstream FreeBSD source) is gitignored and only
+  partly present on this machine — `src/kmod/build.sh` now skips rebuilding
+  `if_rl`/`if_re` without it and keeps the staged `root/boot/kernel/ifre.ko`.
+  Restore `vendsrc/sys/dev/{rl,re}` if that driver must change.
 
-All three fully verified (host tests + real kernel boot in QEMU with real
-device I/O) — see "How to verify" below.
+## Rules learned the hard way
+- **Never wait for time while holding the big kernel lock.** The PIT tick
+  goes only to the BSP; an AP spinning in `hlt` with the lock held starves
+  the BSP of the lock and so of the tick. Use `bkl_wait_for_interrupt()` or a
+  real sleep. (The boot context is pinned to the BSP until init starts for
+  this reason — `kernel/proc/process.c`, `kernel/flk.c`.)
+- **Every new check gets a mutation test**: break the code on purpose, see
+  the check fail, restore.
+- **On Windows hosts**: write edit scripts with the Write tool and open files
+  with `newline=''` — Python writes CRLF by default and bash heredocs mangle
+  backslashes.
+- Keep `ROADMAP.md`, `FEATURES.md` and this file current with each change.
 
-### Unit 1 — the "supreme" privilege
-`kernel/fs/acl.c`'s root bypass in `acl_access` used to carry a comment
-predicting this exact feature ("when this kernel grows privileges as a real
-concept, this is the line that becomes a privilege test instead of a uid
-test"). `cred_is_supreme()` is that: root OR the one uid a root process has
-designated (`genesis_supreme_uid_get/set`, `kernel/proc/process.c` — a single
-kernel-global, never stored per-process, so it can't go stale). Granted via
-`prctl()` (`PR_GENESIS_GRANT_SUPREME`/`REVOKE`/`QUERY` in
-`kernel/proc/syscall.c`) rather than a new syscall number, root-gated,
-kprintf-logged. Boot selftest: `kernel/fs/acl_selftest.c`.
+## How to build and verify
 
-**Not done**: no ring-3/systest.c check that a *non-root* caller's grant
-attempt is actually refused with `-EPERM` (only reasoned about in code, not
-tested from userland yet). `kernel/fs/ntsec.c` also doesn't render the
-supreme uid's SID as `S-1-5-18` (SYSTEM) — cosmetic, doesn't affect the
-actual privilege bypass.
-
-### Unit 2 — gnfs, the native COW filesystem
-New subsystem, `kernel/gnfs/` (BSD-2-Clause, no CDDL boundary, not under
-`kernel/zfs/`): `gnfs_format.c` (pure: checksum, root record, bitmap
-allocator, layout helpers), `gnfs_object.c` (pure: onode table, directory
-entries), `gnfs_vfs.c` (device-facing: real `fs_ops_t`, prober, commit ring).
-Public header `kernel/include/gnfs.h` mirrors `zfs.h`'s one-call opacity.
-Format tool: `tools/mkgnfs.c`.
-
-Shape: a fixed ring of root records (`txg % N`, reusing the uberblock ring's
-own crash-consistency argument) each naming a bitmap region and an object
-table region, both COW'd as whole-structure ping-pongs between two fixed
-locations each commit. The object table is FLAT (an object number is a
-direct array index, never an indirect chain of blocks pointing at blocks) —
-that flatness is the actual fix for the depth that broke the old
-OpenZFS-compatible write path. Files/dirs capped at `GNFS_OBJ_DIRECT * 4096`
-= 48KB (no indirect blocks yet, refused past that with `-EFBIG` rather than
-truncated). `fs_ops_t` is real: lookup, read, write (gaps read as zero),
-iterate, statfs, create, truncate, mkdir, rmdir, unlink. `rename` is NULL
-(deferred).
-
-**Not done, disclosed in ROADMAP.md**: the dataset directory and snapshot
-retention. Retaining an old root record already IS a real, untouched
-snapshot (COW throughout means nothing was overwritten in place) — but the
-allocator doesn't yet know to *refuse* handing out a block a retained
-snapshot still references, since there's only one live bitmap. That's the
-one piece of "keep snapshots" from the original scoping that's still open.
-
-### Unit 3 — the ACL write path, on gnfs
-`fs_ops_t` gained `setacl`; `kernel/fs/vfs.c`'s `fs_setacl()` gates it on
-`ACE_WRITE_ACL` via the same `fs_access` check everything else uses (so
-root/supreme bypass it automatically, same as read). `gnfs_onode_t` gained
-`acl_block` (0 = no stored ACL, falls back to the existing mode-projection
-convention — same convention `ZFS_ACL_TRIVIAL` already established one layer
-down). Two new pure functions in `kernel/fs/acl.c`: `acl_inherit` (real
-NT/NFSv4 inheritance semantics: `FILE_INHERIT`/`DIRECTORY_INHERIT`,
-`NO_PROPAGATE`, floored on a plain mode-derived ACL) and `acl_apply_chmod`
-(rewrites only owner@/group@/everyone@, leaves named grants/denies/inherited
-entries untouched). `gnfs_op_create`/`gnfs_op_mkdir` call `acl_inherit`
-against the parent's effective ACL. New syscalls `chmod(2)`/`fchmod(2)`
-(real Linux numbers 90/91) built entirely on
-`fs_getacl` → `acl_apply_chmod` → `fs_setacl`.
-
-**Not done, disclosed in ROADMAP.md**: `chown`/`fchown`. It needs
-`ACE_WRITE_OWNER` as its *own* gate, not a reuse of `ACE_WRITE_ACL` — an
-ordinary owner holds `WRITE_ACL` unconditionally (so they can always chmod
-their own file) but should NOT thereby be able to give it away to an
-arbitrary other uid, which is exactly the distinction POSIX draws between
-chmod and chown. Getting that right is a small, self-contained next step,
-not a copy-paste of chmod's wiring.
-
-## What to work on next
-
-**Immediate loose ends from this session** (small, well-scoped, sitting
-right where the work stopped):
-1. ~~`chown`/`fchown`~~ — **DONE 2026-09-26**: syscalls 92/93 →
-   `fs_setowner` (vfs.c) → pure `acl_chown_permitted` (acl.c) →
-   `fs_ops_t::setowner` (gnfs). WRITE_OWNER = take-for-self only; owner may
-   chgrp into its own groups; supreme may do anything. See ROADMAP.md
-   ("CHOWN, ADDED THE NEXT SESSION"). Left open: suid/sgid clearing on
-   chown (harmless until exec honours those bits), and a ring-3 systest.
-1b. ~~Creator ownership~~ — **DONE 2026-09-26**: `fs_ops_t::create`/`mkdir`
-   take the creator's `cred`; gnfs records euid/egid. Found while doing it,
-   all still open (ROADMAP.md, "THE CREATOR NOW OWNS WHAT IT CREATES"):
-   - ~~No parent-directory write check on create/mkdir~~ — **DONE
-     2026-09-26** (`fs_may_add_entry`, vfs.c): w+x on the parent, -EEXIST
-     checked first. Side effect: non-root can't create on FAT (root-owned
-     0755 projection); nothing does today.
-   - ~~Deletion ungated~~ — **DONE 2026-09-26**: unlink/rmdir/rename take
-     the cred (`fs_may_remove_entry`, vfs.c): ACE_DELETE on the object OR
-     DELETE_CHILD+EXECUTE on the parent; rename = remove + add + remove
-     replaced. Also fixed: directory w never granted ACE_DELETE_CHILD, so
-     `access(dir, W_OK)` failed for non-root owners.
-   - ~~chmod special bits~~ — **DONE**: `fs_chmod` (vfs.c) sets/clears
-     suid/sgid/sticky in the same commit as the ACL (`setacl` gained a
-     `special` arg); sgid silently dropped for non-members, as Linux.
-   - ~~setgid directories~~ / ~~sticky directories~~ — **DONE**: new objects
-     take a setgid parent's group (subdirs inherit sgid); in a sticky dir
-     only the entry's/dir's owner or supreme may remove (-EPERM).
-   - ~~create mode ignored~~ — **DONE**: open(O_CREAT)/mkdir honour
-     `mode & ~umask` (perm bits; +sticky for mkdir). Default umask now 022.
-   - **Still open:** chown should clear suid/sgid (POSIX) — harmless until
-     exec honours those bits, must land with that; moving a directory to a
-     new parent should need write on the directory itself (".." changes);
-     ~~none of this exercised from ring 3~~ — **DONE**: systest's
-     `test_gnfs_perms` (57 checks, as real uids, on `/mnt/f`) covers every
-     item above end to end through the real syscalls, plus the supreme
-     grant/refusal; two planted plumbing bugs (unlink passing NULL, umask
-     not applied) each fail it.
-2. Snapshot-aware allocation (Unit 2) — the allocator needs to know about
-   every *retained* root record's bitmap, not just the live one.
-3. The dataset directory (Unit 2) — multiple named filesystems in one gnfs
-   volume, what makes "snapshot"/"dataset" real user-facing concepts.
-4. Indirect blocks (Unit 2) — lift the 48KB file cap; one bounded indirect
-   block, matching classic Unix inode design.
-5. `rename(2)` on gnfs — currently NULL.
-6. ~~The ring-3 test for `PR_GENESIS_GRANT_SUPREME`'s `-EPERM` gate~~ —
-   **DONE 2026-09-26**, in systest's gnfs section (below).
-7. SACL/auditing — bigger, lower priority.
-
-**Multithreading (item 14(a)) — STARTED 2026-09-26: Win32 threads work.**
-`CreateThread`/`ExitThread`/`WaitForSingleObject`/`GetExitCodeThread`, each
-thread with its own TEB and stack, starting in `ntdll!RtlUserThreadStart`.
-`src/winthread/thr.exe` checks it (16/16). Also fixed two older clone()-thread
-bugs: threads ran as root, and exited threads were never freed. Full record:
-ROADMAP.md item 14(a), "STARTED 2026-09-26". Next inside (a): TLS
-(`TlsAlloc`), raising MAX_PROCESSES (16, shared by all processes and
-threads), mutant abandonment, then running user code on the second CPU.
-
-**The actual next milestone toward THE GOAL**, once the above is cleared or
-if you want to jump straight at it: **real multithreading** — item 14(a),
-and per its own ordering the biggest single missing prerequisite before any
-of the USER32/GDI32/display work can start. `process.h`'s own
-`sig_handlers`/`sig_blocked` split already has a comment naming `clone()` as
-the thing that will eventually need this. Everything graphical assumes
-threads exist.
-
-## How to verify anything above still works
-
-This machine has no native gcc/qemu toolchain (Windows). Build and test
-through WSL Debian, which has everything, pointed at this same working
-copy via `/mnt/c/...` — no separate Gentoo box or SSH needed:
-
+Everything builds and runs in WSL (Debian) against this working copy:
 ```
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && bash tests/host/run.sh"
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 build.py image"
+wsl bash build/b.sh                                   # kernel -> build/kernel.elf
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && sh tools/build_user.sh"   # all user programs and DLLs
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && rm -f build/disk.img && python3 build.py disk"   # restage the FAT root from root/
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && python3 tools/guest_run.py > build/gr.out 2>&1"  # boot + ring-3 suites
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && bash tests/host/run.sh"   # host-side tests
 ```
+`guest_run.py` boots QEMU (`-smp 4` by default; `GENESIS_SMP=N` overrides;
+`GENESIS_NET=10.0.9.0/24` changes the DHCP subnet), types each program into
+the shell over serial and waits for its tally. Pass program paths to run a
+subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
+`build/guest.log`. Expected as of 2026-09-27:
 
-**The full check - boots the real machine and runs the ring-3 suites.**
-`tools/guest_run.py` boots with `build.py run`'s drives (FAT root, both ZFS
-pools, and - since 2026-09-26 - a fresh gnfs volume at `/mnt/f`), types
-`/bin/verif` and `/bin/systest` into the shell over serial, and waits for
-each tally. About five minutes:
-```
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 tools/guest_run.py > build/guest.txt 2>&1"
-grep -E "^(verification|systest): [0-9]" build/guest.txt   # expect 0 failed on both
-```
-As of 2026-09-27, with `-smp 4`: `verification: 160 passed, 0 failed`,
-`systest: 510 passed, 0 failed`, `thr: 16 passed, 0 failed`,
-`smp: 53 passed, 0 failed` (guest_run.py runs `/bin/thr.exe` and
-`/bin/smp.exe` too). `GENESIS_SMP=1` runs the same on one CPU (systest 507,
-smp 49 - the parallel checks skip). A hung guest: `tools/guest_dump.py CMD`
-runs the commands and presses Ctrl-T for the task dump.
+| Suite | `-smp 4` | `GENESIS_SMP=1` |
+|---|---|---|
+| `verification` (`/bin/verif`) | 160 passed | 160 passed |
+| `systest` | 510 passed | 507 passed |
+| `thr` (`thr.exe`) | 16 passed | 16 passed |
+| `smp` (`smp.exe`) | 61 passed | 57 passed |
+| `tls` (`tls.exe`) | 24 passed | 24 passed |
+| boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, no `FAILED` | same |
+| host (`tests/host/run.sh`) | exit 0 | |
 
-After changing `src/systest.c` (or `src/verif.c`), rebuild it and restage
-the FAT disk - `build_user.sh` stages via `sudo mount`, which needs a
-password, so do the systest part by hand and let `build.py disk` restage
-from `root/` with its own FAT writer (no sudo):
-```
-wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && gcc -std=c99 -Wall -Wextra -O1 -static -no-pie -nostdlib -nostartfiles -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o root/bin/systest src/systest.c && rm -f build/disk.img && python3 build.py disk"
-```
-(`build/disk.img` is regenerated from `root/` that way; the one from before
-2026-09-26 is kept as `build/disk.img.bak-2026-09-26` in case it held
-hand-dropped files.)
+A hung guest: `tools/guest_dump.py CMD` runs commands and presses Ctrl-T for a
+task dump. For a hard hang, boot QEMU with `-monitor unix:/tmp/m.sock,server,nowait`
+and read `info registers` per CPU, then `addr2line -f -e build/kernel.elf`
+the RIPs — that is how the BKL/tick deadlock above was found.
 
-**Do NOT boot-test gnfs by putting it on IDE index 1** (an older version of
-this file said to): the first volume to mount becomes `/`, so the empty
-gnfs disk becomes the root, there is no `/bin/busybox` on it, and no
-userland ever runs - the boot looks clean only because nothing ran. Use
-`guest_run.py`, or `build.py run`, which attach it correctly.
-
-Version control: this path is a git repo since 2026-09-26 (branch `main`).
+**Do not put a gnfs volume on IDE index 1**: the first volume mounted becomes
+`/`, and an empty one means no userland runs, which looks like a clean boot.
+Use `guest_run.py` or `build.py run`, which attach drives correctly.

@@ -59,6 +59,11 @@ rm -f "$ROOT/root/boot/kernel/nbrtl.ko"
 # compiled with it and large parts of these headers are inside #ifdef _KERNEL.
 # The extra -I is for "miibus_if.h", which upstream GENERATES into the object
 # directory and which is hand-written here (see that file).
+#
+# vendsrc/ is the upstream tree and is NOT in version control (.gitignore):
+# a checkout without it keeps the staged ifre.ko and skips these two, loudly,
+# rather than stopping tools/build_user.sh before the programs after it.
+if [ -d "$ROOT/vendsrc/sys/dev/rl" ] && [ -d "$ROOT/vendsrc/sys/dev/re" ]; then
 gcc $CFLAGS -nostdinc -D_KERNEL \
     -isystem "$(gcc -print-file-name=include)" \
     -I"$ROOT/kernel/bsd/compat" -I"$ROOT/kernel/bsd/compat/dev/mii" \
@@ -75,10 +80,13 @@ gcc $CFLAGS -nostdinc -D_KERNEL \
     -I"$ROOT/kernel/include" \
     -c "$ROOT/vendsrc/sys/dev/re/if_re.c" -o if_re.ko
 cp if_re.ko "$ROOT/root/boot/kernel/ifre.ko"
-
-echo "built root/boot/kernel/hellokm.ko"
 echo "built if_rl.ko (UNMODIFIED vendsrc/sys/dev/rl/if_rl.c, compiled not staged)"
 echo "built root/boot/kernel/ifre.ko (UNMODIFIED vendsrc/sys/dev/re/if_re.c)"
+else
+echo "SKIPPED if_rl.ko and ifre.ko: vendsrc/sys/dev/{rl,re} not present - the staged root/boot/kernel/ifre.ko is kept"
+fi
+
+echo "built root/boot/kernel/hellokm.ko"
 echo "built nb_rtl.ko (compiled, not staged - if_rl.c owns that device)"
 echo "built root/lib/modules/lkpiahci.ko"
 echo "built root/lib/modules/lkpipcpu.ko"

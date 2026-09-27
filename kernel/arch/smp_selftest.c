@@ -105,6 +105,7 @@ int smp_irq_selftest(void) {
     uint8 line = 0;
     int i, failures = 0;
     uint64 before, start;
+    uint32 home;
 
     if (n < 2 || !ioapic_active()) {
         kprintf_c(0x0E, "smp irq selftest: needs 2 CPUs and an IOAPIC - skipped\n");
@@ -126,6 +127,7 @@ int smp_irq_selftest(void) {
         kprintf_c(0x0E, "smp irq selftest: no device line to move - skipped\n");
         return 0;
     }
+    home = ioapic_irq_destination(line);
     before = smp_cpu(target)->dev_irqs;
     if (ioapic_bind_irq(line, smp_cpu(target)->apic_id) != 0) {
         kprintf_c(0x0C, "smp irq selftest: could not bind irq %d\n", line);
@@ -147,7 +149,7 @@ int smp_irq_selftest(void) {
                         "there\n", line, target);
         failures++;
     }
-    (void)ioapic_bind_irq(line, smp_cpu(0)->apic_id);
+    (void)ioapic_bind_irq(line, home);            /* back where it was */
     if (failures == 0) {
         kprintf("smp: irq selftest passed - irq %d moved to cpu%d and was "
                 "delivered there (%lx interrupts)\n", line, target,

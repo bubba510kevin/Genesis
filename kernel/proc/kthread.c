@@ -153,6 +153,10 @@ process_t *kthread_create(void (*fn)(void *), void *arg, const char *name) {
     }
 
     p->is_kthread = 1;
+    /* Anywhere, whoever the creator is: the boot context is pinned to the
+     * BSP (process.c), and its kernel threads must not inherit that. A
+     * thread that wants a CPU binds itself. */
+    p->affinity = ~0ULL;
     p->kentry     = fn;
     p->karg       = arg;
     p->kname      = name != NULL ? name : "kthread";

@@ -63,6 +63,13 @@ static int             heads_ready;
  * counted and not acted on. */
 static uint64 unclaimed[IRQ_COUNT];
 
+/* Every interrupt taken, per line - the load irqbalance plans from. */
+static uint64 delivered[IRQ_COUNT];
+
+uint64 irq_delivered(uint8 irq) {
+    return irq < IRQ_COUNT ? delivered[irq] : 0;
+}
+
 /* -1 is the empty-list marker and 0 is a valid slot index, so the head
  * table cannot start as .bss zeroes. Done lazily rather than in an
  * irq_init() the boot path would have to call at the right moment: there is
@@ -191,6 +198,7 @@ void irq_dispatch(uint8 irq) {
     if (irq >= IRQ_COUNT) {
         return;
     }
+    delivered[irq]++;
     for (cur = heads[irq]; cur >= 0; cur = slots[cur].next) {
         if (slots[cur].fn(slots[cur].ctx)) {
             claimed++;
