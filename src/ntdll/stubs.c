@@ -59,6 +59,7 @@ NT_STUB_X(NtOpenEvent,             NT_SYS_OPEN_EVENT);
 NT_STUB_X(NtSetEvent,              NT_SYS_SET_EVENT);
 NT_STUB_X(NtResetEvent,            NT_SYS_RESET_EVENT);
 NT_STUB_X(NtWaitForSingleObject,   NT_SYS_WAIT_SINGLE);
+NT_STUB_X(NtWaitForMultipleObjects, NT_SYS_WAIT_MULTIPLE);
 NT_STUB_X(NtCreateSemaphore,       NT_SYS_CREATE_SEMAPHORE);
 NT_STUB_X(NtReleaseSemaphore,      NT_SYS_RELEASE_SEMAPHORE);
 NT_STUB_X(NtCreateMutant,          NT_SYS_CREATE_MUTANT);

@@ -13,6 +13,8 @@ src/k32demo/*.o
 src/k32demo/k32.exe
 src/winthread/*.o
 src/winthread/thr.exe
+src/winwait/*.o
+src/winwait/wait.exe
 
 # Build output and generated artifacts
 build/

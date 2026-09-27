@@ -175,6 +175,17 @@ struct syscall_frame;
 #define NT_SYS_SUSPEND_THREAD        0x22
 #define NT_SYS_RESUME_THREAD         0x23
 #define NT_MAXIMUM_SUSPEND_COUNT     127
+
+/* NtWaitForMultipleObjects(ULONG Count, PHANDLE Handles, WAIT_TYPE WaitType,
+ *                          BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+ *
+ * Up to 64 dispatcher objects. WaitType is NT's: WaitAll (0) takes every
+ * object in one step once all are signalled - never some first - and
+ * returns STATUS_WAIT_0; WaitAny (1) takes the lowest-indexed signalled
+ * one and returns STATUS_WAIT_0 + its index. STATUS_ABANDONED_WAIT_0 + i
+ * for an abandoned mutant; STATUS_INVALID_PARAMETER_MIX for one object
+ * listed twice in a wait-all. */
+#define NT_SYS_WAIT_MULTIPLE         0x24
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -282,6 +293,10 @@ struct syscall_frame;
 #define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
 #define STATUS_THREAD_IS_TERMINATING  0xC000004Bu
 #define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
+#define STATUS_WAIT_0             0x00000000u
+#define STATUS_INVALID_PARAMETER_1 0xC00000EFu
+#define STATUS_INVALID_PARAMETER_3 0xC00000F1u
+#define STATUS_INVALID_PARAMETER_MIX 0xC0000030u
 
 /* EVENT_TYPE. Upstream's spelling and upstream's values: the difference is
  * visible to a waiter, so a program that passes the wrong one gets a

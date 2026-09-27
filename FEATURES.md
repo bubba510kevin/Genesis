@@ -296,6 +296,10 @@ initialised template, plus TLS callbacks for `DLL_PROCESS_ATTACH`,
 `DLL_THREAD_ATTACH/DETACH` and `DLL_PROCESS_DETACH`. `TlsFree` clears the slot
 in every thread, as Windows does.
 
+**Waiting on several objects ✅** (2026-09-27): `WaitForMultipleObjects`, both
+wait-any (lowest index wins) and wait-all (all or nothing), plus `CreateEvent`,
+`SetEvent`, `ResetEvent`, `CreateSemaphore` and `ReleaseSemaphore` (unnamed).
+
 **Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
 `ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
 released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.

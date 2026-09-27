@@ -740,20 +740,14 @@ static uint64 nt_event_signal(uint64 handle, uint64 prev_ptr, int op) {
  * absolute returns STATUS_NOT_IMPLEMENTED rather than being read as a
  * relative interval of astronomical length, which is what dropping the sign
  * would do. */
-static uint64 nt_wait_single(uint64 handle, uint64 alertable,
-                             uint64 timeout_ptr) {
-    object_t *obj = nt_object_of(handle);
+/* An NT timeout pointer to an absolute deadline in ticks, 0 for none. */
+static uint64 nt_wait_deadline(uint64 timeout_ptr, uint64 *out) {
     uint64 deadline = 0;
-    int rc;
 
-    (void)alertable;                  /* no APCs, so nothing to be alerted by */
-    if (obj == NULL) {
-        return STATUS_INVALID_HANDLE;
-    }
     if (timeout_ptr != 0) {
         int64 t;
 
-        if (!user_ptr_ok(timeout_ptr)) {
+        if (!user_ptr_ok(timeout_ptr) || !user_ptr_ok(timeout_ptr + 7)) {
             return STATUS_ACCESS_VIOLATION;
         }
         t = *(const int64 *)timeout_ptr;
@@ -781,6 +775,24 @@ static uint64 nt_wait_single(uint64 handle, uint64 alertable,
             }
             deadline = timer_ticks_now() + ticks_wanted;
         }
+    }
+    *out = deadline;
+    return STATUS_SUCCESS;
+}
+
+static uint64 nt_wait_single(uint64 handle, uint64 alertable,
+                             uint64 timeout_ptr) {
+    object_t *obj = nt_object_of(handle);
+    uint64 deadline = 0, st;
+    int rc;
+
+    (void)alertable;                  /* no APCs, so nothing to be alerted by */
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    st = nt_wait_deadline(timeout_ptr, &deadline);
+    if (st != STATUS_SUCCESS) {
+        return st;
     }
 
     rc = ob_wait(obj, deadline);
@@ -813,6 +825,70 @@ static uint64 nt_wait_single(uint64 handle, uint64 alertable,
         return STATUS_OBJECT_TYPE_MISMATCH;
     }
     return STATUS_INVALID_HANDLE;
+}
+
+/* NtWaitForMultipleObjects(ULONG Count, PHANDLE Handles, WAIT_TYPE,
+ *                          BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+ *
+ * WAIT_TYPE is NT's: WaitAll 0, WaitAny 1. The result is STATUS_WAIT_0 + i
+ * (the index taken; 0 for wait-all), STATUS_ABANDONED_WAIT_0 + i, or
+ * STATUS_TIMEOUT. Each object is held by a reference for the length of the
+ * wait: a handle another thread closes meanwhile must not let the object's
+ * pool slot be reused under a waiter still testing it. */
+static uint64 nt_wait_multiple(uint64 count, uint64 handles_ptr,
+                               uint64 wait_type, uint64 alertable,
+                               uint64 timeout_ptr) {
+    object_t *objs[DISPATCH_WAIT_MAX];
+    uint64 deadline = 0, st;
+    int n = (int)(uint32)count, i, rc;
+
+    (void)alertable;
+    if (n < 1 || n > DISPATCH_WAIT_MAX) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    if ((uint32)wait_type > 1) {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+    if (!user_ptr_ok(handles_ptr) ||
+        !user_ptr_ok(handles_ptr + (uint64)n * 8 - 1)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = nt_wait_deadline(timeout_ptr, &deadline);
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    for (i = 0; i < n; i++) {
+        objs[i] = nt_object_of(((const uint64 *)handles_ptr)[i]);
+        if (objs[i] == NULL) {
+            while (--i >= 0) {
+                ob_deref(objs[i]);
+            }
+            return STATUS_INVALID_HANDLE;
+        }
+        ob_ref(objs[i]);
+    }
+
+    rc = dispatch_wait_multiple(objs, n, (uint32)wait_type == 0, deadline);
+
+    for (i = 0; i < n; i++) {
+        ob_deref(objs[i]);
+    }
+    if (rc >= DISPATCH_WAIT_ABANDONED) {
+        return STATUS_ABANDONED_WAIT_0 + (uint64)(rc - DISPATCH_WAIT_ABANDONED);
+    }
+    if (rc >= 0) {
+        return STATUS_WAIT_0 + (uint64)rc;
+    }
+    switch (rc) {
+    case -110:
+        return STATUS_TIMEOUT;
+    case -4:
+        return STATUS_ALERTED;
+    case DISPATCH_WAIT_DUPLICATE:
+        return STATUS_INVALID_PARAMETER_MIX;
+    default:
+        return STATUS_OBJECT_TYPE_MISMATCH;     /* something not waitable */
+    }
 }
 
 /* NtCreateSemaphore(PHANDLE, ACCESS_MASK, POA, LONG Initial, LONG Maximum) */
@@ -1325,6 +1401,17 @@ uint64 nt_syscall_dispatch(struct syscall_frame *frame) {
         case NT_SYS_WAIT_SINGLE:
             return nt_trace(frame->rax,
                             nt_wait_single(frame->r10, frame->rdx, frame->r8));
+
+        case NT_SYS_WAIT_MULTIPLE: {
+            uint64 timeout = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &timeout)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_wait_multiple(frame->r10, frame->rdx, frame->r8,
+                                             frame->r9, timeout));
+        }
 
         case NT_SYS_CREATE_SEMAPHORE: {
             uint64 maximum = 0;

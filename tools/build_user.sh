@@ -272,6 +272,10 @@ fi
 if [ -f src/wintls/build.sh ]; then
     sh src/wintls/build.sh
 fi
+# wait.exe: WaitForMultipleObjects, alertable waits and APCs (item 14(b)).
+if [ -f src/winwait/build.sh ]; then
+    sh src/winwait/build.sh
+fi
 
 # hand.exe, the bisect anchor: no imports, no ntdll, no CRT, so when
 # hello.exe breaks this says whether the loader broke or the linking did.

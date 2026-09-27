@@ -55,6 +55,14 @@ EXPORTS
     TerminateThread
     ResumeThread
     WaitForSingleObject
+    WaitForMultipleObjects
+    CreateEventW
+    CreateEventA
+    SetEvent
+    ResetEvent
+    CreateSemaphoreW
+    CreateSemaphoreA
+    ReleaseSemaphore
     CreateMutexW
     CreateMutexA
     ReleaseMutex

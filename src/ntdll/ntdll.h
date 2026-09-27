@@ -183,6 +183,17 @@ NTSTATUS NtResetEvent(HANDLE EventHandle, LONG *PreviousState);
 NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
                                LARGE_INTEGER *Timeout);
 
+/* Up to 64 objects. WaitAll takes every one in a single step once all are
+ * signalled; WaitAny takes the lowest-indexed signalled one and returns
+ * STATUS_WAIT_0 + its index. */
+typedef LONG WAIT_TYPE;
+#define WaitAll                      0
+#define WaitAny                      1
+#define MAXIMUM_WAIT_OBJECTS         64
+NTSTATUS NtWaitForMultipleObjects(DWORD Count, HANDLE *Handles,
+                                  WAIT_TYPE WaitType, BOOLEAN Alertable,
+                                  LARGE_INTEGER *Timeout);
+
 NTSTATUS NtCreateSemaphore(HANDLE *SemaphoreHandle, DWORD DesiredAccess,
                            POBJECT_ATTRIBUTES ObjectAttributes,
                            LONG InitialCount, LONG MaximumCount);
@@ -199,6 +210,8 @@ NTSTATUS NtCreateMutant(HANDLE *MutantHandle, DWORD DesiredAccess,
 NTSTATUS NtReleaseMutant(HANDLE MutantHandle, LONG *PreviousCount);
 
 #define MUTANT_ALL_ACCESS            0x001F0001u
+#define EVENT_ALL_ACCESS             0x001F0003u
+#define SEMAPHORE_ALL_ACCESS         0x001F0003u
 /* A wait that acquired a mutant whose owner died holding it. A SUCCESS code:
  * the caller owns the mutant now, but what it guards may be half-updated. */
 #define STATUS_ABANDONED_WAIT_0      0x00000080u

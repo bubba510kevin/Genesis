@@ -158,6 +158,136 @@ DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
     return WAIT_FAILED;
 }
 
+/* Milliseconds to NT's relative 100ns timeout; NULL for INFINITE. */
+static LARGE_INTEGER *k32_timeout(DWORD milliseconds, LARGE_INTEGER *t) {
+    if (milliseconds == INFINITE) {
+        return NULL_PTR;
+    }
+    t->QuadPart = -(long long)milliseconds * 10000LL;
+    return t;
+}
+
+DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles,
+                                    BOOL wait_all, DWORD milliseconds) {
+    LARGE_INTEGER timeout;
+    NTSTATUS st;
+
+    if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || handles == NULL_PTR) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    st = NtWaitForMultipleObjects(count, (HANDLE *)handles,
+                                  wait_all ? WaitAll : WaitAny, 0,
+                                  k32_timeout(milliseconds, &timeout));
+    /* WAIT_OBJECT_0 + i and WAIT_ABANDONED_0 + i are the NT statuses
+     * themselves, which is why Win32 chose those values. */
+    if ((DWORD)st < count ||
+        ((DWORD)st >= STATUS_ABANDONED_WAIT_0 &&
+         (DWORD)st < STATUS_ABANDONED_WAIT_0 + count) ||
+        (DWORD)st == STATUS_TIMEOUT) {
+        return (DWORD)st;
+    }
+    k32_set_error_from_status(st);
+    return WAIT_FAILED;
+}
+
+/* --- events and semaphores --------------------------------------------- */
+
+HANDLE WINAPI CreateEventW(LPVOID security, BOOL manual_reset,
+                           BOOL initial_state, LPCWSTR name) {
+    HANDLE h = NULL_PTR;
+    NTSTATUS st;
+
+    (void)security;
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    st = NtCreateEvent(&h, EVENT_ALL_ACCESS, NULL_PTR,
+                       manual_reset ? NotificationEvent : SynchronizationEvent,
+                       initial_state ? 1 : 0);
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return NULL_PTR;
+    }
+    SetLastError(ERROR_SUCCESS);
+    return h;
+}
+
+HANDLE WINAPI CreateEventA(LPVOID security, BOOL manual_reset,
+                           BOOL initial_state, LPCSTR name) {
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    return CreateEventW(security, manual_reset, initial_state, NULL_PTR);
+}
+
+BOOL WINAPI SetEvent(HANDLE event) {
+    NTSTATUS st = NtSetEvent(event, NULL_PTR);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
+}
+
+BOOL WINAPI ResetEvent(HANDLE event) {
+    NTSTATUS st = NtResetEvent(event, NULL_PTR);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
+}
+
+HANDLE WINAPI CreateSemaphoreW(LPVOID security, LONG initial, LONG maximum,
+                               LPCWSTR name) {
+    HANDLE h = NULL_PTR;
+    NTSTATUS st;
+
+    (void)security;
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    st = NtCreateSemaphore(&h, SEMAPHORE_ALL_ACCESS, NULL_PTR, initial,
+                           maximum);
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return NULL_PTR;
+    }
+    SetLastError(ERROR_SUCCESS);
+    return h;
+}
+
+HANDLE WINAPI CreateSemaphoreA(LPVOID security, LONG initial, LONG maximum,
+                               LPCSTR name) {
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    return CreateSemaphoreW(security, initial, maximum, NULL_PTR);
+}
+
+BOOL WINAPI ReleaseSemaphore(HANDLE semaphore, LONG count, LONG *previous) {
+    NTSTATUS st = NtReleaseSemaphore(semaphore, count, previous);
+
+    if (!NT_SUCCESS(st)) {
+        /* Past the maximum: ERROR_TOO_MANY_POSTS on Windows. The kernel
+         * answers INVALID_PARAMETER for that and for a count below one. */
+        if (st == STATUS_INVALID_PARAMETER && count > 0) {
+            SetLastError(ERROR_TOO_MANY_POSTS);
+        } else {
+            k32_set_error_from_status(st);
+        }
+        return 0;
+    }
+    return 1;
+}
+
 /* --- mutexes ----------------------------------------------------------- */
 
 HANDLE WINAPI CreateMutexW(LPVOID security, BOOL initial_owner, LPCWSTR name) {
