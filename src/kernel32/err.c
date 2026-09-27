@@ -44,6 +44,13 @@ DWORD k32_set_error_from_status(NTSTATUS status) {
         code = ERROR_INSUFFICIENT_BUFFER; break;
     case 0xC0000002u:                    /* NOT_IMPLEMENTED              */
         code = ERROR_CALL_NOT_IMPLEMENTED; break;
+    case 0xC0000004u:                    /* INFO_LENGTH_MISMATCH         */
+    case 0xC0000023u:                    /* BUFFER_TOO_SMALL             */
+        code = ERROR_INSUFFICIENT_BUFFER; break;
+    case 0xC0000003u:                    /* INVALID_INFO_CLASS           */
+        code = ERROR_INVALID_PARAMETER;  break;
+    case 0x00000102u:                    /* STATUS_TIMEOUT               */
+        code = ERROR_TIMEOUT;            break;
     case 0xC0000005u:                    /* ACCESS_VIOLATION             */
         /* A bad pointer handed to the kernel. ERROR_NOACCESS is what
          * Windows uses; ERROR_INVALID_PARAMETER is closer to what a caller

@@ -1,6 +1,6 @@
 # Genesis — Feature Guide
 
-*Last updated 2026-09-26. A complete tour of what Genesis is, what it can do
+*Last updated 2026-09-27. A complete tour of what Genesis is, what it can do
 today, how each piece works, how each piece is verified, and what is not
 there yet.*
 
@@ -68,9 +68,9 @@ ecosystems at once**:
 
 Large parts of the kernel are **real, vendored FreeBSD source** rather than
 reimplementations: the IPv4 network stack, the socket layer, the routing table,
-sysctl, the UMA allocator, mbufs, and more (`kernel/bsd/`). A **ZFS reader** is
-vendored too, kept behind a license boundary (`kernel/zfs/`, CDDL). Genesis
-also has its own native copy-on-write filesystem, **gnfs**.
+sysctl, the UMA allocator, mbufs, TCP, and more (`kernel/bsd/`). Genesis has
+its own native copy-on-write filesystem, **gnfs**, with snapshots. It runs
+programs on **every CPU at once** (§3, §5).
 
 **The long-term goal**: a daily-drivable desktop running Genesis's own
 reimplementation of the Windows 7 desktop, able to run real Win32 programs.
@@ -89,29 +89,29 @@ them. See §17.
 | Area | Status | Summary |
 |---|---|---|
 | Boot (QEMU + bare metal) | ✅ | BIOS MBR bootloader → 64-bit long mode; single-disk USB image for real machines |
-| Multiprocessor | 🟡 | 2 CPUs brought up (ACPI, LAPIC, IOAPIC, TLB shootdown); only the boot CPU runs programs |
+| Multiprocessor | ✅ | Every CPU runs programs (up to 8; QEMU boots 4); affinity, per-CPU timers, targeted TLB shootdown, interrupt binding; kernel serialised by a big lock |
 | Memory | ✅ | 4-level paging, NX, W^X, vendored UMA slab allocator, low-memory reclaim |
 | Processes | ✅ | fork, vfork, clone, execve (ELF and PE), signals, wait4/waitid, sessions, groups |
 | POSIX threads | ✅ | clone() threads with TLS and `pthread_join` wakeups |
-| Windows threads | ✅ | CreateThread / WaitForSingleObject, a TEB and stack per thread |
-| Scheduler | ✅ | FreeBSD-style ULE with interactivity scoring; preemptive for user code |
-| Linux syscalls | ✅ | ~130 real Linux x86-64 syscall numbers |
+| Windows threads | ✅ | CreateThread / WaitForSingleObject, a TEB and stack per thread; critical sections, SRW locks, condition variables |
+| Scheduler | ✅ | FreeBSD-style ULE with interactivity scoring, on every CPU; preemptive for user code; affinity masks |
+| Linux syscalls | ✅ | ~145 real Linux x86-64 syscall numbers |
 | FAT16 | ✅ | Full read and write; the default root filesystem |
-| ZFS | 🟡 | Read-only, 18 pool features, reads real ACLs; experimental write that doesn't finish |
-| gnfs (native COW FS) | 🟡 | Read, write and ACLs; crash-safe commits; files capped at 48KB |
+| gnfs (native COW FS) | ✅ | Read, write, ACLs, rename, ~1GB files, growing directories, snapshots; crash-safe commits |
 | Permissions | ✅ | One NFSv4/NT ACL model with POSIX and Windows views; chmod, chown, umask, setgid, sticky |
-| Windows programs | 🟡 | PE loading, ntdll + kernel32 subset, 20 NT syscalls; no GUI |
+| Windows programs | 🟡 | PE loading, ntdll + kernel32 subset, 31 NT syscalls; no GUI |
 | NT object manager | ✅ | Namespace, named events/semaphores/mutexes, \ObjectTypes |
-| Driver models | ✅ | Newbus, LinuxKPI and WDM, loadable from 4 directories, with unload |
-| Networking | 🟡 | IPv4, ICMP, ARP, UDP, sockets (FreeBSD's own code); no TCP, no DHCP |
+| Driver models | ✅ | Newbus, LinuxKPI and WDM, loadable from 4 directories, with unload; each with its multiprocessor API |
+| Networking | 🟡 | IPv4, ICMP, ARP, UDP, **TCP**, loopback (FreeBSD's own code); no DHCP, no IPv6 |
 | Storage drivers | ✅ | ATA (PIO), AHCI (DMA), MBR partitions |
 | Console | ✅ | VGA text, PS/2 keyboard, serial console (usable as the only input) |
 | GUI / desktop | ❌ | Nothing graphical yet; see §20 |
 
-**Latest test results** (2026-09-26, full machine under QEMU):
-`verification: 160 passed, 0 failed` · `systest: 443 passed, 0 failed` ·
-`thr: 16 passed, 0 failed` · host suite: all checks passed · 20+ boot-time
-self-tests all passing.
+**Latest test results** (2026-09-27, full machine under QEMU, `-smp 4`):
+`verification: 160 passed, 0 failed` · `systest: 510 passed, 0 failed` ·
+`thr: 16 passed, 0 failed` · `smp: 53 passed, 0 failed` · host suite: all
+checks passed · 25+ boot-time self-tests all passing. The same suites pass on
+one CPU (`GENESIS_SMP=1`).
 
 ---
 
@@ -148,14 +148,40 @@ goes near real hardware.
 - **MSI** for PCI devices that support it.
 - **IRQ sharing** between drivers on one line (`kernel/dev/irq.c`).
 
-### Multiprocessor (SMP) 🟡
-`kernel/arch/smp.c` and `acpi.c`: CPUs are found in ACPI's MADT, and the
-secondary CPUs start with INIT-SIPI-SIPI through a real-mode trampoline. Each
-gets per-CPU GDT/TSS/IST and a per-CPU `%gs`, and **IPI-driven TLB
-shootdown** works. **Limit:** the secondary CPUs come up, answer IPIs and then
-idle in `hlt`. **Only the boot CPU runs processes today**, so threads take
-turns on one CPU rather than running in parallel. There is also no interrupt
-balancing: every line goes to CPU 0.
+### Multiprocessor (SMP) ✅
+`kernel/arch/smp.c`, `kernel/proc/bkl.c`, `kernel/proc/sched.c`. CPUs are found
+in ACPI's MADT and started with INIT-SIPI-SIPI through a real-mode trampoline.
+**Every CPU runs user programs**, and threads of one program run on several
+CPUs at the same moment. That is proven by a ping-pong between two spinning
+threads, which exchange 200,000 times in about 150ms and could not finish at
+all on one CPU.
+
+- **Per CPU:** GDT/TSS/IST, a `%gs` block (current thread, idle thread,
+  reschedule flag, time slice, loaded address space), the SYSCALL MSRs, the
+  FPU/SSE enables, and its own **LAPIC timer**, calibrated against the PIT,
+  for preemption. The TSC is calibrated too and backs the performance
+  counters.
+- **The big kernel lock.** One ticket lock serialises the kernel; user code
+  runs in parallel. It is taken on every entry from ring 3 and dropped on
+  every exit, and it is passed across a context switch rather than released.
+  This is the Giant/BKL model FreeBSD 5 and Linux 2.x shipped SMP with. It
+  makes all existing kernel code, and every vendored subsystem, correct on N
+  CPUs at once.
+- **IPIs:** TLB shootdown, remote function call, and reschedule, through
+  per-CPU mailboxes. A CPU spinning for the big lock services them, so the
+  holder can never deadlock waiting for its answer.
+- **TLB shootdown is targeted.** A user-space change goes only to the CPUs
+  that have that address space loaded; a kernel-half change goes to all. A
+  stale copy-on-write fault from another CPU is retried, not fatal.
+- **Scheduling:** an idle thread per CPU, affinity masks, NT's ideal
+  processor, wake-up IPIs to idle CPUs, and migration (a thread can move
+  itself to another CPU mid-call). A thread killed while running on another
+  CPU is stopped by an IPI, and is never reaped until that CPU has let go of it.
+- **Interrupt binding:** a device line can be moved to any CPU
+  (`bus_bind_intr`); the boot self-test moves the NIC's interrupt to CPU 3 and
+  sees it arrive there.
+- **Ctrl-T** on the console prints every task's state and every CPU's current
+  thread.
 
 ### PCI ✅
 Enumeration with **PCI-to-PCI bridge recursion**, BAR sizing, and config-space
@@ -260,22 +286,25 @@ thread dies.
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used
-by the taskqueue, low-memory reclaim and tests. `sleep(9)` really deschedules a
-kernel thread. **Kernel code is deliberately not preemptible** (nothing in the
-kernel locks against it), so a kernel thread must yield or block.
+by the taskqueue, low-memory reclaim, LinuxKPI workqueues and tests. Kernel
+threads run on any CPU. `sleep(9)` really deschedules the caller, and that now
+includes a process inside a system call, which is what makes a blocking TCP
+connect work. **Kernel code is deliberately not preemptible** (the big kernel
+lock covers it), so a kernel thread must yield or block.
 
 ### Scheduler ✅
 **ULE**, the FreeBSD scheduler design (`kernel/proc/sched_ule.c`), behind a
-small four-function policy interface (`sched.c`):
-- per-CPU run queues;
+small policy interface (`sched.c`):
+- one shared queue (the process table), from which each CPU picks what it may
+  run: READY and allowed by the thread's **affinity mask**, or already its own;
 - an **interactivity score** from sleep-time vs run-time, so programs that
   mostly wait on a person are favoured over CPU hogs;
-- **preemptive for user programs**: the timer tick forces a switch;
+- **preemptive for user programs**: each CPU's timer tick forces a switch;
 - CPU-time accounting that never runs backwards (`times(2)`,
   `CLOCK_PROCESS_CPUTIME_ID`).
 
-**Limit:** `MAX_PROCESSES` is **16**, shared by every process, thread and
-kernel thread.
+**Limit:** `MAX_PROCESSES` is **64**, shared by every process, thread,
+kernel thread and per-CPU idle thread.
 
 ---
 
@@ -297,13 +326,15 @@ point. About **130** syscall numbers are dispatched, in these groups:
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`, `rt_sigpending`, `sigaltstack`, `pause` |
 | Time | `clock_gettime`, `clock_getres`, `clock_nanosleep`, `nanosleep`, `gettimeofday`, `times` |
 | Waiting | `poll`, `ppoll`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
-| Sockets | `socket`, `bind`, `connect`, `sendto`, `recvfrom`, `getsockname` |
+| CPUs | `sched_setaffinity`, `sched_getaffinity`, `getcpu` |
+| Sockets | `socket`, `bind`, `connect`, `listen`, `accept`, `accept4`, `shutdown`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt` |
 | Misc | `uname`, `arch_prctl`, `set_tid_address`, `set_robust_list`, `getrandom`, `prctl`, `reboot` |
 
 **Honest errors.** A call that can't be supported fails with the correct
 errno rather than faking success. For example, `rseq` and `prlimit64` return
-`-ENOSYS`, and a TCP socket returns `-EPROTONOSUPPORT`, refused by the protocol
-switch itself, so it will start working the day TCP is added.
+`-ENOSYS`. The socket calls translate at the boundary between the FreeBSD stack
+and Linux programs: sockaddr layout, errno numbers (ECONNREFUSED is 111, not
+BSD's 61), `MSG_` flags and socket-option numbers.
 
 **Genesis `prctl` extensions:** `PR_GENESIS_GRANT_SUPREME`, `_REVOKE_SUPREME`
 and `_QUERY_SUPREME`. See §9 "the supreme privilege".
@@ -349,39 +380,28 @@ refused with `-EBUSY`.
 - **Limits:** 8.3 names only. FAT has no owners or permission bits, so it
   presents itself as root-owned 0755. There are no symlinks.
 
-### ZFS 🟡 — read-only, real pools
-`kernel/zfs/` holds FreeBSD's standalone ZFS reader (~10k lines), **kept
-behind a CDDL licence boundary** that a build check enforces in both
-directions.
-- Mounts real pools made by OpenZFS, and supports **18 pool read features**
-  (lz4, zstd, blake3, skein, sha512, encryption, large blocks, large dnodes,
-  embedded data, …). A pool using any other feature is **refused**, never
-  mounted and hoped for the best.
-- Reads **real NFSv4 ACLs** in *both* on-disk formats (the old ZPL v1 layout
-  and the modern v5 system-attribute layout), and enforces them. This is
-  something Linux-on-ZFS doesn't do.
-- **Write, experimental:** Genesis can allocate space, write checksummed
-  blocks, and commit a transaction group that **real OpenZFS imports and
-  scrubs clean**, but the full copy-on-write chain doesn't settle, so no file
-  can be changed yet. Writes stay switched off.
-
-### gnfs 🟡 — Genesis's own copy-on-write filesystem
+### gnfs ✅ — Genesis's own copy-on-write filesystem (version 2)
 `kernel/gnfs/`, BSD-2-Clause, new code; design notes in
-`kernel/include/gnfs_layout.h`.
-- **Crash-safe by construction:** a ring of root records (the ZFS uberblock
-  idea, reused), copy-on-write for every block, and a whole-structure
-  ping-pong for the free-space bitmap and object table. A torn write leaves the
-  previous state mountable.
-- A flat object table, where an object number is a direct array index.
-- Files and directories with create, read, write (gaps read as zero),
-  truncate, mkdir, rmdir, unlink, statfs.
+`kernel/include/gnfs_layout.h`. (ZFS was removed on 2026-09-26; gnfs replaced
+it everywhere, including the ACL test fixtures.)
+- **Crash-safe by construction:** a ring of root records, copy-on-write for
+  every block, and ping-pong regions for the free-space bitmap and object
+  table, committed **incrementally** (only what changed). A torn write leaves
+  the previous state mountable.
+- An object table sized to the volume; freed object numbers are reused.
+- Files up to about **1GB** through direct, indirect and double-indirect
+  block maps; directories that grow across blocks; create, read, write (gaps
+  read as zero), truncate (a shrink really forgets the old bytes), **rename**,
+  mkdir, rmdir, unlink, statfs.
+- **Snapshots**: `mkdir /.snapshots/NAME` takes one and `rmdir` deletes it; a
+  snapshot is a read-only view of the whole volume as it was, and the blocks
+  it holds are never reused until it is gone.
 - **Full ACL support**, stored per object in its own COW block, with
   inheritance on create, chmod, chown, the creator owning new objects, and
   setgid/sticky directories. See §9.
 - Formatted by `tools/mkgnfs.c`, which uses the same formatting code the kernel
   does.
-- **Limits:** files and directories are capped at **48KB** (no indirect blocks
-  yet), `rename` isn't implemented, and snapshots and datasets aren't done.
+- **Limits:** one dataset per volume (no named datasets), no symlinks.
 
 ### Other file-like objects ✅
 **Pipes** (with SIGPIPE/EPIPE), **eventfd**, **socketpair** (two crossed
@@ -395,7 +415,7 @@ vtable, so `read`/`write`/`poll` work on all of them.
 Genesis's permission system is one of its most distinctive parts.
 
 ### One ACL model, two views ✅
-Every object's permissions are an **NFSv4 ACL**, the same model ZFS stores and
+Every object's permissions are an **NFSv4 ACL**, the same model ZFS uses and
 the same one Windows uses (NFSv4 took it from NT, and the access-mask bits are
 identical). There's no separate "Unix permissions" system to keep in sync:
 - the **POSIX mode** (`rwxr-xr-x`) is a *projection* computed from the ACL
@@ -468,11 +488,13 @@ Exactly as Windows does, before the first instruction runs
 
 Every structure offset is checked at build time against the documented ABI.
 
-### NT system calls ✅ (20)
+### NT system calls ✅ (31)
 | Area | Calls |
 |---|---|
-| Process | `NtTerminateProcess` |
-| Threads | `NtCreateThreadEx`, `NtTerminateThread`, `NtQueryInformationThread` |
+| Process | `NtTerminateProcess`, `NtQueryInformationProcess` (basic info, affinity, times, priority class), `NtSetInformationProcess` (affinity, priority class) |
+| Threads | `NtCreateThreadEx`, `NtTerminateThread`, `NtQueryInformationThread` (basic, times, priorities, group affinity, ideal processor), `NtSetInformationThread` (affinity, group affinity, ideal processor, priorities) |
+| System | `NtQuerySystemInformation(Ex)` (basic info, processor info, per-CPU performance, logical-processor information in both forms) |
+| Scheduling & time | `NtYieldExecution`, `NtDelayExecution`, `NtGetCurrentProcessorNumber(Ex)`, `NtQueryPerformanceCounter` (the calibrated TSC), `NtQuerySystemTime` |
 | Files | `NtOpenFile`, `NtReadFile`, `NtWriteFile`, `NtClose` |
 | Memory | `NtAllocateVirtualMemory` |
 | Console | `NtDisplayString` |
@@ -487,8 +509,14 @@ The numbers live in one header (`kernel/include/nt.h`); ntdll's stubs are
 
 ### ntdll.dll ✅ (clean-room, `src/ntdll/`)
 The system-call stubs above, plus `NtCurrentTeb`, `RtlInitUnicodeString`,
-`RtlDosPathNameToNtPathName_U`, `RtlAllocateHeap`/`RtlFreeHeap`,
-`LdrInitializeThunk`, `RtlUserThreadStart` and `RtlExitUserThread`.
+`RtlDosPathNameToNtPathName_U`, `RtlAllocateHeap`/`RtlFreeHeap` (thread-safe:
+the heap is locked, because threads of one process now run concurrently),
+`LdrInitializeThunk`, `RtlUserThreadStart`, `RtlExitUserThread`, and the
+user-mode synchronisation built for real parallelism (`src/ntdll/sync.c`):
+**critical sections** (spin, then block on an auto-reset event created on
+first contention, as NT does), **SRW locks**, **condition variables**,
+**interlocked SLists**, `RtlGetCurrentProcessorNumber(Ex)` and
+`RtlQueryPerformanceCounter/Frequency`.
 
 ### kernel32.dll 🟡 (clean-room, `src/kernel32/`)
 | Area | Exports |
@@ -496,7 +524,11 @@ The system-call stubs above, plus `NtCurrentTeb`, `RtlInitUnicodeString`,
 | Errors | `GetLastError`, `SetLastError` (NTSTATUS → Win32 error mapping) |
 | Files | `GetStdHandle`, `CreateFileW`/`A`, `ReadFile`, `WriteFile`, `CloseHandle` |
 | Process | `ExitProcess`, `GetCurrentProcess`, `GetCurrentProcessId`, `GetCommandLineW`/`A`, `GetEnvironmentStringsW`, `FreeEnvironmentStringsW`, `GetCurrentDirectoryW`, `GetModuleHandleW` |
-| Threads | `CreateThread`, `ExitThread`, `GetCurrentThread`, `GetCurrentThreadId`, `GetThreadId`, `GetExitCodeThread`, `WaitForSingleObject` |
+| Threads | `CreateThread`, `ExitThread`, `GetCurrentThread`, `GetCurrentThreadId`, `GetThreadId`, `GetExitCodeThread`, `WaitForSingleObject`, `SwitchToThread`, `Sleep`, `SleepEx` |
+| Processors | `GetSystemInfo`, `GetNativeSystemInfo`, `GetActiveProcessorCount`, `GetMaximumProcessorCount`, the group counts, `GetCurrentProcessorNumber(Ex)`, `GetLogicalProcessorInformation(Ex)` |
+| Affinity & priority | `Get/SetProcessAffinityMask`, `SetThreadAffinityMask`, `Set/GetThreadGroupAffinity`, `SetThreadIdealProcessor(Ex)`, `GetThreadIdealProcessorEx`, `Set/GetThreadPriority`, `Set/GetPriorityClass`, `GetProcessTimes`, `GetThreadTimes` |
+| Synchronisation | `Initialize/Enter/TryEnter/Leave/DeleteCriticalSection` (+ `AndSpinCount`, `Ex`), the SRW lock family, `InitializeConditionVariable`, `Wake(All)ConditionVariable`, `SleepConditionVariableCS/SRW`, the SList family. Most are **forwarders** into ntdll, as on Windows |
+| Time | `QueryPerformanceCounter/Frequency`, `GetTickCount(64)`, `GetSystemTimeAsFileTime`, `GetSystemTimePreciseAsFileTime` |
 | Memory | `GetProcessHeap`, `HeapAlloc`, `HeapFree`, `VirtualAlloc`, `VirtualFree` |
 
 ### Windows test programs in `/bin` ✅
@@ -507,6 +539,7 @@ The system-call stubs above, plus `NtCurrentTeb`, `RtlInitUnicodeString`,
 | `k32.exe` | kernel32-only imports two levels deep; command line and parameters |
 | `sync.exe` | Events, semaphores and mutexes by name, through ntdll (29 checks) |
 | `thr.exe` | Win32 threads end to end (16 checks) |
+| `smp.exe` | The multiprocessor from Win32: processor queries, affinity moves, parallel threads, critical sections/SRW/condition variables/SLists and the heap under real contention (53 checks) |
 
 ### Not yet ❌
 GUI (user32, gdi32), structured exception handling, the registry, COM, TLS,
@@ -577,7 +610,12 @@ The matching engine underneath all three is Newbus-shaped.
   **devclass inheritance**, device names/units (`re0`), a **hints** file in
   FreeBSD's format, and `BUS_PROBE_NOWILDCARD`;
 - bus_space and bus_dma, per-device sysctl trees (`dev.re.0.*`), interrupt
-  setup/teardown.
+  setup/teardown, **`bus_bind_intr`** (really moves the line to a CPU) and
+  `bus_describe_intr`;
+- **the multiprocessor KPI** (`kernel/bsd/kern_smp.c`): `mp_ncpus`, `curcpu`,
+  `CPU_FOREACH` over the CPUs that exist, `all_cpus`, `smp_rendezvous(_cpus)`
+  with real setup/action/teardown barriers, `DPCPU_*` per-CPU variables, and a
+  `sched_bind` that really moves the calling thread.
 
 **The proof:** `if_re.ko` is FreeBSD's **own, unmodified** `if_re.c` (4,295
 lines). It loads at runtime, attaches to QEMU's RTL8139C+, drives its PHY over
@@ -590,7 +628,20 @@ Linux driver **source** compiles against Genesis's headers: `struct
 pci_driver`, `module_pci_driver`, `pr_info`, `kzalloc`, `ioremap`,
 `readl`/`writel`, spinlocks and mutexes, lists, atomics, bitops, delays and
 jiffies. `lkpi_ahci.ko` is ordinary Linux-style driver source that reads a
-real AHCI controller's registers through a memory BAR. The Linux in-kernel
+real AHCI controller's registers through a memory BAR.
+
+**The multiprocessor surface** (`kernel/driver/lkpi_smp.c`):
+`smp_processor_id`, `get_cpu`/`put_cpu`, cpumasks and the `for_each_*_cpu`
+iterators, `smp_call_function(_single/_many/_any)`, `on_each_cpu`,
+`preempt_*`, `local_irq_*`; **per-CPU variables done Linux's way**
+(`DEFINE_PER_CPU`, `per_cpu`, `this_cpu_*`, `alloc_percpu`: CPU n's copy is at
+`__per_cpu_offset[n]` from CPU 0's, and a *loaded module's* per-CPU section is
+placed and replicated by the module loader, checked by `lkpi_pcpu.ko`);
+**kernel threads** with the Linux lifecycle (`kthread_run`,
+`kthread_create_on_cpu`, `kthread_stop`, `wake_up_process`, the
+`set_current_state`/`schedule` sleep protocol); **completions**; and
+**workqueues** with a bound worker per CPU, delayed work, flush and cancel;
+`late_initcall`. The Linux in-kernel
 binary interface isn't stable even on Linux, so compatibility is at the source
 level; that was a deliberate decision.
 
@@ -605,6 +656,14 @@ level; that was a deliberate decision.
   function driver) and completion routines; **IRQL mapped onto the LAPIC's
   task-priority register**. The self-test sends an IRP through filter →
   function → completion.
+- **the multiprocessor surface** (`kernel/driver/wdm_smp.c`, all exported to
+  loaded drivers): `KeGetCurrentProcessorNumber(Ex)`,
+  `KeQueryActiveProcessor*`, the group queries, `KeNumberProcessors`,
+  `KeIpiGenericCall`, `KeGenericCallDpc` with its barrier, **DPC objects** with
+  per-CPU queues and `KeSetTargetProcessorDpc`, `KeSetSystemAffinityThread(Ex)`
+  and its revert, the DPC-level and **in-stack queued** spin locks,
+  `ExInterlocked*List`, `KeStallExecutionProcessor` and
+  `KeQueryPerformanceCounter`.
 
 ### Loading and unloading ✅ (`kernel/driver/kldload.c`)
 - Modules are loaded from **four directories**: `/boot/kernel`,
@@ -633,13 +692,14 @@ layer is hand-written.
 | Feature | Status |
 |---|---|
 | IPv4, ICMP (ping replies), ARP, UDP | ✅ verified end to end at boot |
+| **TCP** | ✅ FreeBSD's own `tcp_input/output/subr/timer/usrreq/reass/sack/syncache/hostcache/timewait/ecn` and NewReno congestion control, vendored whole |
+| **Loopback** | ✅ `lo0` at `127.0.0.1/8` (FreeBSD's `if_loop.c`); packets a host sends itself go through a real deferred netisr queue |
 | Routing table, default route, `SIOCAIFADDR` address setup | ✅ |
-| **Sockets from user programs**: `socket`, `bind`, `connect`, `sendto`, `recvfrom`, and plain `read`/`write` | ✅ systest sends a real DNS query to QEMU's resolver and checks the reply (the reply needs the host to have a working DNS upstream) |
-| `poll` on sockets | 🟡 the wake-up is implemented but has no test yet: proving it needs data arriving on demand, which needs a loopback interface |
+| **Sockets from user programs**: `socket`, `bind`, `connect` (blocking and non-blocking), `listen`, `accept4`, `shutdown`, `send*`/`recv*` including `sendmsg`/`recvmsg`, socket options, and plain `read`/`write` | ✅ systest runs TCP over lo0: handshake, data both ways, `MSG_PEEK`/`MSG_WAITALL`, half-close, `ECONNREFUSED`, non-blocking connect with `SO_ERROR` |
+| `poll` on sockets | ✅ listeners report `POLLIN` for a waiting connection; connecting sockets report `POLLOUT` when done |
 | NIC | ✅ RTL8139C+ via the unmodified FreeBSD `if_re` driver |
 | Address | 🟡 static `10.0.2.15/24`, gateway `10.0.2.2` (QEMU user networking) |
-| **TCP** | ❌ not vendored yet; everything below it exists |
-| DHCP, loopback interface, `listen`/`accept`, IPv6 | ❌ |
+| DHCP, IPv6 | ❌ |
 
 ---
 
@@ -657,7 +717,9 @@ real thing, not a stub (`kernel/bsd/`):
   kernel environment and `log()`, the `sys/time.h` clock family;
 - **locks**: mutexes, rwlocks and sx over Genesis's own `mtx` implementation
   (`kernel/lib/mtx.c`), which has bounded-spin deadlock reports and held-lock
-  dumps, and passes a two-CPU contention test with no lost increments.
+  dumps, and passes a four-CPU contention test with no lost increments;
+- **modules**: `DECLARE_MODULE` delivers `MOD_LOAD` at boot (that is how
+  NewReno registers itself).
 
 ---
 
@@ -669,6 +731,9 @@ real thing, not a stub (`kernel/bsd/`):
 - **kprintf** with field widths and colours, mirrored to serial.
 - **NT syscall trace**: failing NT calls print their number and status.
 - **Lock diagnostics**: deadlock reports and held-lock dumps.
+- **Ctrl-T** on the console: every task (state, CPU, what it waits on) and
+  every CPU's current thread. `tools/guest_dump.py` runs commands in the guest
+  and presses it.
 - `build.py debug` starts QEMU paused with a GDB stub.
 
 ---
@@ -679,16 +744,17 @@ Four layers, and every feature above lives in at least one:
 
 | Layer | What it is | Runs |
 |---|---|---|
-| **Host suite** (`tests/host/run.sh`) | Kernel code (VFS, FAT, gnfs, ACLs, ZFS reader, bcache, PE, paths, volumes, …) compiled natively and tested directly, plus build-time checks: the ZFS licence boundary and staged-tree name collisions | On the build machine |
-| **Boot self-tests** | 20+ checks that run every boot: SMP TLB shootdown, IOAPIC, IDT, IRQ, MSI, locks, ULE, kernel threads, condvars, taskqueue, callout, mbuf, bus, W^X, module unload, WDM IRPs, AHCI DMA, page cache, low memory, dispatcher objects, ACL privilege, network ARP/ICMP | Inside the kernel |
-| **systest** (`src/systest.c`) | 443 checks of the syscall interface from a real user program, deliberately without libc so errnos aren't hidden. Permission checks run in child processes as real uids | Inside the booted machine |
+| **Host suite** (`tests/host/run.sh`) | Kernel code (VFS, FAT, gnfs, ACLs, bcache, PE, paths, volumes, …) compiled natively and tested directly, plus a byte-for-byte check of the gnfs ACL fixture and staged-tree name collisions | On the build machine |
+| **Boot self-tests** | 25+ checks that run every boot: SMP TLB shootdown, the WDM, LinuxKPI and FreeBSD multiprocessor APIs, interrupt migration, IOAPIC, IDT, IRQ, MSI, locks on 4 CPUs, ULE, kernel threads, condvars, taskqueue, callout, mbuf, bus, W^X, module unload, WDM IRPs, AHCI DMA, page cache, low memory, dispatcher objects, ACL privilege, network ARP/ICMP/UDP | Inside the kernel |
+| **systest** (`src/systest.c`) | 510 checks of the syscall interface from a real user program, deliberately without libc so errnos aren't hidden: including TCP over lo0, gnfs v2, and threads running on two CPUs at once. Permission checks run in child processes as real uids | Inside the booted machine |
 | **verif** (`src/verif.c`) | 160 checks plus the bug postmortems and the "needs a human" queue | Inside the booted machine |
-| **Windows programs** | `sync.exe` (29), `thr.exe` (16), `k32.exe`, `hello.exe`, `hand.exe` | Inside the booted machine |
+| **Windows programs** | `sync.exe` (29), `thr.exe` (16), `smp.exe` (53), `k32.exe`, `hello.exe`, `hand.exe` | Inside the booted machine |
 
-**`tools/guest_run.py`** boots the full machine (FAT root, two ZFS pools, a
-fresh gnfs volume, AHCI, the NIC), types commands into the shell over the
-serial port, and collects each program's `N passed, M failed` tally. The whole
-run takes about five minutes:
+**`tools/guest_run.py`** boots the full machine (4 CPUs, FAT root, a fresh
+gnfs volume and the gnfs ACL fixture, AHCI, the NIC), types commands into the
+shell over the serial port, and collects each program's `N passed, M failed`
+tally (verif, systest, thr.exe and smp.exe by default). `GENESIS_SMP=1` runs
+it on one CPU. The whole run takes about ten minutes:
 
 ```
 wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 tools/guest_run.py > build/guest.txt 2>&1"
@@ -719,7 +785,8 @@ points at this same working copy.
 | `python3 build.py test` | The kernel heap allocator's native test |
 | `python3 build.py clean` | Remove build products, keeping `disk.img` |
 | `bash tests/host/run.sh` | The host test suite |
-| `python3 tools/guest_run.py` | Boot and run verif, systest and thr.exe |
+| `python3 tools/guest_run.py` | Boot and run verif, systest, thr.exe and smp.exe (`GENESIS_SMP=N` picks the CPU count, default 4) |
+| `python3 tools/guest_dump.py CMD...` | Run commands, then press Ctrl-T and print the task dump (for a guest that hangs) |
 | `sh src/<ntdll\|kernel32\|winthread\|…>/build.sh` | Build a Windows DLL or program (MinGW-w64) |
 | `tools/build_user.sh` | Build every user program (its final staging step needs `sudo`) |
 
@@ -732,15 +799,17 @@ Toolchain: gcc, nasm, ld, QEMU, mkfs.fat, **MinGW-w64** (Windows programs),
 
 Collected in one place so nobody has to discover them the hard way:
 
-- **One CPU runs programs.** The second CPU is up but idle.
-- **16 process slots in total**, shared by processes, threads and kernel
-  threads.
-- **Kernel code is not preemptible**; a kernel loop that doesn't yield hangs
-  the machine.
+- **The kernel runs on one CPU at a time** (the big kernel lock); programs
+  run on all of them. System-call-heavy workloads do not scale with CPUs;
+  compute does.
+- **64 process slots in total**, shared by processes, threads, kernel threads
+  and the per-CPU idle threads.
+- **Kernel code is not preemptible**; a kernel loop that doesn't yield holds
+  the big lock and stalls every CPU's system calls.
 - **No GUI**: text console only.
-- **No TCP, no DHCP, no loopback.**
-- **ZFS is read-only**; gnfs files are capped at 48KB; there are no symlinks
-  on any filesystem; FAT is 8.3-only.
+- **No DHCP, no IPv6.**
+- gnfs has one dataset per volume; there are no symlinks on any filesystem;
+  FAT is 8.3-only.
 - **No file-backed mmap, no swap, no demand paging.**
 - **No USB** (no controller or HID drivers); input is PS/2 or serial.
 - **No NVMe, no GPT**; ATA is PIO-only.
@@ -765,7 +834,7 @@ ROADMAP item 14's dependency-ordered list:
 
 | Step | What | Status |
 |---|---|---|
-| (a) | **Full multithreading** | 🟡 started: POSIX and Win32 threads work; TLS, more slots and multi-CPU remain |
+| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads run on every CPU with Win32 synchronisation; Windows TLS remains |
 | (b) | Dispatcher objects completed: waits blocking threads, APCs | 🟡 objects and waits exist; APCs don't |
 | (c) | Structured exception handling (x64 table-based) | ❌ |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |
@@ -781,13 +850,13 @@ ROADMAP item 14's dependency-ordered list:
 | (n) | Session/service architecture (smss, services) | ❌ |
 | (o) | A shell: explorer-like, or a native fallback | ❌ |
 | (p) | NTFS (read at least) | ❌ |
-| (q) | TCP | ❌ |
+| (q) | TCP | ✅ |
 | (r) | USB (controllers, HID, mass storage) | ❌ |
 
 ROADMAP.md is candid about the scale: this list is larger than everything built
 so far combined, and ReactOS has worked on almost exactly this problem since
 1996. The foundations here (the object manager, the PE loader, WDM, the unified
-ACL model, and now threads) are the parts everything above sits on.
+ACL model, threads, SMP and TCP) are the parts everything above sits on.
 
 ---
 
@@ -803,7 +872,6 @@ Genesis/
 │   ├── proc/                  processes, threads, ULE scheduler, signals, futex, syscalls
 │   ├── fs/                    VFS, FAT16, ACLs, NT security descriptors, caches, pipes
 │   ├── gnfs/                  gnfs, Genesis's native COW filesystem
-│   ├── zfs/                   vendored ZFS reader (CDDL, kept separate)
 │   ├── dev/                   ATA, AHCI, disks, partitions, volumes, PCI, IRQ, console, serial, timer, RTC
 │   ├── driver/                Newbus, LinuxKPI, WDM, module loaders, hints
 │   ├── exec/                  ELF, PE, NT syscalls, TEB/PEB construction
@@ -813,13 +881,13 @@ Genesis/
 │   └── include/               all headers (flat, on purpose; see kernel/README.md)
 ├── src/
 │   ├── ntdll/  kernel32/      clean-room Windows DLLs
-│   ├── winhello/ hand/ k32demo/ winsync/ winthread/   Windows test programs
+│   ├── winhello/ hand/ k32demo/ winsync/ winthread/ winsmp/   Windows test programs
 │   ├── rtld/                  the ELF dynamic linker (ld-gen.so)
-│   ├── kmod/                  loadable driver modules (if_re, lkpi_ahci, nb_rtl, …)
+│   ├── kmod/                  loadable driver modules (if_re, lkpi_ahci, lkpi_pcpu, nb_rtl, …)
 │   ├── systest.c  verif.c     the in-machine test suites
 │   └── hello.c hello_musl.c ls.c mkprobe.c
 ├── root/                      the files staged onto the boot disk (/bin, /lib, /boot, /wsr)
-├── tests/host/                host test suite and ZFS fixtures
+├── tests/host/                host test suite and the gnfs ACL fixture
 ├── tools/                     guest_run.py, mkgnfs.c, fatfs.py, build_user.sh, …
 ├── build.py                   the build
 └── ROADMAP.md  ROADMAP-archive.md  handoff.md  FEATURES.md

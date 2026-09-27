@@ -145,6 +145,38 @@ static BYTE  *heap_cursor;
 static SIZE_T heap_left;
 static block_t *heap_free_list;
 
+/* The heap lock. Threads of one process run on several CPUs at once, and
+ * the free list and bump cursor are one structure: two HeapAllocs racing
+ * would hand out the same block. A spin lock that yields the CPU when it
+ * does not get the lock at once - holding it is a few dozen instructions, so
+ * a waiter rarely spins long, and yielding keeps a waiter from burning the
+ * CPU the holder may need. HEAP_NO_SERIALIZE skips it, as on Windows, for a
+ * caller that serialises for itself. */
+#define HEAP_NO_SERIALIZE 0x00000001u
+static volatile LONG heap_lock;
+
+static void heap_acquire(DWORD flags) {
+    int spins = 0;
+
+    if (flags & HEAP_NO_SERIALIZE) {
+        return;
+    }
+    while (__atomic_exchange_n(&heap_lock, 1, __ATOMIC_ACQUIRE) != 0) {
+        if (++spins < 64) {
+            __asm__ volatile ("pause");
+        } else {
+            NtYieldExecution();
+            spins = 0;
+        }
+    }
+}
+
+static void heap_release(DWORD flags) {
+    if (!(flags & HEAP_NO_SERIALIZE)) {
+        __atomic_store_n(&heap_lock, 0, __ATOMIC_RELEASE);
+    }
+}
+
 static SIZE_T align_up(SIZE_T n) {
     return (n + (HEAP_ALIGN - 1)) & ~(SIZE_T)(HEAP_ALIGN - 1);
 }
@@ -172,6 +204,7 @@ PVOID RtlAllocateHeap(PVOID heap, DWORD flags, SIZE_T size) {
 
     (void)heap;
 
+    heap_acquire(flags);
     /* First fit. A first-fit scan over one list is the wrong long-term
      * answer and the right first one: it is short enough to be obviously
      * correct, which is what matters while everything above it is new. */
@@ -185,6 +218,7 @@ PVOID RtlAllocateHeap(PVOID heap, DWORD flags, SIZE_T size) {
     }
 
     if (heap_left < total && !heap_grow(total)) {
+        heap_release(flags);
         return 0;
     }
     b = (block_t *)heap_cursor;
@@ -194,6 +228,7 @@ PVOID RtlAllocateHeap(PVOID heap, DWORD flags, SIZE_T size) {
     heap_left   -= total;
 
 found:
+    heap_release(flags);
     {
         BYTE *payload = (BYTE *)b + align_up(sizeof(block_t));
 
@@ -217,8 +252,10 @@ BOOL RtlFreeHeap(PVOID heap, DWORD flags, PVOID address) {
         return 1;                          /* freeing nothing succeeds */
     }
     b = (block_t *)((BYTE *)address - align_up(sizeof(block_t)));
+    heap_acquire(flags);
     b->next_free = heap_free_list;
     heap_free_list = b;
+    heap_release(flags);
     return 1;
 }
 

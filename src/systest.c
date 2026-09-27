@@ -144,6 +144,10 @@ static i64 sc6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 #define SYS_umask          95
 #define SYS_madvise        28
 #define SYS_sched_yield    24
+#define SYS_sched_setaffinity 203
+#define SYS_sched_getaffinity 204
+#define SYS_getcpu        309
+#define SYS_clock_gettime_ 228
 #define SYS_setsid        112
 #define SYS_getsid        124
 #define SYS_setresuid     117
@@ -2033,6 +2037,157 @@ static void test_clone_threads(void) {
                    "exited threads are reclaimed, not leaked");
 }
 
+/* --- the multiprocessor -----------------------------------------------------
+ *
+ * sched_getaffinity / sched_setaffinity / getcpu, and the proof that two
+ * threads of this process really run at the same time: a ping-pong on
+ * shared memory between two threads pinned to two CPUs, spinning, never
+ * blocking. On one CPU every hand-off would wait for a timer preemption and
+ * the exchanges would take many minutes; the bound below is seconds. */
+static u8 smp_stack[16384] __attribute__((aligned(16)));
+static volatile int smp_ctid;
+static volatile int smp_ball;
+static volatile int smp_pong_cpu = -1;
+#define SMP_PINGS 100000
+#define SMP_SPIN_LIMIT 400000000L
+
+static void pong_body(void) {
+    u64 mask = 2;
+    u32 cpu = 99;
+    int i;
+    long spin;
+
+    sc3(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
+    sc3(SYS_getcpu, &cpu, 0, 0);
+    smp_pong_cpu = (int)cpu;
+    for (i = 0; i < SMP_PINGS; i++) {
+        for (spin = 0; smp_ball != 2 * i + 1 && spin < SMP_SPIN_LIMIT; spin++) {
+            __asm__ volatile ("pause");
+        }
+        smp_ball = 2 * i + 2;
+    }
+}
+
+/* A thread that is NOT joined on the spot, unlike raw_thread's. */
+static i64 start_thread(void (*fn)(void)) {
+    i64 ret;
+    register i64 r10 __asm__("r10") = 0;
+    register i64 r8  __asm__("r8")  = (i64)&smp_ctid;
+
+    smp_ctid = 1;
+    __asm__ volatile (
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jnz 1f\n\t"
+        "call *%%rbx\n\t"
+        "movl $60, %%eax\n\t"
+        "xorl %%edi, %%edi\n\t"
+        "syscall\n\t"
+        "1:\n\t"
+        : "=a"(ret)
+        : "a"(SYS_clone),
+          "D"(CLONE_THREAD_FLAGS | CLONE_CHILD_CLEARTID_F),
+          "S"(smp_stack + sizeof(smp_stack)), "d"(0),
+          "r"(r10), "r"(r8), "b"(fn)
+        : "rcx", "r11", "memory");
+    if (ret < 0) {
+        smp_ctid = 0;
+    }
+    return ret;
+}
+
+static i64 mono_ms(void) {
+    struct { i64 sec; i64 nsec; } ts;
+
+    sc2(SYS_clock_gettime_, 1 /* CLOCK_MONOTONIC */, &ts);
+    return ts.sec * 1000 + ts.nsec / 1000000;
+}
+
+static void test_smp(void) {
+    u64 mask = 0, all;
+    u8  big[128];
+    u32 cpu = 99, node = 99;
+    int ncpu = 0, k, landed = 1;
+
+    section("the multiprocessor: affinity, getcpu, parallel threads");
+
+    check_eq(sc3(SYS_sched_getaffinity, 0, sizeof(big), big), 8,
+             "sched_getaffinity answers with an 8-byte mask");
+    for (k = 0; k < 8; k++) {
+        mask |= (u64)big[k] << (8 * k);
+    }
+    all = mask;
+    for (k = 0; k < 64; k++) {
+        ncpu += (int)((all >> k) & 1);
+    }
+    check(ncpu >= 1, "and names at least one CPU");
+    check(sc3(SYS_sched_getaffinity, 0, 4, big) == -22,
+          "a buffer smaller than the mask is EINVAL");
+    check_eq(sc3(SYS_getcpu, &cpu, &node, 0), 0, "getcpu succeeds");
+    check(cpu < (u32)ncpu && node == 0, "and names a CPU that exists, node 0");
+
+    for (k = 0; k < ncpu; k++) {
+        u64 one = 1ULL << k;
+
+        if (sc3(SYS_sched_setaffinity, 0, sizeof(one), &one) != 0) {
+            landed = 0;
+            continue;
+        }
+        sc3(SYS_getcpu, &cpu, 0, 0);
+        if ((int)cpu != k) {
+            landed = 0;
+        }
+    }
+    check(landed, "sched_setaffinity moves this thread to each CPU in turn");
+    {
+        u64 none = 1ULL << 40;
+
+        check_eq(sc3(SYS_sched_setaffinity, 0, sizeof(none), &none), -22,
+                 "a mask naming no CPU that exists is EINVAL");
+    }
+    sc3(SYS_sched_setaffinity, 0, sizeof(all), &all);
+    mask = 0;
+    sc3(SYS_sched_getaffinity, 0, sizeof(mask), &mask);
+    check(mask == all, "and the full mask comes back");
+
+    if (ncpu < 2) {
+        out("  skip  one CPU - the parallel check needs two (-smp 2 or more)\n");
+        return;
+    }
+    {
+        u64 zero_only = 1;
+        i64 t0, t1;
+        int i;
+        long spin;
+        int stuck = 0;
+
+        sc3(SYS_sched_setaffinity, 0, sizeof(zero_only), &zero_only);
+        smp_ball = 0;
+        smp_pong_cpu = -1;
+        check(start_thread(pong_body) > 0, "a second thread, pinned to CPU 1");
+        t0 = mono_ms();
+        for (i = 0; i < SMP_PINGS && !stuck; i++) {
+            smp_ball = 2 * i + 1;
+            for (spin = 0; smp_ball != 2 * i + 2; spin++) {
+                if (spin > SMP_SPIN_LIMIT) {
+                    stuck = 1;
+                    break;
+                }
+                __asm__ volatile ("pause");
+            }
+        }
+        t1 = mono_ms();
+        while (smp_ctid != 0) {
+            sc0(SYS_sched_yield);
+        }
+        sc3(SYS_sched_setaffinity, 0, sizeof(all), &all);
+        check_eq(smp_pong_cpu, 1, "which really ran on CPU 1");
+        check(!stuck && t1 - t0 < 10000,
+              "100000 spin hand-offs complete in seconds - both threads "
+              "running AT ONCE");
+    }
+}
+
 static void test_clone(void) {
     i64 pid, reaped;
     int status = 0;
@@ -2906,6 +3061,7 @@ void _start(void) {
     test_fork();
     test_pipes();
     test_clone();
+    test_smp();
     test_fpu();
     test_exec();
     test_vfork();

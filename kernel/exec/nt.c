@@ -183,7 +183,7 @@ static int unicode_to_path(uint64 str_ptr, char *out, uint64 cap) {
  * type needs, so for anything narrower than 64 bits the high half is stale
  * stack. A caller of this function fetching a ULONG, a DWORD or a BOOL must
  * mask; see nt_rw_file's Length, which is where that was learned. */
-static int nt_stack_arg(uint64 rsp, int n, uint64 *out) {
+int nt_stack_arg(uint64 rsp, int n, uint64 *out) {
     uint64 at = rsp + NT_STACK_ARG_OFFSET(n);
 
     if (!user_ptr_ok(at) || !user_ptr_ok(at + 7)) {
@@ -511,7 +511,7 @@ static uint64 nt_handle_out(object_t *obj, uint64 handle_out, uint32 access) {
 }
 
 /* The object a HANDLE names, or NULL. */
-static object_t *nt_object_of(uint64 handle) {
+object_t *nt_object_of(uint64 handle) {
     process_t *p = proc_current();
     open_file_t *f;
     int index = nt_handle_index(handle);
@@ -1117,13 +1117,20 @@ typedef char nt_tbi_layout[(sizeof(nt_thread_basic_info_t) == 0x30 &&
     __builtin_offsetof(nt_thread_basic_info_t, unique_thread) == 0x18)
     ? 1 : -1];
 
+uint64 nt_query_thread_more(uint64 handle, uint64 cls, uint64 buf, uint64 len,
+                            uint64 retlen);
+uint64 nt_thread_affinity(uint64 handle);
+int32  nt_thread_priority(uint64 handle);
+
 static uint64 nt_query_thread(uint64 handle, uint64 info_class,
                               uint64 buf, uint64 len, uint64 retlen_ptr) {
     process_t *p = proc_current();
     nt_thread_basic_info_t tbi;
 
     if ((uint32)info_class != ThreadBasicInformation) {
-        return STATUS_INVALID_INFO_CLASS;
+        /* ThreadTimes, the priorities, group affinity and the ideal
+         * processor - kernel/exec/nt_sys.c. */
+        return nt_query_thread_more(handle, info_class, buf, len, retlen_ptr);
     }
     if ((uint32)len < sizeof(tbi)) {
         return STATUS_INFO_LENGTH_MISMATCH;
@@ -1134,9 +1141,11 @@ static uint64 nt_query_thread(uint64 handle, uint64 info_class,
 
     tbi.pad0           = 0;
     tbi.unique_process = (uint64)p->tgid;
-    tbi.affinity_mask  = 1;           /* one CPU runs user code */
-    tbi.priority       = 8;           /* THREAD_PRIORITY_NORMAL's base */
-    tbi.base_priority  = 0;
+    /* The thread's real mask and the priority its last SetThreadPriority
+     * gave it - every CPU runs user code now. */
+    tbi.affinity_mask  = nt_thread_affinity(handle);
+    tbi.priority       = nt_thread_priority(handle);
+    tbi.base_priority  = tbi.priority - 8;
 
     if (handle == NT_CURRENT_THREAD) {
         tbi.exit_status   = STATUS_PENDING;
@@ -1172,7 +1181,14 @@ static uint64 nt_query_thread(uint64 handle, uint64 info_class,
 
 static uint64 nt_trace(uint64 number, uint64 status) {
 #if NT_TRACE_FAILURES
-    if (status != STATUS_SUCCESS) {
+    /* ERROR severity only (top two bits set). Success and informational
+     * codes are not failures - STATUS_TIMEOUT, STATUS_NO_YIELD_PERFORMED,
+     * and the calls whose "status" is a value (the processor number,
+     * SetThreadIdealProcessor's previous ideal) all have them clear, and
+     * printing those buried the real failures under noise. */
+    if ((status & 0xC0000000u) == 0xC0000000u &&
+        (uint32)status != STATUS_INFO_LENGTH_MISMATCH &&
+        (uint32)status != STATUS_BUFFER_TOO_SMALL) {
         print_string("  NT call ", 0x0E);
         print_hex((uint32)number, 0x0E);
         print_string(" -> status ", 0x0E);
@@ -1309,7 +1325,15 @@ uint64 nt_syscall_dispatch(struct syscall_frame *frame) {
                                             frame->r8, frame->r9, retlen));
         }
 
-        default:
+        default: {
+            /* The machine / process / scheduling calls live in nt_sys.c. */
+            int handled = 0;
+            uint64 st = nt_sys_dispatch(frame, &handled);
+
+            if (handled) {
+                return nt_trace(frame->rax, st);
+            }
+        }
             /* Printing the number is the same loop that got the Linux side to
              * a shell: run it, read the number, implement it, repeat. The
              * difference is that here the number is one we chose, so an

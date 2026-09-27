@@ -30,6 +30,51 @@ EXPORTS
     NtCreateThreadEx
     NtTerminateThread
     NtQueryInformationThread
+; --- the machine, processes and scheduling ---
+    NtQuerySystemInformation
+    NtQuerySystemInformationEx
+    NtQueryInformationProcess
+    NtSetInformationProcess
+    NtSetInformationThread
+    NtYieldExecution
+    NtDelayExecution
+    NtGetCurrentProcessorNumber
+    NtGetCurrentProcessorNumberEx
+    NtQueryPerformanceCounter
+    NtQuerySystemTime
+; --- synchronisation ---
+    RtlInitializeCriticalSection
+    RtlInitializeCriticalSectionAndSpinCount
+    RtlInitializeCriticalSectionEx
+    RtlEnterCriticalSection
+    RtlTryEnterCriticalSection
+    RtlLeaveCriticalSection
+    RtlDeleteCriticalSection
+    RtlSetCriticalSectionSpinCount
+    RtlIsCriticalSectionLockedByThread
+    RtlInitializeSRWLock
+    RtlAcquireSRWLockExclusive
+    RtlAcquireSRWLockShared
+    RtlReleaseSRWLockExclusive
+    RtlReleaseSRWLockShared
+    RtlTryAcquireSRWLockExclusive
+    RtlTryAcquireSRWLockShared
+    RtlInitializeConditionVariable
+    RtlWakeConditionVariable
+    RtlWakeAllConditionVariable
+    RtlSleepConditionVariableCS
+    RtlSleepConditionVariableSRW
+    RtlInitializeSListHead
+    RtlInterlockedPushEntrySList
+    RtlInterlockedPopEntrySList
+    RtlInterlockedFlushSList
+    RtlFirstEntrySList
+    RtlQueryDepthSList
+; --- processors and time ---
+    RtlGetCurrentProcessorNumber
+    RtlGetCurrentProcessorNumberEx
+    RtlQueryPerformanceCounter
+    RtlQueryPerformanceFrequency
 ; --- the runtime library ---
     NtCurrentTeb
     RtlInitUnicodeString

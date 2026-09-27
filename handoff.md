@@ -3,7 +3,7 @@
 *For a subsystem-by-subsystem tour of everything Genesis can do, see
 `FEATURES.md`. This file is about where to pick the work up.*
 
-Last updated 2026-09-26. Read this first if you're picking the project back
+Last updated 2026-09-27. Read this first if you're picking the project back
 up cold. It points at the detailed prose in `ROADMAP.md` rather than
 repeating it — this file is orientation, `ROADMAP.md` is the record.
 
@@ -15,8 +15,8 @@ Windows subsystem (`/wsr`, clean-room `ntdll.dll`/`kernel32.dll`, real PE
 binaries run on it), and three driver models side by side (FreeBSD Newbus,
 Linux via a LinuxKPI shim, Windows WDM/KMDF) — all three run *unmodified*
 vendored driver source against real hardware. Large parts of the kernel are
-real vendored FreeBSD source (`kernel/bsd/`) and ZFS (`kernel/zfs/`, kept
-CDDL-separate on purpose), not reimplementations.
+real vendored FreeBSD source (`kernel/bsd/`), not reimplementations. (ZFS
+was removed on 2026-09-26; gnfs, the native COW filesystem, replaced it.)
 
 Engineering culture: self-tests everywhere, bug postmortems live in
 `src/verif.c`, and `ROADMAP.md` is written as dense narrative prose
@@ -61,7 +61,27 @@ those are still fully unstarted, and per item 14's own ordering, real
 multithreading is the biggest single missing prerequisite before any of the
 graphical stack can even begin.
 
-## Project state — most recent session, three connected units
+## Latest session (2026-09-26 / 27): ZFS out, gnfs v2, TCP, SMP
+
+In commit order (see `ROADMAP.md` items 6, 7 and 13 for the detail):
+- **ZFS removed**; its test fixtures moved onto gnfs (`tests/host/gnfs_fixture.c`,
+  committed image checked byte-for-byte).
+- **gnfs v2**: ~1GB files (indirect blocks), object reuse, growing directories,
+  rename, incremental commits, snapshots under `/.snapshots`.
+- **TCP + lo0** vendored whole; listen/accept/shutdown/sockopts/sendmsg/recvmsg;
+  the socket boundary translates to Linux's ABI.
+- **SMP**: every CPU runs processes under a big kernel lock; per-CPU timers,
+  idle threads, affinity, targeted shootdowns, interrupt binding; the SMP APIs
+  of all three driver models; Linux affinity syscalls; 11 new NT syscalls,
+  ntdll synchronisation, kernel32's processor/affinity/time surface;
+  `src/winsmp/smp.exe`.
+
+Next, by the goal's ordering: Windows TLS (TlsAlloc) and the rest of item
+14(a), then (b) APCs / WaitForMultipleObjects, then SEH. On the SMP side,
+splitting the big kernel lock only when a measurement asks for it. DHCP is
+the networking loose end.
+
+## Project state — an earlier session, three connected units
 
 All three fully verified (host tests + real kernel boot in QEMU with real
 device I/O) — see "How to verify" below.
@@ -219,10 +239,12 @@ each tally. About five minutes:
 wsl.exe -d Debian -- bash -lc "cd '/mnt/c/Users/kevin/code/Genesis/Genesis' && python3 tools/guest_run.py > build/guest.txt 2>&1"
 grep -E "^(verification|systest): [0-9]" build/guest.txt   # expect 0 failed on both
 ```
-As of 2026-09-26: `verification: 160 passed, 0 failed`,
-`systest: 443 passed, 0 failed`, `thr: 16 passed, 0 failed` (guest_run.py
-now also runs `/bin/thr.exe` by default and accepts any `name: N passed`
-tally).
+As of 2026-09-27, with `-smp 4`: `verification: 160 passed, 0 failed`,
+`systest: 510 passed, 0 failed`, `thr: 16 passed, 0 failed`,
+`smp: 53 passed, 0 failed` (guest_run.py runs `/bin/thr.exe` and
+`/bin/smp.exe` too). `GENESIS_SMP=1` runs the same on one CPU (systest 507,
+smp 49 - the parallel checks skip). A hung guest: `tools/guest_dump.py CMD`
+runs the commands and presses Ctrl-T for the task dump.
 
 After changing `src/systest.c` (or `src/verif.c`), rebuild it and restage
 the FAT disk - `build_user.sh` stages via `sudo mount`, which needs a

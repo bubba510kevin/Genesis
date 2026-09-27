@@ -68,3 +68,16 @@ NT_STUB_X(NtReleaseMutant,         NT_SYS_RELEASE_MUTANT);
 NT_STUB_X(NtCreateThreadEx,        NT_SYS_CREATE_THREAD);
 NT_STUB_X(NtTerminateThread,       NT_SYS_TERMINATE_THREAD);
 NT_STUB_X(NtQueryInformationThread, NT_SYS_QUERY_THREAD);
+
+/* The machine, processes and scheduling. */
+NT_STUB_X(NtQuerySystemInformation,   NT_SYS_QUERY_SYSTEM_INFO);
+NT_STUB_X(NtQuerySystemInformationEx, NT_SYS_QUERY_SYSTEM_INFO_EX);
+NT_STUB_X(NtQueryInformationProcess,  NT_SYS_QUERY_PROCESS);
+NT_STUB_X(NtSetInformationProcess,    NT_SYS_SET_PROCESS);
+NT_STUB_X(NtSetInformationThread,     NT_SYS_SET_THREAD);
+NT_STUB_X(NtYieldExecution,           NT_SYS_YIELD);
+NT_STUB_X(NtDelayExecution,           NT_SYS_DELAY);
+NT_STUB_X(NtGetCurrentProcessorNumber, NT_SYS_CURRENT_PROCESSOR);
+NT_STUB_X(NtGetCurrentProcessorNumberEx, NT_SYS_CURRENT_PROCESSOR_EX);
+NT_STUB_X(NtQueryPerformanceCounter,  NT_SYS_PERF_COUNTER);
+NT_STUB_X(NtQuerySystemTime,          NT_SYS_SYSTEM_TIME);

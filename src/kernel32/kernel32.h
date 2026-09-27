@@ -105,6 +105,7 @@ typedef DWORD *LPDWORD;
 #define ERROR_CALL_NOT_IMPLEMENTED 120u
 #define ERROR_INSUFFICIENT_BUFFER 122u
 #define ERROR_GEN_FAILURE          31u
+#define ERROR_TIMEOUT            1460u
 
 /* CreateFile dispositions. Only OPEN_EXISTING is honoured; the rest are
  * declared so a caller's constant means what it says when it is refused. */
@@ -228,6 +229,193 @@ SIZE_T k32_ansi_to_wide(LPCSTR src, LPWSTR dst, SIZE_T dst_chars);
  * forwarder to ntdll's NtCurrentTeb, resolved by the loader at link time.
  * Declaring it here is what lets a caller name it; there is deliberately no
  * definition to go with it. */
+/* --- processors, affinity, priorities, time (sysinfo.c) ---------------- */
+typedef SIZE_T  DWORD_PTR, *PDWORD_PTR;
+typedef unsigned long long ULONGLONG;
+typedef DWORD  *PDWORD;
+
+typedef struct _FILETIME {
+    DWORD dwLowDateTime;
+    DWORD dwHighDateTime;
+} FILETIME, *LPFILETIME;
+
+typedef struct _SYSTEM_INFO {
+    WORD      wProcessorArchitecture;
+    WORD      wReserved;
+    DWORD     dwPageSize;
+    LPVOID    lpMinimumApplicationAddress;
+    LPVOID    lpMaximumApplicationAddress;
+    DWORD_PTR dwActiveProcessorMask;
+    DWORD     dwNumberOfProcessors;
+    DWORD     dwProcessorType;
+    DWORD     dwAllocationGranularity;
+    WORD      wProcessorLevel;
+    WORD      wProcessorRevision;
+} SYSTEM_INFO, *LPSYSTEM_INFO;
+
+typedef enum _LOGICAL_PROCESSOR_RELATIONSHIP {
+    RelationProcessorCore    = 0,
+    RelationNumaNode         = 1,
+    RelationCache            = 2,
+    RelationProcessorPackage = 3,
+    RelationGroup            = 4,
+    RelationAll              = 0xFFFF
+} LOGICAL_PROCESSOR_RELATIONSHIP;
+
+typedef struct _SYSTEM_LOGICAL_PROCESSOR_INFORMATION {
+    DWORD_PTR ProcessorMask;
+    LOGICAL_PROCESSOR_RELATIONSHIP Relationship;
+    union {
+        struct { BYTE Flags; } ProcessorCore;
+        struct { DWORD NodeNumber; } NumaNode;
+        ULONGLONG Reserved[2];
+    };
+} SYSTEM_LOGICAL_PROCESSOR_INFORMATION, *PSYSTEM_LOGICAL_PROCESSOR_INFORMATION;
+
+typedef struct _PROCESSOR_RELATIONSHIP {
+    BYTE           Flags;
+    BYTE           EfficiencyClass;
+    BYTE           Reserved[20];
+    WORD           GroupCount;
+    GROUP_AFFINITY GroupMask[1];
+} PROCESSOR_RELATIONSHIP;
+
+typedef struct _NUMA_NODE_RELATIONSHIP {
+    DWORD          NodeNumber;
+    BYTE           Reserved[18];
+    WORD           GroupCount;
+    GROUP_AFFINITY GroupMask;
+} NUMA_NODE_RELATIONSHIP;
+
+typedef struct _PROCESSOR_GROUP_INFO {
+    BYTE      MaximumProcessorCount;
+    BYTE      ActiveProcessorCount;
+    BYTE      Reserved[38];
+    KAFFINITY ActiveProcessorMask;
+} PROCESSOR_GROUP_INFO;
+
+typedef struct _GROUP_RELATIONSHIP {
+    WORD                 MaximumGroupCount;
+    WORD                 ActiveGroupCount;
+    BYTE                 Reserved[20];
+    PROCESSOR_GROUP_INFO GroupInfo[1];
+} GROUP_RELATIONSHIP;
+
+typedef struct _SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
+    LOGICAL_PROCESSOR_RELATIONSHIP Relationship;
+    DWORD                          Size;
+    union {
+        PROCESSOR_RELATIONSHIP Processor;
+        NUMA_NODE_RELATIONSHIP NumaNode;
+        GROUP_RELATIONSHIP     Group;
+    };
+} SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, *PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+
+#define PROCESSOR_ARCHITECTURE_AMD64   9
+#define PROCESSOR_AMD_X8664         8664
+#define ALL_PROCESSOR_GROUPS      0xFFFF
+
+#define THREAD_PRIORITY_IDLE          (-15)
+#define THREAD_PRIORITY_LOWEST        (-2)
+#define THREAD_PRIORITY_BELOW_NORMAL  (-1)
+#define THREAD_PRIORITY_NORMAL          0
+#define THREAD_PRIORITY_ABOVE_NORMAL    1
+#define THREAD_PRIORITY_HIGHEST         2
+#define THREAD_PRIORITY_TIME_CRITICAL  15
+#define THREAD_PRIORITY_ERROR_RETURN  0x7FFFFFFF
+
+#define IDLE_PRIORITY_CLASS          0x00000040u
+#define BELOW_NORMAL_PRIORITY_CLASS  0x00004000u
+#define NORMAL_PRIORITY_CLASS        0x00000020u
+#define ABOVE_NORMAL_PRIORITY_CLASS  0x00008000u
+#define HIGH_PRIORITY_CLASS          0x00000080u
+#define REALTIME_PRIORITY_CLASS      0x00000100u
+
+void      WINAPI GetSystemInfo(LPSYSTEM_INFO info);
+void      WINAPI GetNativeSystemInfo(LPSYSTEM_INFO info);
+DWORD     WINAPI GetActiveProcessorCount(WORD group);
+DWORD     WINAPI GetMaximumProcessorCount(WORD group);
+WORD      WINAPI GetActiveProcessorGroupCount(void);
+WORD      WINAPI GetMaximumProcessorGroupCount(void);
+DWORD     WINAPI GetCurrentProcessorNumber(void);
+void      WINAPI GetCurrentProcessorNumberEx(PPROCESSOR_NUMBER pn);
+BOOL      WINAPI GetLogicalProcessorInformation(
+                     PSYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer,
+                     PDWORD length);
+BOOL      WINAPI GetLogicalProcessorInformationEx(
+                     LOGICAL_PROCESSOR_RELATIONSHIP rel,
+                     PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer,
+                     PDWORD length);
+BOOL      WINAPI GetProcessAffinityMask(HANDLE process, PDWORD_PTR proc_mask,
+                                        PDWORD_PTR sys_mask);
+BOOL      WINAPI SetProcessAffinityMask(HANDLE process, DWORD_PTR mask);
+DWORD_PTR WINAPI SetThreadAffinityMask(HANDLE thread, DWORD_PTR mask);
+DWORD     WINAPI SetThreadIdealProcessor(HANDLE thread, DWORD ideal);
+BOOL      WINAPI SetThreadIdealProcessorEx(HANDLE thread, PPROCESSOR_NUMBER ideal,
+                                           PPROCESSOR_NUMBER previous);
+BOOL      WINAPI GetThreadIdealProcessorEx(HANDLE thread, PPROCESSOR_NUMBER ideal);
+BOOL      WINAPI SetThreadGroupAffinity(HANDLE thread, const GROUP_AFFINITY *ga,
+                                        PGROUP_AFFINITY previous);
+BOOL      WINAPI GetThreadGroupAffinity(HANDLE thread, PGROUP_AFFINITY ga);
+BOOL      WINAPI SetThreadPriority(HANDLE thread, int priority);
+int       WINAPI GetThreadPriority(HANDLE thread);
+BOOL      WINAPI SetPriorityClass(HANDLE process, DWORD cls);
+DWORD     WINAPI GetPriorityClass(HANDLE process);
+BOOL      WINAPI GetProcessTimes(HANDLE process, LPFILETIME creation,
+                                 LPFILETIME exit_time, LPFILETIME kernel,
+                                 LPFILETIME user);
+BOOL      WINAPI GetThreadTimes(HANDLE thread, LPFILETIME creation,
+                                LPFILETIME exit_time, LPFILETIME kernel,
+                                LPFILETIME user);
+BOOL      WINAPI SwitchToThread(void);
+void      WINAPI Sleep(DWORD ms);
+DWORD     WINAPI SleepEx(DWORD ms, BOOL alertable);
+BOOL      WINAPI QueryPerformanceCounter(LARGE_INTEGER *count);
+BOOL      WINAPI QueryPerformanceFrequency(LARGE_INTEGER *freq);
+DWORD     WINAPI GetTickCount(void);
+ULONGLONG WINAPI GetTickCount64(void);
+void      WINAPI GetSystemTimeAsFileTime(LPFILETIME ft);
+void      WINAPI GetSystemTimePreciseAsFileTime(LPFILETIME ft);
+
+/* --- synchronisation (sync.c; most forward straight to ntdll) ------------ */
+typedef RTL_CRITICAL_SECTION   CRITICAL_SECTION, *LPCRITICAL_SECTION;
+typedef RTL_SRWLOCK            SRWLOCK, *PSRWLOCK;
+typedef RTL_CONDITION_VARIABLE CONDITION_VARIABLE, *PCONDITION_VARIABLE;
+
+BOOL  WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs,
+                                                   DWORD spin);
+BOOL  WINAPI InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin,
+                                         DWORD flags);
+BOOL  WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION cs);
+BOOL  WINAPI SleepConditionVariableCS(PCONDITION_VARIABLE cv,
+                                      LPCRITICAL_SECTION cs, DWORD ms);
+BOOL  WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK l,
+                                       DWORD ms, DWORD flags);
+
+/* Exported by kernel32 as FORWARDERS to ntdll's Rtl* (see kernel32.def):
+ * declared here with their Win32 names and signatures, resolved by the
+ * loader into ntdll. */
+void    WINAPI InitializeCriticalSection(LPCRITICAL_SECTION cs);
+void    WINAPI EnterCriticalSection(LPCRITICAL_SECTION cs);
+void    WINAPI LeaveCriticalSection(LPCRITICAL_SECTION cs);
+void    WINAPI DeleteCriticalSection(LPCRITICAL_SECTION cs);
+DWORD   WINAPI SetCriticalSectionSpinCount(LPCRITICAL_SECTION cs, DWORD spin);
+void    WINAPI InitializeSRWLock(PSRWLOCK l);
+void    WINAPI AcquireSRWLockExclusive(PSRWLOCK l);
+void    WINAPI AcquireSRWLockShared(PSRWLOCK l);
+void    WINAPI ReleaseSRWLockExclusive(PSRWLOCK l);
+void    WINAPI ReleaseSRWLockShared(PSRWLOCK l);
+BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK l);
+BOOLEAN WINAPI TryAcquireSRWLockShared(PSRWLOCK l);
+void    WINAPI InitializeConditionVariable(PCONDITION_VARIABLE cv);
+void    WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv);
+void    WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv);
+void         WINAPI InitializeSListHead(PSLIST_HEADER h);
+PSLIST_ENTRY WINAPI InterlockedPushEntrySList(PSLIST_HEADER h, PSLIST_ENTRY e);
+PSLIST_ENTRY WINAPI InterlockedPopEntrySList(PSLIST_HEADER h);
+PSLIST_ENTRY WINAPI InterlockedFlushSList(PSLIST_HEADER h);
+WORD         WINAPI QueryDepthSList(PSLIST_HEADER h);
+
 DWORD WINAPI K32OrdinalProbe(void);
 PVOID WINAPI K32CurrentTeb(void);
 

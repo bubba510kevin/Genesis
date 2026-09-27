@@ -245,5 +245,196 @@ void     LdrInitializeThunk(void);
 void     RtlExitUserThread(NTSTATUS ExitStatus);
 
 #define HEAP_ZERO_MEMORY 0x00000008u
+#define HEAP_NO_SERIALIZE 0x00000001u
+
+/* --- the machine, processes and scheduling ------------------------------
+ *
+ * See kernel/include/nt.h (NT_SYS_QUERY_SYSTEM_INFO and after) for the
+ * contract of each call and kernel/exec/nt_sys.c for the structures. */
+typedef unsigned long long KAFFINITY;
+typedef long long          LONGLONG;
+typedef unsigned short     USHORT;
+typedef unsigned char      UCHAR;
+
+#define STATUS_NO_YIELD_PERFORMED   0x40000024u
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
+#define STATUS_INVALID_INFO_CLASS   0xC0000003u
+#define STATUS_ACCESS_VIOLATION     0xC0000005u
+
+#define SystemBasicInformation                    0
+#define SystemProcessorInformation                1
+#define SystemProcessorPerformanceInformation     8
+#define SystemLogicalProcessorInformation         73
+#define SystemLogicalProcessorAndGroupInformation 107
+
+#define ProcessBasicInformation   0
+#define ProcessTimes              4
+#define ProcessPriorityClass      18
+#define ProcessAffinityMask       21
+
+#define ThreadTimes               1
+#define ThreadPriority            2
+#define ThreadBasePriority        3
+#define ThreadAffinityMask        4
+#define ThreadIdealProcessor      13
+#define ThreadHideFromDebugger    17
+#define ThreadGroupInformation    30
+#define ThreadIdealProcessorEx    33
+
+typedef struct _SYSTEM_BASIC_INFORMATION {
+    DWORD     Reserved;
+    DWORD     TimerResolution;
+    DWORD     PageSize;
+    DWORD     NumberOfPhysicalPages;
+    DWORD     LowestPhysicalPageNumber;
+    DWORD     HighestPhysicalPageNumber;
+    DWORD     AllocationGranularity;
+    SIZE_T    MinimumUserModeAddress;
+    SIZE_T    MaximumUserModeAddress;
+    KAFFINITY ActiveProcessorsAffinityMask;
+    char      NumberOfProcessors;
+} SYSTEM_BASIC_INFORMATION;
+
+typedef struct _SYSTEM_PROCESSOR_INFORMATION {
+    USHORT ProcessorArchitecture;
+    USHORT ProcessorLevel;
+    USHORT ProcessorRevision;
+    USHORT MaximumProcessors;
+    DWORD  ProcessorFeatureBits;
+} SYSTEM_PROCESSOR_INFORMATION;
+
+typedef struct _SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION {
+    LARGE_INTEGER IdleTime;
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER DpcTime;
+    LARGE_INTEGER InterruptTime;
+    DWORD         InterruptCount;
+} SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS  ExitStatus;
+    PVOID     PebBaseAddress;
+    KAFFINITY AffinityMask;
+    LONG      BasePriority;
+    SIZE_T    UniqueProcessId;
+    SIZE_T    InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
+typedef struct _KERNEL_USER_TIMES {
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER ExitTime;
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+} KERNEL_USER_TIMES;
+
+typedef struct _PROCESSOR_NUMBER {
+    WORD Group;
+    BYTE Number;
+    BYTE Reserved;
+} PROCESSOR_NUMBER, *PPROCESSOR_NUMBER;
+
+typedef struct _GROUP_AFFINITY {
+    KAFFINITY Mask;
+    WORD      Group;
+    WORD      Reserved[3];
+} GROUP_AFFINITY, *PGROUP_AFFINITY;
+
+NTSTATUS NtQuerySystemInformation(DWORD Class, PVOID Buffer, DWORD Length,
+                                  DWORD *ReturnLength);
+NTSTATUS NtQuerySystemInformationEx(DWORD Class, PVOID InputBuffer,
+                                    DWORD InputLength, PVOID Buffer,
+                                    DWORD Length, DWORD *ReturnLength);
+NTSTATUS NtQueryInformationProcess(HANDLE Process, DWORD Class, PVOID Buffer,
+                                   DWORD Length, DWORD *ReturnLength);
+NTSTATUS NtSetInformationProcess(HANDLE Process, DWORD Class, PVOID Buffer,
+                                 DWORD Length);
+NTSTATUS NtSetInformationThread(HANDLE Thread, DWORD Class, PVOID Buffer,
+                                DWORD Length);
+NTSTATUS NtYieldExecution(void);
+NTSTATUS NtDelayExecution(BOOLEAN Alertable, LARGE_INTEGER *Interval);
+DWORD    NtGetCurrentProcessorNumber(void);
+DWORD    NtGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER ProcNumber);
+NTSTATUS NtQueryPerformanceCounter(LARGE_INTEGER *Counter,
+                                   LARGE_INTEGER *Frequency);
+NTSTATUS NtQuerySystemTime(LARGE_INTEGER *SystemTime);
+
+/* --- synchronisation, in user mode ----------------------------------------
+ *
+ * The primitives a multithreaded Win32 program is built on, which on SMP
+ * are the difference between a program that works and one that corrupts
+ * itself: critical sections, slim reader/writer locks, condition variables,
+ * and the lock-free singly linked list. Layouts are Windows' (a CRITICAL_
+ * SECTION is 40 bytes, an SRWLOCK and a CONDITION_VARIABLE one pointer, an
+ * SLIST_HEADER 16 bytes aligned to 16). See sync.c. */
+typedef struct _RTL_CRITICAL_SECTION {
+    PVOID           DebugInfo;
+    volatile LONG   LockCount;          /* -1 free; else owner + waiters - 1 */
+    volatile LONG   RecursionCount;
+    volatile HANDLE OwningThread;       /* thread id of the owner           */
+    volatile HANDLE LockSemaphore;      /* auto-reset event, made on demand */
+    SIZE_T          SpinCount;
+} RTL_CRITICAL_SECTION, *PRTL_CRITICAL_SECTION;
+
+typedef struct _RTL_SRWLOCK {
+    volatile SIZE_T Value;              /* bit 0: exclusive; count << 1     */
+} RTL_SRWLOCK, *PRTL_SRWLOCK;
+
+typedef struct _RTL_CONDITION_VARIABLE {
+    volatile SIZE_T Value;              /* a generation, bumped per wake    */
+} RTL_CONDITION_VARIABLE, *PRTL_CONDITION_VARIABLE;
+
+typedef struct _SLIST_ENTRY {
+    struct _SLIST_ENTRY *Next;
+} SLIST_ENTRY, *PSLIST_ENTRY;
+
+typedef struct __attribute__((aligned(16))) _SLIST_HEADER {
+    volatile PSLIST_ENTRY Next;
+    volatile QWORD        DepthAndLock; /* bits 0-15 depth; bit 63 lock     */
+} SLIST_HEADER, *PSLIST_HEADER;
+
+#define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u
+
+NTSTATUS RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs);
+NTSTATUS RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs,
+                                                  DWORD spin);
+NTSTATUS RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, DWORD spin,
+                                        DWORD flags);
+NTSTATUS RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+BOOLEAN  RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+NTSTATUS RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
+NTSTATUS RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs);
+DWORD    RtlSetCriticalSectionSpinCount(PRTL_CRITICAL_SECTION cs, DWORD spin);
+BOOLEAN  RtlIsCriticalSectionLockedByThread(PRTL_CRITICAL_SECTION cs);
+
+void     RtlInitializeSRWLock(PRTL_SRWLOCK l);
+void     RtlAcquireSRWLockExclusive(PRTL_SRWLOCK l);
+void     RtlAcquireSRWLockShared(PRTL_SRWLOCK l);
+void     RtlReleaseSRWLockExclusive(PRTL_SRWLOCK l);
+void     RtlReleaseSRWLockShared(PRTL_SRWLOCK l);
+BOOLEAN  RtlTryAcquireSRWLockExclusive(PRTL_SRWLOCK l);
+BOOLEAN  RtlTryAcquireSRWLockShared(PRTL_SRWLOCK l);
+
+void     RtlInitializeConditionVariable(PRTL_CONDITION_VARIABLE cv);
+void     RtlWakeConditionVariable(PRTL_CONDITION_VARIABLE cv);
+void     RtlWakeAllConditionVariable(PRTL_CONDITION_VARIABLE cv);
+NTSTATUS RtlSleepConditionVariableCS(PRTL_CONDITION_VARIABLE cv,
+                                     PRTL_CRITICAL_SECTION cs,
+                                     LARGE_INTEGER *timeout);
+NTSTATUS RtlSleepConditionVariableSRW(PRTL_CONDITION_VARIABLE cv,
+                                      PRTL_SRWLOCK l, LARGE_INTEGER *timeout,
+                                      DWORD flags);
+
+void         RtlInitializeSListHead(PSLIST_HEADER h);
+PSLIST_ENTRY RtlInterlockedPushEntrySList(PSLIST_HEADER h, PSLIST_ENTRY e);
+PSLIST_ENTRY RtlInterlockedPopEntrySList(PSLIST_HEADER h);
+PSLIST_ENTRY RtlInterlockedFlushSList(PSLIST_HEADER h);
+PSLIST_ENTRY RtlFirstEntrySList(const SLIST_HEADER *h);
+WORD         RtlQueryDepthSList(PSLIST_HEADER h);
+
+DWORD    RtlGetCurrentProcessorNumber(void);
+void     RtlGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER ProcNumber);
+BOOLEAN  RtlQueryPerformanceCounter(LARGE_INTEGER *Counter);
+BOOLEAN  RtlQueryPerformanceFrequency(LARGE_INTEGER *Frequency);
 
 #endif

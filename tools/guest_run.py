@@ -101,7 +101,8 @@ def main():
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
 
-    commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe"]
+    commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
+                                "/bin/smp.exe"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)

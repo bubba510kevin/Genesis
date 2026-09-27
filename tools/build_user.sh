@@ -261,6 +261,15 @@ if [ -f src/k32demo/build.sh ]; then
     sh src/k32demo/build.sh
 fi
 
+# thr.exe and smp.exe: Win32 threads, and the multiprocessor from Win32 -
+# affinity, processor queries, and synchronisation under real parallelism.
+if [ -f src/winthread/build.sh ]; then
+    sh src/winthread/build.sh
+fi
+if [ -f src/winsmp/build.sh ]; then
+    sh src/winsmp/build.sh
+fi
+
 # hand.exe, the bisect anchor: no imports, no ntdll, no CRT, so when
 # hello.exe breaks this says whether the loader broke or the linking did.
 #

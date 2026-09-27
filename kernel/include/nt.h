@@ -108,6 +108,42 @@ struct syscall_frame;
 #define NT_SYS_QUERY_THREAD       0x14
 
 #define NT_CURRENT_THREAD         0xFFFFFFFFFFFFFFFEULL    /* (HANDLE)-2 */
+
+/* --- the machine, processes and scheduling (kernel/exec/nt_sys.c) ---------
+ *
+ * What a Win32 program asks about the processors it runs on and how it
+ * steers its threads across them: GetSystemInfo and GetLogicalProcessor-
+ * Information(Ex) (NtQuerySystemInformation(Ex)), GetProcessAffinityMask /
+ * SetProcessAffinityMask and GetProcessTimes (NtQuery/SetInformation-
+ * Process), SetThreadAffinityMask, SetThreadIdealProcessor(Ex),
+ * SetThreadPriority and SetThreadGroupAffinity (NtSetInformationThread),
+ * SwitchToThread (NtYieldExecution), Sleep (NtDelayExecution),
+ * GetCurrentProcessorNumber(Ex), QueryPerformanceCounter and
+ * GetSystemTimeAsFileTime.
+ *
+ * NtQuerySystemInformation(Class, Buffer, Length, ReturnLength)
+ * NtQuerySystemInformationEx(Class, InputBuffer, InputLength, Buffer,
+ *                            Length, ReturnLength)
+ * NtQueryInformationProcess(Handle, Class, Buffer, Length, ReturnLength)
+ * NtSetInformationProcess(Handle, Class, Buffer, Length)
+ * NtSetInformationThread(Handle, Class, Buffer, Length)
+ * NtYieldExecution(void)
+ * NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
+ * NtGetCurrentProcessorNumber(void)
+ * NtGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)
+ * NtQueryPerformanceCounter(PLARGE_INTEGER Counter, PLARGE_INTEGER Freq)
+ * NtQuerySystemTime(PLARGE_INTEGER SystemTime) */
+#define NT_SYS_QUERY_SYSTEM_INFO     0x15
+#define NT_SYS_QUERY_SYSTEM_INFO_EX  0x16
+#define NT_SYS_QUERY_PROCESS         0x17
+#define NT_SYS_SET_PROCESS           0x18
+#define NT_SYS_SET_THREAD            0x19
+#define NT_SYS_YIELD                 0x1A
+#define NT_SYS_DELAY                 0x1B
+#define NT_SYS_CURRENT_PROCESSOR     0x1C
+#define NT_SYS_CURRENT_PROCESSOR_EX  0x1D
+#define NT_SYS_PERF_COUNTER          0x1E
+#define NT_SYS_SYSTEM_TIME           0x1F
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -190,6 +226,8 @@ struct syscall_frame;
 #define STATUS_INVALID_INFO_CLASS 0xC0000003u
 #define STATUS_NOT_SUPPORTED      0xC00000BBu
 #define STATUS_INSUFFICIENT_RESOURCES 0xC000009Au
+#define STATUS_NO_YIELD_PERFORMED 0x40000024u
+#define STATUS_INVALID_PARAMETER_2 0xC00000F0u
 
 /* NTSTATUS values the dispatcher objects need.
  *
@@ -372,5 +410,14 @@ uint64 nt_syscall_dispatch(struct syscall_frame *frame);
 /* NT has no signals. Nothing here restores a frame the way rt_sigreturn does,
  * so no call number needs excluding from signal delivery. */
 int nt_is_sigreturn(uint64 nr);
+
+/* Shared between nt.c and nt_sys.c: stack argument n (>= 5) given the user
+ * RSP at the syscall, and the object behind an NT handle (NULL if none). */
+struct object;
+int            nt_stack_arg(uint64 rsp, int n, uint64 *out);
+struct object *nt_object_of(uint64 handle);
+
+/* nt_sys.c's calls, one per NT_SYS_ number above; each returns NTSTATUS. */
+uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled);
 
 #endif

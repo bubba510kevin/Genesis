@@ -52,6 +52,68 @@ EXPORTS
     GetThreadId
     GetExitCodeThread
     WaitForSingleObject
+; --- processors, affinity, priorities, time (sysinfo.c) ---
+    GetSystemInfo
+    GetNativeSystemInfo
+    GetActiveProcessorCount
+    GetMaximumProcessorCount
+    GetActiveProcessorGroupCount
+    GetMaximumProcessorGroupCount
+    GetCurrentProcessorNumber
+    GetCurrentProcessorNumberEx
+    GetLogicalProcessorInformation
+    GetLogicalProcessorInformationEx
+    GetProcessAffinityMask
+    SetProcessAffinityMask
+    SetThreadAffinityMask
+    SetThreadIdealProcessor
+    SetThreadIdealProcessorEx
+    GetThreadIdealProcessorEx
+    SetThreadGroupAffinity
+    GetThreadGroupAffinity
+    SetThreadPriority
+    GetThreadPriority
+    SetPriorityClass
+    GetPriorityClass
+    GetProcessTimes
+    GetThreadTimes
+    SwitchToThread
+    Sleep
+    SleepEx
+    QueryPerformanceCounter
+    QueryPerformanceFrequency
+    GetTickCount
+    GetTickCount64
+    GetSystemTimeAsFileTime
+    GetSystemTimePreciseAsFileTime
+; --- synchronisation: wrappers where the Win32 signature differs ... ---
+    InitializeCriticalSectionAndSpinCount
+    InitializeCriticalSectionEx
+    TryEnterCriticalSection
+    SleepConditionVariableCS
+    SleepConditionVariableSRW
+; ... and FORWARDERS where it does not: these are ntdll's Rtl* under
+; kernel32's name, exactly as on Windows. The loader follows each string.
+    InitializeCriticalSection = ntdll.RtlInitializeCriticalSection
+    EnterCriticalSection = ntdll.RtlEnterCriticalSection
+    LeaveCriticalSection = ntdll.RtlLeaveCriticalSection
+    DeleteCriticalSection = ntdll.RtlDeleteCriticalSection
+    SetCriticalSectionSpinCount = ntdll.RtlSetCriticalSectionSpinCount
+    InitializeSRWLock = ntdll.RtlInitializeSRWLock
+    AcquireSRWLockExclusive = ntdll.RtlAcquireSRWLockExclusive
+    AcquireSRWLockShared = ntdll.RtlAcquireSRWLockShared
+    ReleaseSRWLockExclusive = ntdll.RtlReleaseSRWLockExclusive
+    ReleaseSRWLockShared = ntdll.RtlReleaseSRWLockShared
+    TryAcquireSRWLockExclusive = ntdll.RtlTryAcquireSRWLockExclusive
+    TryAcquireSRWLockShared = ntdll.RtlTryAcquireSRWLockShared
+    InitializeConditionVariable = ntdll.RtlInitializeConditionVariable
+    WakeConditionVariable = ntdll.RtlWakeConditionVariable
+    WakeAllConditionVariable = ntdll.RtlWakeAllConditionVariable
+    InitializeSListHead = ntdll.RtlInitializeSListHead
+    InterlockedPushEntrySList = ntdll.RtlInterlockedPushEntrySList
+    InterlockedPopEntrySList = ntdll.RtlInterlockedPopEntrySList
+    InterlockedFlushSList = ntdll.RtlInterlockedFlushSList
+    QueryDepthSList = ntdll.RtlQueryDepthSList
 ; --- memory ---
     GetProcessHeap
     HeapAlloc
