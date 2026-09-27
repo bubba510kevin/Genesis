@@ -41,6 +41,8 @@ void genesis_lowmem_init(void);
 int  genesis_lowmem_selftest(void);
 void genesis_lowmem_report(unsigned char color);
 int  pcache_selftest(void);
+int  lkpi_smp_selftest(void);           /* kernel/driver/lkpi_smp_selftest.c */
+int  bsd_smp_selftest(void);            /* kernel/bsd/kern_smp.c */
 void pcache_report(uint8 color);
 #include "sysload.h"
 #include "pci_generic.h"
@@ -1022,6 +1024,14 @@ void flk(void) {
     /* The NT driver model's multiprocessor calls, on the CPUs that are
      * actually running - after smp_selftest has shown the IPIs work. */
     wdm_smp_selftest();
+    /* And LinuxKPI's: cross-CPU calls, per-CPU variables, bound kthreads,
+     * the sleep protocol and workqueues, written as driver code. */
+    lkpi_smp_selftest();
+    /* And FreeBSD's: CPU_FOREACH, smp_rendezvous, DPCPU, sched_bind. */
+    bsd_smp_selftest();
+    /* A device interrupt moved to another CPU really arrives there - after
+     * net_selftest, which has the NIC up and answering. */
+    smp_irq_selftest();
     lock_selftest();
     lock_report(0x0F);
     sched_ule_selftest();

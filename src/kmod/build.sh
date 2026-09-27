@@ -44,6 +44,9 @@ cp lkpi_ahci.ko "$ROOT/root/lib/modules/lkpiahci.ko"
 # disk would mean whichever registered first silently won, which reads as a
 # bug in the log. It stays built so it cannot rot, and stays in the tree as
 # the small hand-written counterpart to the 2095-line vendored one.
+gcc $CFLAGS -I"$ROOT/kernel/include" -c lkpi_pcpu.c -o lkpi_pcpu.ko
+cp lkpi_pcpu.ko "$ROOT/root/lib/modules/lkpipcpu.ko"
+
 gcc $CFLAGS -I"$ROOT/kernel/include" -c nb_rtl.c -o nb_rtl.ko
 rm -f "$ROOT/root/boot/kernel/nbrtl.ko"
 
@@ -78,3 +81,4 @@ echo "built if_rl.ko (UNMODIFIED vendsrc/sys/dev/rl/if_rl.c, compiled not staged
 echo "built root/boot/kernel/ifre.ko (UNMODIFIED vendsrc/sys/dev/re/if_re.c)"
 echo "built nb_rtl.ko (compiled, not staged - if_rl.c owns that device)"
 echo "built root/lib/modules/lkpiahci.ko"
+echo "built root/lib/modules/lkpipcpu.ko"

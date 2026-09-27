@@ -137,6 +137,9 @@ static uint32 inti_flags_for_irq(uint8 irq) {
     return 0;
 }
 
+/* Which APIC each legacy line is delivered to, as last set. */
+static uint32 routed_cpu_apic[16];
+
 static void set_masked(uint32 gsi, int masked) {
     struct ioapic *io = owner_of(gsi);
     uint32 reg, low;
@@ -175,6 +178,7 @@ int ioapic_route_irq(uint8 irq, uint8 vector, uint32 apic_id) {
 
     routed_vector[irq] = vector;
     routed_gsi[irq]    = gsi;
+    routed_cpu_apic[irq] = apic_id;
     return 0;
 }
 
@@ -369,4 +373,39 @@ void ioapic_report(uint8 color) {
                   (routed_live & (1u << i)) ? "live" : "masked",
                   routed_gsi[i] != (uint32)i ? "  (overridden)" : "");
     }
+}
+
+/* Move a legacy line to another CPU - bus_bind_intr's mechanism. The vector
+ * stays what boot gave it (32 + irq); only the destination changes, and the
+ * line comes back in whatever mask state it was in, so a live device is not
+ * silenced by being moved. The PIT (IRQ 0) is refused: its tick is the
+ * machine's clock, which the BSP keeps. */
+int ioapic_bind_irq(uint8 irq, uint32 apic_id) {
+    uint32 gsi;
+    struct ioapic *io;
+    uint32 reg, low;
+    int was_masked;
+
+    if (!active || irq == 0 || irq >= 16) {
+        return -1;
+    }
+    gsi = ioapic_gsi_for_irq(irq);
+    io = owner_of(gsi);
+    if (io == NULL) {
+        return -1;
+    }
+    reg = IOAPIC_REG_REDIR + (gsi - io->gsi_base) * 2;
+    low = ioapic_read(io, reg);
+    was_masked = (low & REDIR_MASKED) != 0;
+    if (ioapic_route_irq(irq, (uint8)(low & 0xFF), apic_id) != 0) {
+        return -1;
+    }
+    if (!was_masked) {
+        set_masked(gsi, 0);
+    }
+    return 0;
+}
+
+uint32 ioapic_irq_destination(uint8 irq) {
+    return irq < 16 ? routed_cpu_apic[irq] : 0;
 }

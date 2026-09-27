@@ -7,6 +7,8 @@
 #include "irq.h"
 #include "kheap.h"
 #include "kprintf.h"
+#include "ioapic.h"
+#include "ksmp.h"
 #include <stdarg.h>
 
 /* The FreeBSD Newbus source-compat adapter - see kernel/include/
@@ -487,6 +489,8 @@ struct newbus_intr {
     void            *arg;
     uint8            irq;
     int              in_use;
+    int              bound_cpu;      /* -1: wherever boot routed it */
+    char             descr[24];
 };
 
 static struct newbus_intr newbus_intrs[NEWBUS_INTR_MAX];
@@ -544,6 +548,8 @@ int bus_setup_intr(bus_dev_t *dev, bus_resource_t *irq, int flags,
     e->arg     = arg;
     e->irq     = line;
     e->in_use  = 1;
+    e->bound_cpu = -1;
+    e->descr[0]  = '\0';
 
     if (irq_register(line, newbus_intr_trampoline, e) != 0) {
         e->in_use = 0;
@@ -552,6 +558,46 @@ int bus_setup_intr(bus_dev_t *dev, bus_resource_t *irq, int flags,
     if (cookiep != NULL) {
         *cookiep = e;
     }
+    return 0;
+}
+
+int bus_bind_intr(bus_dev_t *dev, bus_resource_t *irq, int cpu) {
+    const pci_ivars_t *f = (const pci_ivars_t *)bus_get_ivars(dev);
+    struct cpu_local *c = smp_cpu(cpu);
+    uint8 line;
+    int i;
+
+    if (c == NULL || !c->online) {
+        return 22;                                    /* EINVAL */
+    }
+    line = (irq != NULL) ? (uint8)bus_get_resource_start(irq)
+                         : (f != NULL ? f->int_line : 0);
+    if (ioapic_bind_irq(line, c->apic_id) != 0) {
+        return 45;                                    /* EOPNOTSUPP */
+    }
+    for (i = 0; i < NEWBUS_INTR_MAX; i++) {
+        if (newbus_intrs[i].in_use && newbus_intrs[i].irq == line) {
+            newbus_intrs[i].bound_cpu = cpu;
+        }
+    }
+    return 0;
+}
+
+int bus_describe_intr(bus_dev_t *dev, bus_resource_t *irq, void *cookie,
+                      const char *fmt, ...) {
+    struct newbus_intr *e = (struct newbus_intr *)cookie;
+    int i;
+
+    (void)dev; (void)irq;
+    if (e == NULL || fmt == NULL) {
+        return 22;
+    }
+    /* The format is taken literally: drivers describe with a plain name
+     * ("rx", "tx0") far more often than with conversions. */
+    for (i = 0; i < (int)sizeof(e->descr) - 1 && fmt[i] != '\0'; i++) {
+        e->descr[i] = fmt[i];
+    }
+    e->descr[i] = '\0';
     return 0;
 }
 

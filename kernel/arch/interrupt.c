@@ -384,6 +384,9 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
     if (vec >= 32) {
         c->irq_depth++;
     }
+    if (vec > 32 && vec != IDT_SPURIOUS_VECTOR) {
+        c->dev_irqs++;
+    }
     interrupt_dispatch_locked(frame);
     if (vec >= 32) {
         c->irq_depth--;

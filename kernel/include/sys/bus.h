@@ -241,6 +241,17 @@ int bus_setup_intr(device_t dev, struct resource *irq, int flags,
                    void *arg, void **cookiep);
 int bus_teardown_intr(device_t dev, struct resource *irq, void *cookie);
 
+/* Deliver this interrupt to CPU `cpu` from now on (upstream's per-queue
+ * spreading: a multi-queue NIC binds queue n's vector to CPU n). Real: the
+ * IOAPIC entry's destination is rewritten. EINVAL for a CPU that is not
+ * online; EOPNOTSUPP for a line the IOAPIC does not own (or the clock). */
+int bus_bind_intr(device_t dev, struct resource *irq, int cpu);
+
+/* Name the handler for reports ("re0:rx"). Recorded and printed by
+ * newbus_intr_report. */
+int bus_describe_intr(device_t dev, struct resource *irq, void *cookie,
+                      const char *fmt, ...);
+
 /* --- the rest of what driver source calls -------------------------------- */
 
 /* device_printf prefixes the device's name and unit, which is the whole

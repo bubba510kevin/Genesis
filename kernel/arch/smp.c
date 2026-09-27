@@ -17,6 +17,9 @@
 #include "typesk.h"
 #include "wdm.h"
 
+void lkpi_smp_started(void);          /* kernel/driver/lkpi_smp.c */
+void lkpi_run_late_initcalls(void);
+
 /* See ksmp.h for what this kernel does with more than one CPU. */
 
 /* Must match AP_BASE in ap_trampoline.c, and must be a page number that fits
@@ -49,6 +52,7 @@ static volatile int ap_started;
 /* Released by smp_start_scheduling: until then the APs idle without taking
  * processes, because there are no idle threads and no timer calibration. */
 static volatile int    sched_go;
+static int             cpus_counted;   /* smp_init has enumerated */
 static uint32          lapic_timer_count;
 
 static int shootdown_vector = -1;
@@ -579,6 +583,7 @@ int smp_init(void) {
     cpu_count = 1;
 
     if (!lapic_available()) {
+        cpus_counted = 1;
         return 1;
     }
 
@@ -592,6 +597,7 @@ int smp_init(void) {
 
     found = acpi_enumerate_cpus();
     if (found <= 1) {
+        cpus_counted = 1;
         return 1;
     }
 
@@ -632,7 +638,16 @@ int smp_init(void) {
     }
 
     vmm_unmap_page(AP_TRAMPOLINE_PHYS);
+    cpus_counted = 1;
     return cpu_count;
+}
+
+int smp_cpus_counted(void) {
+    return cpus_counted;
+}
+
+int smp_scheduling_started(void) {
+    return sched_go;
 }
 
 /* Give every CPU an idle thread, calibrate the LAPIC timer, and let the APs
@@ -672,6 +687,7 @@ void smp_start_scheduling(void) {
     }
     __asm__ volatile ("" : : : "memory");
     wdm_smp_started();
+    lkpi_smp_started();
     sched_go = 1;
     for (i = 1; i < cpu_count; i++) {
         if (cpus[i].online && resched_vector >= 0) {
@@ -682,6 +698,9 @@ void smp_start_scheduling(void) {
                     "TSC %d MHz)\n",
               cpu_count, cpu_count == 1 ? "" : "s", (int)lapic_timer_count,
               (int)(timer_tsc_hz() / 1000000));
+
+    /* Last: anything that asked to run once the machine is fully up. */
+    lkpi_run_late_initcalls();
 }
 
 void smp_report(uint8 color) {

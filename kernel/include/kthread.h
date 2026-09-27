@@ -63,7 +63,7 @@
 
 /* Ceiling on live kernel threads. See above: they share MAX_PROCESSES with
  * user processes, and this is what keeps one from eating all of it. */
-#define KTHREAD_MAX 6
+#define KTHREAD_MAX 32   /* per-CPU workers (LinuxKPI workqueues) need room */
 
 /* Set up the kernel-thread layer. Call after proc_init/sched_init and after
  * kheap_init (proc_alloc takes a kernel stack, which needs the VA allocator

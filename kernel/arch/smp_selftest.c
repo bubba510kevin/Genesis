@@ -2,6 +2,12 @@
 #include "lapic.h"
 #include "ksmp.h"
 #include "typesk.h"
+#include "ioapic.h"
+#include "irq.h"
+#include "bkl.h"
+#include "netstack.h"
+#include "timer.h"
+#include "sched.h"
 
 /* Part 10's check: prove a second CPU is EXECUTING, not merely counted.
  *
@@ -83,6 +89,69 @@ int smp_selftest(void) {
                 "shootdown IPIs\n", n);
     } else {
         kprintf_c(0x0C, "smp: selftest FAILED (%d)\n", failures);
+    }
+    return failures;
+}
+
+/* --- a device interrupt, moved ---------------------------------------------
+ *
+ * bus_bind_intr's mechanism end to end: the NIC's legacy line is pointed at
+ * the last CPU, a ping to the gateway provokes a receive interrupt, and the
+ * interrupt has to be counted on THAT CPU. Then the line goes back to the
+ * BSP, where everything else expects it. */
+int smp_irq_selftest(void) {
+    int n = smp_cpu_count();
+    int target = n - 1;
+    uint8 line = 0;
+    int i, failures = 0;
+    uint64 before, start;
+
+    if (n < 2 || !ioapic_active()) {
+        kprintf_c(0x0E, "smp irq selftest: needs 2 CPUs and an IOAPIC - skipped\n");
+        return 0;
+    }
+    /* The first shareable device line with a handler: not the clock, the
+     * keyboard, the serial port or the ATA channels, whose interrupts are
+     * not provoked by a ping. */
+    for (i = 3; i < 16; i++) {
+        if (i == 4 || i == 14 || i == 15) {
+            continue;
+        }
+        if (irq_handler_count((uint8)i) > 0) {
+            line = (uint8)i;
+            break;
+        }
+    }
+    if (line == 0) {
+        kprintf_c(0x0E, "smp irq selftest: no device line to move - skipped\n");
+        return 0;
+    }
+    before = smp_cpu(target)->dev_irqs;
+    if (ioapic_bind_irq(line, smp_cpu(target)->apic_id) != 0) {
+        kprintf_c(0x0C, "smp irq selftest: could not bind irq %d\n", line);
+        return 1;
+    }
+    if (ioapic_irq_destination(line) != smp_cpu(target)->apic_id) {
+        kprintf_c(0x0C, "smp irq selftest: irq %d destination did not change\n",
+                  line);
+        failures++;
+    }
+    (void)net_ping(0x0202000AU);                  /* 10.0.2.2, the gateway */
+    start = timer_ticks_now();
+    while (smp_cpu(target)->dev_irqs == before &&
+           timer_ticks_now() - start < 100) {
+        bkl_wait_for_interrupt();
+    }
+    if (smp_cpu(target)->dev_irqs == before) {
+        kprintf_c(0x0C, "smp irq selftest: irq %d bound to cpu%d never arrived "
+                        "there\n", line, target);
+        failures++;
+    }
+    (void)ioapic_bind_irq(line, smp_cpu(0)->apic_id);
+    if (failures == 0) {
+        kprintf("smp: irq selftest passed - irq %d moved to cpu%d and was "
+                "delivered there (%lx interrupts)\n", line, target,
+                smp_cpu(target)->dev_irqs - before);
     }
     return failures;
 }

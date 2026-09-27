@@ -57,6 +57,15 @@
  * rather than a leak nobody notices. */
 #define module_exit(fn) GENESIS_MODULE_EXIT(fn)
 
+/* late_initcall: run `fn` once the kernel is fully up - every CPU scheduling,
+ * per-CPU areas replicated, workqueues usable. A module loaded at boot (before
+ * that point) has its late initcalls queued and run then; one loaded later
+ * has them run at load. Linux's ordering guarantee, in the only form a
+ * module here can observe. */
+int linux_register_late_initcall(int (*fn)(void));
+#define late_initcall(fn)                                                      static int __lkpi_late_##fn(void) {                                           return linux_register_late_initcall(fn);                              }                                                                          GENESIS_MODULE_INIT(__lkpi_late_##fn)
+#define late_initcall_sync(fn) late_initcall(fn)
+
 /* THIS_MODULE is a pointer to the module's own struct module. Driver source
  * passes it to registration functions that record an owner for refcounting.
  * Genesis has no module refcounting, so there is nothing to point at and

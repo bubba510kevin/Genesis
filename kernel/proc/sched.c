@@ -2,6 +2,7 @@
 #include "cpu.h"
 #include "ksmp.h"
 #include "kthread.h"
+#include "ksleep.h"
 #include "process.h"
 #include "sched.h"
 #include "screen.h"
@@ -527,4 +528,71 @@ int sched_cpu_is_idle(int cpu) {
     struct cpu_local *c = smp_cpu(cpu);
 
     return c != NULL && c->current != NULL && c->current == c->idle;
+}
+
+/* --- FreeBSD's sched_bind / sched_pin (see kernel/bsd/compat/sys/sched.h) ---- */
+static uint64 bind_saved[MAX_PROCESSES];
+static uint8  bind_on[MAX_PROCESSES];
+static int    pin_depth[SMP_MAX_CPUS];
+
+int genesis_sched_bind(int cpu) {
+    process_t *me = proc_current();
+    int slot;
+
+    if (me == NULL || cpu < 0 || cpu >= smp_cpu_count() ||
+        !smp_cpu(cpu)->online) {
+        return -1;
+    }
+    slot = proc_index(me);
+    if (!bind_on[slot]) {
+        bind_saved[slot] = me->affinity;
+        bind_on[slot] = 1;
+    }
+    /* Only a context that can switch away can move. From an interrupt the
+     * current thread is whoever was interrupted, and narrowing ITS affinity
+     * would pin a stranger. */
+    if (!ksleep_can_block()) {
+        return 0;
+    }
+    if (sched_set_affinity(me, 1ULL << cpu) != 0) {
+        return -1;
+    }
+    sched_migrate_self();
+    return 0;
+}
+
+void genesis_sched_unbind(void) {
+    process_t *me = proc_current();
+    int slot;
+
+    if (me == NULL) {
+        return;
+    }
+    slot = proc_index(me);
+    if (bind_on[slot]) {
+        me->affinity = bind_saved[slot] != 0 ? bind_saved[slot] : ~0ULL;
+        bind_on[slot] = 0;
+    }
+}
+
+int genesis_sched_is_bound(void) {
+    process_t *me = proc_current();
+
+    return me != NULL && bind_on[proc_index(me)];
+}
+
+void genesis_sched_pin(void) {
+    pin_depth[smp_cpu_index()]++;
+}
+
+void genesis_sched_unpin(void) {
+    int c = smp_cpu_index();
+
+    if (pin_depth[c] > 0) {
+        pin_depth[c]--;
+    }
+}
+
+int genesis_sched_pinned(void) {
+    return pin_depth[smp_cpu_index()] > 0;
 }

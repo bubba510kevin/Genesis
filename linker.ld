@@ -123,6 +123,17 @@ SECTIONS
         KEEP(*(SORT(set_sysctl_set)))
         __stop_set_sysctl_set = .;
 
+        /* LinuxKPI per-CPU variables (<linux/percpu.h>): the section IS
+         * CPU 0's copy of every DEFINE_PER_CPU in the kernel, plus the
+         * reserve alloc_percpu and loaded modules carve from. Placed, with
+         * its bounds named, for the same orphan-section reason as the link
+         * sets above; kernel/driver/lkpi_smp.c copies it once per CPU. */
+        . = ALIGN(64);
+        __start_lkpi_percpu = .;
+        KEEP(*(lkpi_percpu))
+        . = ALIGN(64);
+        __stop_lkpi_percpu = .;
+
         /* Any other set a future vendored file declares. Placed after the
          * three named above so that adding one does not need a linker-script
          * edit - only a SET_DECLARE in the C file. */

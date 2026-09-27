@@ -89,6 +89,7 @@ struct cpu_local {
     uint64 ipis_received;  /* resched + call IPIs                        */
     uint64 bkl_spins;      /* acquisitions that had to wait              */
     uint64 user_entries;   /* times this CPU entered the kernel from ring 3 */
+    uint64 dev_irqs;       /* device interrupts (not IPIs, not the clock)   */
 
     uint64 ist1_top;       /* this CPU's double-fault stack              */
     uint64 cow_last_addr;  /* page this CPU last resolved or flushed as a
@@ -123,6 +124,8 @@ int smp_cpu_count(void);
 struct cpu_local *smp_this_cpu(void);
 struct cpu_local *smp_cpu(int index);
 int smp_cpu_index(void);                /* smp_this_cpu()->index */
+int smp_cpus_counted(void);             /* smp_init has enumerated the CPUs */
+int smp_scheduling_started(void);       /* smp_start_scheduling has run     */
 uint64 smp_online_mask(void);           /* bit i set: CPU i online */
 
 /* Invalidate `addr` (or SMP_TLB_ALL) on every OTHER online CPU and wait for
@@ -197,9 +200,11 @@ void smp_idle_poll_work(void);
  * CPUs to test is zero failures with a printed note. */
 int smp_selftest(void);
 
-/* Prove processes really run on more than one CPU at once. After
- * smp_start_scheduling. */
-int smp_sched_selftest(void);
+/* Prove a device interrupt can be moved to another CPU and arrives there:
+ * the NIC's line is bound away from the BSP, a ping provokes a receive
+ * interrupt, and the target's device-interrupt count has to move. After
+ * smp_start_scheduling and the network stack. */
+int smp_irq_selftest(void);
 
 /* The AP entry point. Not called by C - the trampoline jumps to it once the
  * AP is in long mode. Declared here so the trampoline's address-of is

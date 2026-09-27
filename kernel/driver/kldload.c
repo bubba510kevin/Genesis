@@ -12,6 +12,12 @@
 #include "modinit.h"
 #include "typesk.h"
 
+/* The LinuxKPI per-CPU area (kernel/driver/lkpi_smp.c). Declared here
+ * rather than by including <linux/percpu.h>, which is a driver-side header. */
+unsigned long lkpi_percpu_module_alloc(uint64 size, uint64 align);
+void          lkpi_percpu_replicate(unsigned long cpu0_addr, uint64 size);
+#define LKPI_PERCPU_SECTION "lkpi_percpu"
+
 /* See kldload.h. */
 
 /* --- the ET_REL subset of ELF -------------------------------------------
@@ -342,6 +348,25 @@ static int name_eq(const char *a, const char *b) {
     return a[i] == '\0' && b[i] == '\0';
 }
 
+/* Is section `i` the LinuxKPI per-CPU section? Such a section is not part
+ * of the module image: it is placed in the per-CPU area, where CPU n's copy
+ * of every variable in it is at the same offset from CPU 0's as for every
+ * other per-CPU object (see <linux/percpu.h>). */
+static int is_percpu_section(const uint8 *base, uint64 size, const kld_ehdr *eh,
+                             const kld_shdr *sh, uint32 i) {
+    const kld_shdr *strs;
+
+    if (eh->e_shstrndx >= eh->e_shnum) {
+        return 0;
+    }
+    strs = &sh[eh->e_shstrndx];
+    if (strs->sh_offset + strs->sh_size > size || sh[i].sh_name >= strs->sh_size) {
+        return 0;
+    }
+    return name_eq((const char *)(base + strs->sh_offset + sh[i].sh_name),
+                   LKPI_PERCPU_SECTION);
+}
+
 static uint64 align_up(uint64 v, uint64 a) {
     if (a < 2) {
         return v;
@@ -491,6 +516,9 @@ int kld_load(const char *name, const void *image, uint64 size) {
             if (is_exec != (pass == 0)) {
                 continue;
             }
+            if (is_percpu_section(base, size, eh, sh, i)) {
+                continue;                   /* placed in the per-CPU area */
+            }
             total = align_up(total, sh[i].sh_addralign);
             total += sh[i].sh_size;
         }
@@ -527,6 +555,26 @@ int kld_load(const char *name, const void *image, uint64 size) {
             continue;
         }
         if (is_exec != (pass == 0)) {
+            continue;
+        }
+        if (is_percpu_section(base, size, eh, sh, i)) {
+            uint8 *pc;
+            uint64 b;
+
+            placed[i] = lkpi_percpu_module_alloc(sh[i].sh_size,
+                                                 sh[i].sh_addralign);
+            if (placed[i] == 0) {
+                kprintf_c(0x0C, "kld: %s: per-CPU area exhausted (%lx bytes)\n",
+                          name, sh[i].sh_size);
+                kld_image_free(mem, total);
+                return KLD_ERR_NOMEM;
+            }
+            pc = (uint8 *)placed[i];
+            for (b = 0; b < sh[i].sh_size; b++) {
+                pc[b] = (sh[i].sh_type == SHT_NOBITS ||
+                         sh[i].sh_offset + b >= size)
+                        ? 0 : base[sh[i].sh_offset + b];
+            }
             continue;
         }
         cursor = align_up(cursor, sh[i].sh_addralign);
@@ -691,6 +739,18 @@ int kld_load(const char *name, const void *image, uint64 size) {
      *
      * A module with no exit section is normal, not an error. Most modules
      * have nothing to undo. */
+    /* The per-CPU section's relocations are done: now every CPU's copy can
+     * be given its initial contents. Before the init functions run, because
+     * they are the first code that may read another CPU's copy. */
+    if (rc == KLD_OK) {
+        for (i = 0; i < eh->e_shnum; i++) {
+            if ((sh[i].sh_flags & SHF_ALLOC) && sh[i].sh_size != 0 &&
+                placed[i] != 0 && is_percpu_section(base, size, eh, sh, i)) {
+                lkpi_percpu_replicate((unsigned long)placed[i], sh[i].sh_size);
+            }
+        }
+    }
+
     pending_exit_ptrs  = 0;
     pending_exit_count = 0;
     if (rc == KLD_OK && eh->e_shstrndx < eh->e_shnum &&

@@ -63,6 +63,12 @@ uint32 ioapic_gsi_for_irq(uint8 irq);
  * pic_clear_mask. Returns 0, or -1 if no IOAPIC owns that GSI. */
 int ioapic_route_irq(uint8 irq, uint8 vector, uint32 apic_id);
 
+/* Deliver legacy line `irq` to the CPU with APIC ID `apic_id` from now on,
+ * keeping its vector and mask state. -1 for IRQ 0 (the clock stays on the
+ * BSP), a line with no IOAPIC entry, or no IOAPIC at all. */
+int    ioapic_bind_irq(uint8 irq, uint32 apic_id);
+uint32 ioapic_irq_destination(uint8 irq);
+
 /* Mask and unmask by ISA IRQ number, applying overrides. No-ops when no
  * IOAPIC is active, so irq.c can call them unconditionally. */
 void ioapic_mask_irq(uint8 irq);

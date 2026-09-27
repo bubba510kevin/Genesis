@@ -107,6 +107,8 @@ typedef int32  uid_t;
 typedef int32  gid_t;
 typedef uint16 ether_vlanid_t;
 typedef int32  cpusetid_t;
+typedef int32  cpuwhich_t;          /* <sys/cpuset.h>'s which/level */
+typedef int32  cpulevel_t;
 typedef uint32 in_addr_t;
 typedef uint16 in_port_t;
 
