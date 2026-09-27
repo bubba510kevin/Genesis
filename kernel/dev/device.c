@@ -13,7 +13,10 @@
  * disk is, the boundary has failed and this is where it will be visible. That
  * is the same standard vfs.c is held to, and for the same reason. */
 
-#define DEVICE_MAX 16
+/* 24, up from 16 when the framebuffer and the mouse joined the disks,
+ * volumes and serial port: the boot machine already used most of sixteen,
+ * and a full pool fails dev_alloc quietly at attach time. */
+#define DEVICE_MAX 24
 
 static device_t dev_pool[DEVICE_MAX];
 
@@ -95,9 +98,9 @@ static int64 devobj_write(object_t *obj, const void *buf, uint64 n,
     return put;
 }
 
-/* A synchronous device is always ready. It stops being true the day a driver
- * gets an interrupt-driven queue, and this is the function that changes then
- * - which is why it exists rather than falling back on ob_poll's default.
+/* A synchronous device is always ready. The mouse was the first driver with
+ * an interrupt-driven queue, and it answers through device_ops_t::poll; a
+ * driver without that slot still gets "always ready" (dev_poll).
  *
  * A REMOVED device is also always ready, and reports both directions rather
  * than an error. poll(2) has no way to say -ENODEV; a poller told the
@@ -105,9 +108,7 @@ static int64 devobj_write(object_t *obj, const void *buf, uint64 n,
  * readable calls read, gets -ENODEV, and learns the truth on a call that can
  * express it. */
 static int devobj_poll(object_t *obj, int events) {
-    (void)obj;
-    (void)events;
-    return OB_POLLIN | OB_POLLOUT;
+    return dev_poll((device_t *)obj->body, events);
 }
 
 static const object_type_t device_object_type = {
@@ -402,6 +403,32 @@ int dev_control(device_t *dev, uint32 code, void *arg, uint64 arg_size) {
         return -25;                          /* -ENOTTY */
     }
     return dev->ops->control(dev, code, arg, arg_size);
+}
+
+int dev_poll(device_t *dev, int events) {
+    /* A removed device, and a device with no poll slot, are both ready -
+     * see devobj_poll below for why that is the answer for the first. */
+    if (!dev_present(dev) || dev->ops->poll == NULL) {
+        return OB_POLLIN | OB_POLLOUT;
+    }
+    return dev->ops->poll(dev, events);
+}
+
+int dev_mmap(device_t *dev, uint64 offset, uint64 *phys, uint64 *cache_flags) {
+    if (dev == NULL || phys == NULL || cache_flags == NULL) {
+        return -22;
+    }
+    if (!dev_present(dev)) {
+        return -19;
+    }
+    if (dev->ops->mmap == NULL) {
+        return -19;                          /* -ENODEV, what Linux answers */
+    }
+    if ((offset & 0xFFFULL) != 0) {
+        return -22;
+    }
+    *cache_flags = 0;
+    return dev->ops->mmap(dev, offset, phys, cache_flags);
 }
 
 int dev_parse(device_t *dev, const char *remainder, uint32 access,

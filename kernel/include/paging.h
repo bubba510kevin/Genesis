@@ -18,6 +18,30 @@
  * mapping and a copy-on-write one produce byte-identical faults. */
 #define PAGE_COW      0x200
 
+/* Bit 10: the frame behind this entry is DEVICE memory - the framebuffer,
+ * mapped into a process by mmap on /dev/fb0 (ROADMAP item 14(h)). The VMM
+ * owns no frame there, so three paths that assume every user page is a PMM
+ * frame treat it differently:
+ *   - munmap and address-space teardown do not free it;
+ *   - fork shares it WRITABLE in both spaces rather than marking it
+ *     copy-on-write, because the point of the mapping is that every writer
+ *     reaches the same video memory. Without this, the result is still
+ *     right, but by accident: vmm_handle_write_fault finds the PMM holds no
+ *     reference on the frame (refs 0) and un-COWs it in place rather than
+ *     copying it. Nothing from ring 3 can tell the two apart (the fork
+ *     mutation leaves fbtest passing); this bit is what makes it correct
+ *     by design rather than by the refcount of a frame the PMM never owned.
+ * pmm_free_frame would in fact ignore most such frames (they are above RAM,
+ * or were never allocated), but "most" is not a property to lean on: on a
+ * machine with RAM above the PCI hole the frame number can be in range. */
+#define PAGE_DEVICE   0x400
+
+/* Cache-control bits, for mappings of device memory. PCD alone selects PAT
+ * entry 2 (UC-): uncached unless an MTRR says write-combining, which is the
+ * right default for a framebuffer without programming the PAT. */
+#define PAGE_PWT      0x8
+#define PAGE_PCD      0x10
+
 /* No-execute. Bit 63 of a leaf entry: an instruction fetch from the page
  * faults with error bit 4 set, whatever the read and write permissions say.
  *

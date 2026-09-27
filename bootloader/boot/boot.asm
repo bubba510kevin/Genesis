@@ -77,6 +77,11 @@ __start:
 
     call load_kernel
 
+    ; The graphics mode-set, while the BIOS can still be called. The code is
+    ; in the kernel image (kernel/arch/vbe_boot.c) at offset 0x10, reached
+    ; through the HMA: with A20 open, 0xFFFF:0x0020 is linear 0x100010.
+    call 0xFFFF:0x0020
+
     lgdt [gdt_descriptor]
 
     mov eax, cr0
