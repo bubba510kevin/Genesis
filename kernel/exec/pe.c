@@ -233,6 +233,8 @@ static int validate(const void *image, uint64 size, pe_info_t *info,
     info->has_imports    = opt->number_of_rva_and_sizes > PE_DIR_IMPORT &&
                            opt->directory[PE_DIR_IMPORT].size != 0;
     info->thread_start   = 0;    /* set only by pe_load_executable's link */
+    info->apc_dispatcher = 0;
+    info->exception_dispatcher = 0;
     return PE_OK;
 }
 
@@ -617,6 +619,7 @@ static int load_image(address_space_t *as, const void *image, uint64 size,
 struct module {
     char   name[32];
     uint64 base;
+    uint64 size;
 };
 
 struct link_ctx {
@@ -1016,6 +1019,7 @@ static int load_dependency(struct link_ctx *ctx, const char *name,
     str_copy_n(ctx->modules[ctx->count].name, name,
                sizeof(ctx->modules[ctx->count].name));
     ctx->modules[ctx->count].base = info.image_base;
+    ctx->modules[ctx->count].size = info.image_size;
     ctx->count++;
 
     /* A dependency may have dependencies. ntdll has none, but the loader
@@ -1239,8 +1243,13 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
         return rc;
     }
     info->thread_start = 0;
+    info->apc_dispatcher = 0;
+    info->exception_dispatcher = 0;
     info->tls_count = 0;
     info->has_tls_callbacks = 0;
+    info->mod_count = 1;
+    info->mods[0].base = info->image_base;
+    info->mods[0].size = info->image_size;
     rc = collect_tls(as, info->image_base, info);
     if (rc != PE_OK) {
         return rc;
@@ -1265,6 +1274,12 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
     }
     /* Every DLL that came in with it, in load order, after the executable. */
     for (i = 0; i < ctx.count; i++) {
+        if (ctx.modules[i].base != 0 && ctx.modules[i].base != info->image_base &&
+            info->mod_count < PE_MAX_MODULES + 1) {
+            info->mods[info->mod_count].base = ctx.modules[i].base;
+            info->mods[info->mod_count].size = ctx.modules[i].size;
+            info->mod_count++;
+        }
         if (ctx.modules[i].base != 0 && ctx.modules[i].base != info->image_base) {
             rc = collect_tls(as, ctx.modules[i].base, info);
             if (rc != PE_OK) {
@@ -1281,6 +1296,13 @@ int pe_load_executable(address_space_t *as, const void *image, uint64 size,
 
         if (ntdll != 0 && find_export(&ctx, ntdll, "RtlUserThreadStart", &at)) {
             info->thread_start = at;
+        }
+        if (ntdll != 0 && find_export(&ctx, ntdll, "KiUserApcDispatcher", &at)) {
+            info->apc_dispatcher = at;
+        }
+        if (ntdll != 0 &&
+            find_export(&ctx, ntdll, "KiUserExceptionDispatcher", &at)) {
+            info->exception_dispatcher = at;
         }
     }
     return PE_OK;

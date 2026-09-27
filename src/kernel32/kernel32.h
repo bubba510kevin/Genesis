@@ -74,6 +74,7 @@ typedef const CHAR *LPCSTR;
 typedef WCHAR *LPWSTR;
 typedef const WCHAR *LPCWSTR;
 typedef void *LPVOID;
+typedef SIZE_T ULONG_PTR;
 typedef DWORD *LPDWORD;
 
 #define WINAPI
@@ -109,6 +110,7 @@ typedef DWORD *LPDWORD;
 #define ERROR_NO_MORE_ITEMS       259u
 #define ERROR_NOT_OWNER           288u
 #define ERROR_SIGNAL_REFUSED      156u
+#define ERROR_TOO_MANY_POSTS      298u
 
 /* CreateFile dispositions. Only OPEN_EXISTING is honoured; the rest are
  * declared so a caller's constant means what it says when it is refused. */
@@ -132,8 +134,20 @@ typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID parameter);
 #define INFINITE             0xFFFFFFFFu
 #define WAIT_OBJECT_0        0x00000000u
 #define WAIT_ABANDONED       0x00000080u
+#define WAIT_ABANDONED_0     0x00000080u
+#define WAIT_IO_COMPLETION   0x000000C0u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
+
+/* --- structured exception handling (except.c) ---------------------------- */
+void   WINAPI RaiseException(DWORD code, DWORD flags, DWORD nargs,
+                             const ULONG_PTR *args);
+PTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(
+    PTOP_LEVEL_EXCEPTION_FILTER filter);
+LONG   WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info);
+PVOID  WINAPI AddVectoredExceptionHandler(DWORD first,
+                                          PVECTORED_EXCEPTION_HANDLER fn);
+DWORD  WINAPI RemoveVectoredExceptionHandler(PVOID handle);
 
 /* --- error reporting (err.c) --------------------------------------------
  *
@@ -200,6 +214,29 @@ DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
  * ERROR_CALL_NOT_IMPLEMENTED rather than half-supported, because the named
  * form's other half - opening the existing one, ERROR_ALREADY_EXISTS - has
  * no kernel path yet. */
+DWORD  WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles,
+                                     BOOL wait_all, DWORD milliseconds);
+/* The alertable forms: WAIT_IO_COMPLETION when queued APCs ran instead. */
+DWORD  WINAPI WaitForSingleObjectEx(HANDLE handle, DWORD milliseconds,
+                                    BOOL alertable);
+DWORD  WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
+                                       BOOL wait_all, DWORD milliseconds,
+                                       BOOL alertable);
+typedef void (WINAPI *PAPCFUNC)(ULONG_PTR data);
+/* Queue fn(data) on `thread`; it runs at that thread's next alertable wait. */
+DWORD  WINAPI QueueUserAPC(PAPCFUNC fn, HANDLE thread, ULONG_PTR data);
+/* Events and semaphores, unnamed only for the same reason as mutexes. */
+HANDLE WINAPI CreateEventW(LPVOID security, BOOL manual_reset,
+                           BOOL initial_state, LPCWSTR name);
+HANDLE WINAPI CreateEventA(LPVOID security, BOOL manual_reset,
+                           BOOL initial_state, LPCSTR name);
+BOOL   WINAPI SetEvent(HANDLE event);
+BOOL   WINAPI ResetEvent(HANDLE event);
+HANDLE WINAPI CreateSemaphoreW(LPVOID security, LONG initial, LONG maximum,
+                               LPCWSTR name);
+HANDLE WINAPI CreateSemaphoreA(LPVOID security, LONG initial, LONG maximum,
+                               LPCSTR name);
+BOOL   WINAPI ReleaseSemaphore(HANDLE semaphore, LONG count, LONG *previous);
 HANDLE WINAPI CreateMutexW(LPVOID security, BOOL initial_owner, LPCWSTR name);
 HANDLE WINAPI CreateMutexA(LPVOID security, BOOL initial_owner, LPCSTR name);
 BOOL   WINAPI ReleaseMutex(HANDLE mutex);

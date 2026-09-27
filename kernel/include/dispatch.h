@@ -91,6 +91,26 @@ int dispatch_create_named(const char *name, object_t *obj);
  * kthread_exit), some of which run twice for one thread. */
 void dispatch_owner_exited(int pid);
 
+/* Wait on up to DISPATCH_WAIT_MAX dispatcher objects at once -
+ * NtWaitForMultipleObjects. With `wait_all` zero, returns the index of the
+ * object taken (the LOWEST ready one); with it set, takes every object in
+ * one indivisible step once all are ready, never some of them first, and
+ * returns 0. Either way DISPATCH_WAIT_ABANDONED + i instead when object i
+ * was an abandoned mutant (the first such, for wait-all).
+ *
+ * -EINVAL when any object is not a dispatcher object or n is out of range,
+ * DISPATCH_WAIT_DUPLICATE for the same object twice in a wait-all,
+ * -ETIMEDOUT at the deadline (absolute ticks, 0 for none), -EINTR on a
+ * signal. */
+#define DISPATCH_WAIT_MAX        64          /* MAXIMUM_WAIT_OBJECTS */
+#define DISPATCH_WAIT_ABANDONED  0x80        /* + index */
+#define DISPATCH_WAIT_DUPLICATE  (-33)
+/* An ALERTABLE wait (alertable non-zero) also ends - taking nothing - when
+ * the calling thread has a user APC queued: DISPATCH_WAIT_APC. */
+#define DISPATCH_WAIT_APC        (-1000)
+int dispatch_wait_multiple(object_t **objs, int n, int wait_all,
+                           int alertable, uint64 deadline);
+
 /* Look up a named dispatcher object. Returns it with a reference taken, or
  * NULL. `name` is the leaf under \BaseNamedObjects. */
 object_t *dispatch_open_named(const char *name);

@@ -508,6 +508,16 @@ static int as_write(address_space_t *as, uint64 va, const void *src, uint64 n) {
     return 0;
 }
 
+int nt_modules_publish(address_space_t *as, const nt_module_table_t *table) {
+    typedef char fits[(NT_PEB_MODULES_OFFSET + sizeof(nt_module_table_t)
+                       <= 0x1000 &&
+                       NT_PEB_TLS_OFFSET + sizeof(nt_tls_table_t)
+                       <= NT_PEB_MODULES_OFFSET) ? 1 : -1];
+    (void)sizeof(fits);
+    return as_write(as, NT_PEB_BASE + NT_PEB_MODULES_OFFSET, table,
+                    sizeof(*table));
+}
+
 int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table) {
     typedef char fits[(NT_PEB_TLS_OFFSET + sizeof(nt_tls_table_t) <= 0x1000)
                       ? 1 : -1];

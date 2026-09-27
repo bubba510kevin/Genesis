@@ -55,6 +55,29 @@ EXPORTS
     TerminateThread
     ResumeThread
     WaitForSingleObject
+    WaitForMultipleObjects
+    WaitForSingleObjectEx
+    WaitForMultipleObjectsEx
+    QueueUserAPC
+    RtlCaptureContext = ntdll.RtlCaptureContext
+; --- structured exception handling (except.c), and the Rtl* unwind calls
+; MinGW's libgcc imports from kernel32, forwarded as on Windows ---
+    RaiseException
+    SetUnhandledExceptionFilter
+    UnhandledExceptionFilter
+    AddVectoredExceptionHandler = ntdll.RtlAddVectoredExceptionHandler
+    RemoveVectoredExceptionHandler = ntdll.RtlRemoveVectoredExceptionHandler
+    RtlLookupFunctionEntry = ntdll.RtlLookupFunctionEntry
+    RtlVirtualUnwind = ntdll.RtlVirtualUnwind
+    RtlUnwindEx = ntdll.RtlUnwindEx
+    RtlUnwind = ntdll.RtlUnwind
+    CreateEventW
+    CreateEventA
+    SetEvent
+    ResetEvent
+    CreateSemaphoreW
+    CreateSemaphoreA
+    ReleaseSemaphore
     CreateMutexW
     CreateMutexA
     ReleaseMutex

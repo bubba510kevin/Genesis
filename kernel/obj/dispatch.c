@@ -239,6 +239,135 @@ static int disp_wait(object_t *obj, uint64 deadline) {
     }
 }
 
+/* --- waiting on several at once ------------------------------------------
+ *
+ * WaitForMultipleObjects. A thread is on one wait queue at a time, so a
+ * multi-object waiter parks on the readiness queue that EVERY
+ * waitq_wake_all also wakes - poll's arrangement, and for poll's reasons
+ * (waitq.h). It re-tests its own objects on each wake and sleeps again if
+ * none was one of them.
+ *
+ * WAIT-ALL IS ALL OR NOTHING. The objects are taken together, in one
+ * interrupts-off window, and only once every one of them is ready. Taking
+ * each as it becomes available instead would hold the first mutex while
+ * waiting for the second - which is exactly the lock-ordering deadlock
+ * wait-all exists to let a program avoid. */
+
+static int is_dispatcher(const object_t *obj);
+
+struct multi_ctx {
+    dispatcher_t **d;
+    int            n;
+    int            wait_all;
+    int            who;
+    process_t     *alertable;   /* the waiter, if an APC may end the wait */
+};
+
+static int multi_ready(void *ctx) {
+    struct multi_ctx *m = (struct multi_ctx *)ctx;
+    int i;
+
+    if (m->alertable != NULL && m->alertable->nt_apc_head != NULL) {
+        return 1;
+    }
+    for (i = 0; i < m->n; i++) {
+        int r = !m->d[i]->in_use || disp_ready(m->d[i], m->who);
+
+        if (m->wait_all && !r) {
+            return 0;
+        }
+        if (!m->wait_all && r) {
+            return 1;
+        }
+    }
+    return m->wait_all;
+}
+
+int dispatch_wait_multiple(object_t **objs, int n, int wait_all,
+                           int alertable, uint64 deadline) {
+    dispatcher_t *d[DISPATCH_WAIT_MAX];
+    struct multi_ctx ctx;
+    uint64 flags;
+    int i, j, rc;
+
+    if (n < 1 || n > DISPATCH_WAIT_MAX) {
+        return -22;
+    }
+    for (i = 0; i < n; i++) {
+        if (objs[i] == NULL || !is_dispatcher(objs[i])) {
+            return -22;                     /* not waitable */
+        }
+        d[i] = (dispatcher_t *)objs[i]->body;
+        if (d[i] == NULL || !d[i]->in_use) {
+            return -22;
+        }
+        /* The same object twice in a wait-all could never be satisfied for
+         * a semaphore of one and would be taken twice for anything else.
+         * NT refuses it; so does this. */
+        for (j = 0; wait_all && j < i; j++) {
+            if (d[j] == d[i]) {
+                return DISPATCH_WAIT_DUPLICATE;
+            }
+        }
+    }
+    ctx.d        = d;
+    ctx.n        = n;
+    ctx.wait_all = wait_all;
+    ctx.who      = caller_id();
+    ctx.alertable = alertable ? proc_current() : NULL;
+
+    flags = intr_disable();
+    for (;;) {
+        /* A queued APC ends an alertable wait before anything is taken -
+         * checked first, as NT does, so an APC queued before the wait
+         * began is not held up by an object that happens to be ready. */
+        if (ctx.alertable != NULL && ctx.alertable->nt_apc_head != NULL) {
+            intr_restore(flags);
+            return DISPATCH_WAIT_APC;
+        }
+        for (i = 0; i < n; i++) {
+            if (!d[i]->in_use) {
+                intr_restore(flags);
+                return -22;                 /* destroyed while we waited */
+            }
+        }
+        if (wait_all) {
+            if (multi_ready(&ctx)) {
+                int abandoned = -1;
+
+                for (i = 0; i < n; i++) {
+                    if (disp_consume(d[i], ctx.who) && abandoned < 0) {
+                        abandoned = i;
+                    }
+                }
+                intr_restore(flags);
+                return abandoned >= 0 ? DISPATCH_WAIT_ABANDONED + abandoned
+                                      : 0;
+            }
+        } else {
+            /* The LOWEST ready index wins, as on NT - a program that lists
+             * its shutdown event first is relying on exactly that. */
+            for (i = 0; i < n; i++) {
+                if (disp_ready(d[i], ctx.who)) {
+                    rc = disp_consume(d[i], ctx.who);
+                    intr_restore(flags);
+                    return rc ? DISPATCH_WAIT_ABANDONED + i : i;
+                }
+            }
+        }
+
+        rc = waitq_wait_until(waitq_readiness(), multi_ready, &ctx, deadline);
+        if (rc == WAITQ_TIMEOUT) {
+            intr_restore(flags);
+            return -110;
+        }
+        if (rc == WAITQ_SIGNAL) {
+            intr_restore(flags);
+            return -4;
+        }
+    }
+}
+
 /* --- the signal ---------------------------------------------------------- */
 
 static int disp_signal(object_t *obj, int op, int64 count, int64 *prev) {
@@ -394,6 +523,11 @@ static const object_type_t thread_type = {
     .signal  = disp_signal,
     .destroy = disp_destroy
 };
+
+static int is_dispatcher(const object_t *obj) {
+    return obj->type == &event_type || obj->type == &semaphore_type ||
+           obj->type == &mutant_type || obj->type == &thread_type;
+}
 
 /* --- creation ------------------------------------------------------------ */
 

@@ -12,6 +12,7 @@
 #include "waitq.h"
 #include "process.h"
 #include "dispatch.h"
+#include "nt_context.h"
 #include "teb.h"
 #include "tty.h"
 #include "typesk.h"
@@ -151,6 +152,10 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->nt_stack_lo     = 0;
     current->nt_stack_pages  = 0;
     current->nt_thread_start = 0;
+    current->nt_apc_dispatcher = 0;
+    current->nt_exc_dispatcher = 0;
+    current->nt_apc_head     = NULL;
+    current->nt_apc_tail     = NULL;
     current->nt_tls_va       = 0;
     current->nt_tls_pages    = 0;
     current->run_ticks       = 0;
@@ -446,6 +451,10 @@ process_t *proc_alloc(int ppid) {
             p->nt_alerted      = 0;
             p->nt_suspend_count = 0;
             p->nt_parked       = 0;
+            p->nt_apc_head     = NULL;
+            p->nt_apc_tail     = NULL;
+            p->nt_apc_dispatcher = 0;
+            p->nt_exc_dispatcher = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
@@ -598,6 +607,7 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
      * reaped: a thread blocked on one must not wait for a reaper. Any
      * thread, not only NT ones - kernel code takes mutants too. */
     dispatch_owner_exited(p->pid);
+    nt_apc_flush(p);                      /* APCs nobody will ever run */
     if (p->nt_thread_obj != NULL) {
         thread_object_record_cpu(p->nt_thread_obj, p->cpu_ticks);
         thread_object_exited(p->nt_thread_obj, exit_code);

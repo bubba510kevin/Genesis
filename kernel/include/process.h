@@ -189,6 +189,11 @@ typedef struct process {
     uint64           nt_stack_lo;
     uint64           nt_stack_pages;
     uint64           nt_thread_start;
+    /* ntdll's KiUserApcDispatcher / KiUserExceptionDispatcher in this
+     * image (pe.c finds them with RtlUserThreadStart), inherited by the
+     * group's threads; 0 when the image has none. */
+    uint64           nt_apc_dispatcher;
+    uint64           nt_exc_dispatcher;
     /* This thread's implicit-TLS area (teb.h), unmapped when it exits the
      * same way its TEB and stack are. 0 pages: the process has no .tls. */
     uint64           nt_tls_va;
@@ -202,6 +207,10 @@ typedef struct process {
      * parked thread, and a signal does not (see signal_send). */
     volatile int     nt_suspend_count;
     volatile int     nt_parked;
+    /* Queued user-mode APCs, oldest first (nt_context.c). Freed when the
+     * thread exits. */
+    struct nt_apc   *nt_apc_head;
+    struct nt_apc   *nt_apc_tail;
 
     thread_t        thread;
 

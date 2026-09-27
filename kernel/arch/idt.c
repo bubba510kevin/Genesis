@@ -123,6 +123,13 @@ void idt_init(void) {
     idt_set_gate(8, (uint64)isr_stub_table[8],
                  IDT_PRESENT | IDT_TYPE_INTERRUPT, 1);
 
+    /* int3 from ring 3 is a breakpoint, not a protection fault: DebugBreak()
+     * and __debugbreak() must raise EXCEPTION_BREAKPOINT, which is only
+     * possible if the gate lets ring 3 through. With DPL 0 the CPU turns
+     * the instruction into a #GP instead. */
+    idt_set_gate(3, (uint64)isr_stub_table[3],
+                 IDT_PRESENT | IDT_TYPE_INTERRUPT | IDT_DPL3, 0);
+
     idtp.limit = (uint16)(sizeof(idt) - 1);
     idtp.base  = (uint64)&idt;
 

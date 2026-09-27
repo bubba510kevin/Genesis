@@ -1,6 +1,7 @@
 #include "backtrace.h"
 #include "idt.h"
 #include "interrupt.h"
+#include "nt_context.h"
 #include "irq.h"
 #include "lapic.h"
 #include "keyboard.h"
@@ -182,6 +183,16 @@ static void interrupt_dispatch_locked(struct interrupt_frame *frame) {
         }
 
         if (from_user) {
+            /* A Windows process handles its own faults (ROADMAP 14(c)):
+             * the fault goes to ntdll's exception dispatcher, and only a
+             * process that cannot be told - no dispatcher, no stack left -
+             * dies here. An unhandled one comes back as NtRaiseException's
+             * last chance and dies there, with the same kind of report. */
+            if (nt_exception_deliver(frame,
+                                     frame->vector == 14 ? read_cr2() : 0)) {
+                return_to_user(1);
+                return;
+            }
             print_string("\nUser fault: ", 0x0C);
             print_string(exception_name(frame->vector), 0x0C);
             print_string("  RIP ", 0x0C);

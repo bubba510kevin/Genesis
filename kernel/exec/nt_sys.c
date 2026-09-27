@@ -2,6 +2,7 @@
 #include "kprintf.h"
 #include "ksmp.h"
 #include "nt.h"
+#include "nt_context.h"
 #include "object.h"
 #include "pmm.h"
 #include "process.h"
@@ -10,6 +11,7 @@
 #include "teb.h"
 #include "timer.h"
 #include "typesk.h"
+#include "waitq.h"
 
 /* The NT calls about the machine, processes and scheduling - see the block
  * of NT_SYS_ numbers in nt.h for the list and what Win32 builds on each.
@@ -921,12 +923,17 @@ static uint64 nt_now_100ns(void) {
     return timer_realtime_ns() / 100 + NT_EPOCH_DELTA_100NS;
 }
 
+static int apc_waiting(void *ctx);
+
 static uint64 nt_delay_execution(uint64 alertable, uint64 interval_ptr) {
     process_t *me = proc_current();
     int64 interval;
     uint64 deadline, hz = timer_hz();
 
-    (void)alertable;
+    alertable = (uint8)alertable;
+    if (alertable && nt_apc_pending(me)) {
+        return STATUS_USER_APC;             /* SleepEx(..., TRUE) with one queued */
+    }
     if (!range_ok(interval_ptr, 8)) {
         return STATUS_ACCESS_VIOLATION;
     }
@@ -952,6 +959,24 @@ static uint64 nt_delay_execution(uint64 alertable, uint64 interval_ptr) {
      * that. */
     deadline = timer_ticks_now() + 1 +
                (((uint64)(-interval)) * hz + 9999999ULL) / 10000000ULL;
+    if (alertable) {
+        /* On the readiness queue, which nt_apc_queue wakes: the sleep ends
+         * at the deadline or at the first APC, whichever is first. */
+        for (;;) {
+            int r = waitq_wait_until(waitq_readiness(), apc_waiting, me,
+                                     deadline);
+
+            if (nt_apc_pending(me)) {
+                return STATUS_USER_APC;
+            }
+            if (r == WAITQ_TIMEOUT || timer_ticks_now() >= deadline) {
+                return STATUS_SUCCESS;
+            }
+            if (r == WAITQ_SIGNAL) {
+                return STATUS_ALERTED;
+            }
+        }
+    }
     while (timer_ticks_now() < deadline) {
         sched_sleep_until(me, deadline);
         if (me->state == PROC_BLOCKED) {
@@ -1088,6 +1113,29 @@ static uint64 nt_alert_by_tid(uint64 tid) {
     return STATUS_SUCCESS;
 }
 
+/* --- APCs ------------------------------------------------------------------------- */
+
+/* NtQueueApcThread(HANDLE, PPS_APC_ROUTINE, PVOID, PVOID, PVOID) */
+static uint64 nt_queue_apc(uint64 handle, uint64 routine, uint64 arg1,
+                           uint64 arg2, uint64 arg3) {
+    process_t *t = thread_of_handle(handle);
+
+    if (t == NULL || t->is_kthread) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (routine == 0 || !range_ok(routine, 1)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (nt_apc_queue(t, routine, arg1, arg2, arg3) != 0) {
+        return STATUS_NO_MEMORY;
+    }
+    return STATUS_SUCCESS;
+}
+
+static int apc_waiting(void *ctx) {
+    return nt_apc_pending((const process_t *)ctx);
+}
+
 /* --- suspend and resume ------------------------------------------------------------ */
 
 static uint64 nt_suspend_resume(uint64 handle, uint64 prev_ptr, int suspend) {
@@ -1174,6 +1222,9 @@ uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
         return nt_wait_for_alert(frame->r10, frame->rdx);
     case NT_SYS_ALERT_BY_TID:
         return nt_alert_by_tid(frame->r10);
+    case NT_SYS_QUEUE_APC:
+        (void)nt_stack_arg(syscall_get_user_rsp(), 5, &a5);
+        return nt_queue_apc(frame->r10, frame->rdx, frame->r8, frame->r9, a5);
     case NT_SYS_SUSPEND_THREAD:
         return nt_suspend_resume(frame->r10, frame->rdx, 1);
     case NT_SYS_RESUME_THREAD:

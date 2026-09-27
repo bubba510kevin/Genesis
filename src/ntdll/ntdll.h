@@ -183,6 +183,17 @@ NTSTATUS NtResetEvent(HANDLE EventHandle, LONG *PreviousState);
 NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
                                LARGE_INTEGER *Timeout);
 
+/* Up to 64 objects. WaitAll takes every one in a single step once all are
+ * signalled; WaitAny takes the lowest-indexed signalled one and returns
+ * STATUS_WAIT_0 + its index. */
+typedef LONG WAIT_TYPE;
+#define WaitAll                      0
+#define WaitAny                      1
+#define MAXIMUM_WAIT_OBJECTS         64
+NTSTATUS NtWaitForMultipleObjects(DWORD Count, HANDLE *Handles,
+                                  WAIT_TYPE WaitType, BOOLEAN Alertable,
+                                  LARGE_INTEGER *Timeout);
+
 NTSTATUS NtCreateSemaphore(HANDLE *SemaphoreHandle, DWORD DesiredAccess,
                            POBJECT_ATTRIBUTES ObjectAttributes,
                            LONG InitialCount, LONG MaximumCount);
@@ -199,6 +210,8 @@ NTSTATUS NtCreateMutant(HANDLE *MutantHandle, DWORD DesiredAccess,
 NTSTATUS NtReleaseMutant(HANDLE MutantHandle, LONG *PreviousCount);
 
 #define MUTANT_ALL_ACCESS            0x001F0001u
+#define EVENT_ALL_ACCESS             0x001F0003u
+#define SEMAPHORE_ALL_ACCESS         0x001F0003u
 /* A wait that acquired a mutant whose owner died holding it. A SUCCESS code:
  * the caller owns the mutant now, but what it guards may be half-updated. */
 #define STATUS_ABANDONED_WAIT_0      0x00000080u
@@ -240,6 +253,169 @@ NTSTATUS NtQueryInformationThread(HANDLE ThreadHandle, DWORD InfoClass,
 /* Counted: each reports the count as it was BEFORE the call. */
 NTSTATUS NtSuspendThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
 NTSTATUS NtResumeThread(HANDLE ThreadHandle, DWORD *PreviousSuspendCount);
+
+/* --- CONTEXT, APCs -----------------------------------------------------------
+ *
+ * CONTEXT in Microsoft's exact x64 layout (0x4D0 bytes, 16-aligned): every
+ * exception handler is handed one and compiled code reads it by windows.h's
+ * offsets. See kernel/include/nt_context.h for the kernel's side. */
+typedef struct __attribute__((aligned(16))) _M128A {
+    QWORD Low;
+    long long High;
+} M128A;
+
+typedef struct __attribute__((aligned(16))) _CONTEXT {
+    QWORD P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
+    DWORD ContextFlags;
+    DWORD MxCsr;
+    WORD  SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+    DWORD EFlags;
+    QWORD Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+    QWORD Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    QWORD R8, R9, R10, R11, R12, R13, R14, R15;
+    QWORD Rip;
+    BYTE  FltSave[512];             /* XMM_SAVE_AREA32: FXSAVE's image */
+    M128A VectorRegister[26];
+    QWORD VectorControl;
+    QWORD DebugControl;
+    QWORD LastBranchToRip, LastBranchFromRip;
+    QWORD LastExceptionToRip, LastExceptionFromRip;
+} CONTEXT, *PCONTEXT;
+
+#define CONTEXT_AMD64           0x00100000u
+#define CONTEXT_CONTROL         (CONTEXT_AMD64 | 0x1u)
+#define CONTEXT_INTEGER         (CONTEXT_AMD64 | 0x2u)
+#define CONTEXT_SEGMENTS        (CONTEXT_AMD64 | 0x4u)
+#define CONTEXT_FLOATING_POINT  (CONTEXT_AMD64 | 0x8u)
+#define CONTEXT_FULL            (CONTEXT_CONTROL | CONTEXT_INTEGER | \
+                                 CONTEXT_FLOATING_POINT)
+
+#define STATUS_USER_APC         0x000000C0u
+
+typedef void (*PPS_APC_ROUTINE)(PVOID Arg1, PVOID Arg2, PVOID Arg3);
+
+/* Resume in exactly `Context` - every register. Does not return on success.
+ * TestAlert TRUE runs any queued APC first (see NtQueueApcThread). */
+NTSTATUS NtContinue(PCONTEXT Context, BOOLEAN TestAlert);
+/* Queue Routine(Arg1, Arg2, Arg3) on a thread of this process; it runs the
+ * next time that thread waits alertably or calls NtTestAlert. */
+NTSTATUS NtQueueApcThread(HANDLE Thread, PPS_APC_ROUTINE Routine,
+                          PVOID Arg1, PVOID Arg2, PVOID Arg3);
+NTSTATUS NtTestAlert(void);
+/* The caller's registers as they will be when this returns. */
+void     RtlCaptureContext(PCONTEXT Context);
+/* Where the kernel sends a thread to run an APC. Not called by anybody. */
+void     KiUserApcDispatcher(void);
+
+/* --- structured exception handling (ROADMAP 14(c)) ----------------------
+ *
+ * x64 SEH is TABLE-BASED: nothing is registered at run time. Every function
+ * that needs unwinding has a RUNTIME_FUNCTION in its image's .pdata naming
+ * an UNWIND_INFO in .xdata that describes its prologue - and optionally a
+ * language handler (for C, __C_specific_handler, whose scope table lists
+ * the __try ranges). Dispatching an exception is walking those tables up
+ * the stack. */
+typedef struct _EXCEPTION_RECORD {
+    DWORD  ExceptionCode;
+    DWORD  ExceptionFlags;
+    struct _EXCEPTION_RECORD *ExceptionRecord;
+    PVOID  ExceptionAddress;
+    DWORD  NumberParameters;
+    QWORD  ExceptionInformation[15];
+} EXCEPTION_RECORD, *PEXCEPTION_RECORD;
+
+typedef struct _EXCEPTION_POINTERS {
+    PEXCEPTION_RECORD ExceptionRecord;
+    PCONTEXT          ContextRecord;
+} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
+
+typedef struct _RUNTIME_FUNCTION {
+    DWORD BeginAddress;
+    DWORD EndAddress;
+    DWORD UnwindData;
+} RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;
+
+typedef enum _EXCEPTION_DISPOSITION {
+    ExceptionContinueExecution = 0,
+    ExceptionContinueSearch    = 1,
+    ExceptionNestedException   = 2,
+    ExceptionCollidedUnwind    = 3
+} EXCEPTION_DISPOSITION;
+
+struct _DISPATCHER_CONTEXT;
+typedef EXCEPTION_DISPOSITION (*PEXCEPTION_ROUTINE)(
+    PEXCEPTION_RECORD rec, PVOID EstablisherFrame, PCONTEXT ctx,
+    struct _DISPATCHER_CONTEXT *dc);
+
+typedef struct _DISPATCHER_CONTEXT {
+    QWORD              ControlPc;
+    QWORD              ImageBase;
+    PRUNTIME_FUNCTION  FunctionEntry;
+    QWORD              EstablisherFrame;
+    QWORD              TargetIp;
+    PCONTEXT           ContextRecord;
+    PEXCEPTION_ROUTINE LanguageHandler;
+    PVOID              HandlerData;
+    PVOID              HistoryTable;
+    DWORD              ScopeIndex;
+    DWORD              Fill0;
+} DISPATCHER_CONTEXT, *PDISPATCHER_CONTEXT;
+
+typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
+typedef LONG (*PTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
+
+#define EXCEPTION_NONCONTINUABLE      0x01u
+#define EXCEPTION_UNWINDING           0x02u
+#define EXCEPTION_EXIT_UNWIND         0x04u
+#define EXCEPTION_TARGET_UNWIND       0x20u
+#define EXCEPTION_MAXIMUM_PARAMETERS  15
+
+#define EXCEPTION_EXECUTE_HANDLER      1
+#define EXCEPTION_CONTINUE_SEARCH      0
+#define EXCEPTION_CONTINUE_EXECUTION  (-1)
+
+#define UNW_FLAG_NHANDLER  0x0u
+#define UNW_FLAG_EHANDLER  0x1u
+#define UNW_FLAG_UHANDLER  0x2u
+#define UNW_FLAG_CHAININFO 0x4u
+
+#define STATUS_ACCESS_VIOLATION        0xC0000005u
+#define STATUS_NONCONTINUABLE_EXCEPTION 0xC0000025u
+#define STATUS_INVALID_DISPOSITION     0xC0000026u
+#define STATUS_UNWIND                  0xC0000027u
+
+NTSTATUS NtRaiseException(PEXCEPTION_RECORD rec, PCONTEXT ctx,
+                          BOOLEAN FirstChance);
+
+PRUNTIME_FUNCTION RtlLookupFunctionEntry(QWORD ControlPc, QWORD *ImageBase,
+                                         PVOID HistoryTable);
+PEXCEPTION_ROUTINE RtlVirtualUnwind(DWORD HandlerType, QWORD ImageBase,
+                                    QWORD ControlPc,
+                                    PRUNTIME_FUNCTION FunctionEntry,
+                                    PCONTEXT Context, PVOID *HandlerData,
+                                    QWORD *EstablisherFrame,
+                                    PVOID ContextPointers);
+BOOLEAN  RtlDispatchException(PEXCEPTION_RECORD rec, PCONTEXT ctx);
+void     RtlUnwindEx(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD rec,
+                     PVOID ReturnValue, PCONTEXT OriginalContext,
+                     PVOID HistoryTable);
+void     RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PEXCEPTION_RECORD rec,
+                   PVOID ReturnValue);
+void     RtlRaiseException(PEXCEPTION_RECORD rec);
+void     RtlRaiseStatus(NTSTATUS status);
+PVOID    RtlAddVectoredExceptionHandler(DWORD First,
+                                        PVECTORED_EXCEPTION_HANDLER handler);
+DWORD    RtlRemoveVectoredExceptionHandler(PVOID handle);
+/* What runs when nothing on the stack handled an exception (kernel32's
+ * SetUnhandledExceptionFilter installs its UnhandledExceptionFilter here).
+ * Returns the previous one. */
+PTOP_LEVEL_EXCEPTION_FILTER RtlSetUnhandledExceptionFilter(
+    PTOP_LEVEL_EXCEPTION_FILTER filter);
+EXCEPTION_DISPOSITION __C_specific_handler(PEXCEPTION_RECORD rec,
+                                           PVOID EstablisherFrame,
+                                           PCONTEXT ctx,
+                                           PDISPATCHER_CONTEXT dc);
+void     KiUserExceptionDispatcher(void);
 
 /* --- the runtime library ------------------------------------------------- */
 
