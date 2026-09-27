@@ -443,7 +443,10 @@ void vmm_space_destroy(address_space_t *as) {
                 ptv = table_at(pdv[i2] & ADDR_MASK);
 
                 for (i1 = 0; i1 < PT_ENTRIES; i1++) {
-                    if (ptv[i1] & PAGE_PRESENT) {
+                    /* Device memory (PAGE_DEVICE) is not a frame this
+                     * space owns - see paging.h. */
+                    if ((ptv[i1] & PAGE_PRESENT) &&
+                        !(ptv[i1] & PAGE_DEVICE)) {
                         /* No refcount, so this assumes the space held the
                          * last mapping of every frame in it. True while
                          * nothing is shared; the assumption that fork with
@@ -491,6 +494,14 @@ static int clone_page(address_space_t *dst, virt_addr_t virt,
     uint64      entry = *src_entry;
     phys_addr_t frame = entry & ADDR_MASK;
     uint64      flags;
+
+    /* Device memory is shared as it stands, writable on both sides and with
+     * no reference taken: there is no frame to count and nothing to copy -
+     * see PAGE_DEVICE in paging.h. */
+    if (entry & PAGE_DEVICE) {
+        flags = (entry & (0xFFFULL | PAGE_NX)) & ~(uint64)PAGE_PRESENT;
+        return vmm_map_page_in(dst, virt, frame, flags);
+    }
 
     /* Write permission goes away on both sides, and PAGE_COW records that the
      * page is only read-only because it is shared. A page that was already
@@ -872,6 +883,9 @@ void vmm_unmap_page_in(address_space_t *as, virt_addr_t virt_addr, int free_fram
     if (!(ptv[i1] & PAGE_PRESENT)) return;
 
     frame = ptv[i1] & ADDR_MASK;
+    if (ptv[i1] & PAGE_DEVICE) {
+        free_frame = 0;                 /* not ours - see paging.h */
+    }
     ptv[i1] = 0;
     tlb_invalidate(as, virt_addr);
     if (free_frame) {

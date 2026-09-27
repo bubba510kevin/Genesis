@@ -56,6 +56,13 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
   `__try`/`__except`/`__finally` (`src/winseh`).
 - **Networking** (item 6): TCP + lo0, Linux-ABI sockets, **DHCP** with renewal.
 - **gnfs v2**: big files, rename, snapshots; ZFS removed.
+- **Display** (item 14(h), branch `claude/vbe-fb-ps2-mouse`): the bootloader
+  sets a VESA/VBE 32bpp linear-framebuffer mode (1024x768 by default) through a
+  real-mode stub at the head of the kernel image (`kernel/arch/vbe_boot.c`);
+  the console draws into it; `/dev/fb0` has fbdev ioctls and `mmap`.
+- **Mouse** (mouse half of item 14(j), same branch): PS/2 `psm` driver
+  (FreeBSD Newbus idiom) on an `atkbdc` bus, wheel included; `/dev/mouse0`
+  serves evdev `input_event` records. `/bin/fbtest` covers both from ring 3.
 
 ## What needs to be done now, in order
 
@@ -93,6 +100,10 @@ load (win32k.sys first, then the VGA-class display driver and the
 i8042prt/mouclass input stack); the real gdi32/user32/comctl32/explorer on
 top; COM. Mouse: precompiled stack, or FreeBSD's psm ported meanwhile. See
 item 14.
+The framebuffer (14(h), boot console and `/dev/fb0`) and the PS/2 mouse
+(`/dev/mouse0`, `mouse_take()` in `kernel/dev/mouse.c`) are done. Open ends
+there: no mode switch after boot, no PAT write-combining, one mouse queue
+shared by every reader, no `O_NONBLOCK` on device reads.
 
 ### Side work, smaller, any time
 - **An intermittent boot selftest failure, not yet explained**:
@@ -164,7 +175,11 @@ wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && bash tests/host/run.s
 `GENESIS_NET=10.0.9.0/24` changes the DHCP subnet), types each program into
 the shell over serial and waits for its tally. Pass program paths to run a
 subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
-`build/guest.log`. Expected as of 2026-09-27:
+`build/guest.log`. For `/bin/fbtest` it also drives QEMU's mouse through a
+monitor on a free TCP port when the program prints `MOUSE-WAIT-n`, so run
+fbtest through guest_run (by hand it asks you to move and click).
+`GENESIS_VBE=WxH` or `GENESIS_VBE=off` at build time picks the graphics mode
+or keeps text mode. Expected as of 2026-09-27:
 
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
@@ -175,7 +190,8 @@ subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
 | `wait` (`wait.exe`) | 46 passed | 46 passed |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
-| boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, no `FAILED` | same |
+| `fbtest` | 52 passed | 52 passed |
+| boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, `fb: selftest passed`, `psm: selftest passed (4-byte packets)`, no `FAILED` | same |
 | host (`tests/host/run.sh`) | exit 0 | |
 
 A hung guest: `tools/guest_dump.py CMD` runs commands and presses Ctrl-T for a

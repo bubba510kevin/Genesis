@@ -49,6 +49,11 @@ SECTIONS
 
     /* Runs with paging off or mid-switch: linked where it is loaded. */
     .lowtext : {
+        /* The image head (kernel/arch/vbe_boot.c) FIRST: a jump to
+           _kernel_entry at 0x100000, where boot.asm calls, then the VBE mode
+           request words and the real-mode stub boot.asm far-calls at
+           0xFFFF:0x0020. KEEP because nothing references the stub by name. */
+        KEEP(*(.lowtext.head))
         *(.lowtext*)
     }
 

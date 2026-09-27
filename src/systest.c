@@ -1533,7 +1533,9 @@ static void test_ioctl(void) {
              "TCSETS is accepted");
     check_eq(sc3(SYS_ioctl, 0, 0x5413 /* TIOCGWINSZ */, ws), 0,
              "TIOCGWINSZ succeeds");
-    check(ws[0] == 25 && ws[1] == 80, "and the console is 80x25");
+    /* 80x25 in VGA text mode; larger once the console draws into a
+     * framebuffer (128x48 at 1024x768) - so a floor, not an equality. */
+    check(ws[0] >= 25 && ws[1] >= 80, "and the console is at least 80x25");
     check_eq(sc3(SYS_ioctl, 0, 0xDEAD, termios), -ENOTTY,
              "an unknown request is -ENOTTY, not a lie");
     /* --- ioctl is about WHAT the descriptor names, not its number -------

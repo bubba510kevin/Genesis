@@ -137,6 +137,26 @@ typedef struct device_ops {
      * codes, which never reach here. */
     int (*control)(device_t *dev, uint32 code, void *arg, uint64 arg_size);
 
+    /* Which of OB_POLLIN / OB_POLLOUT hold right now, for poll(2). Optional:
+     * a device without one is "always ready", which is the truth for a disk
+     * and was the answer every device gave before a device that can BLOCK
+     * on read (the mouse) existed. A driver with a poll slot must also wake
+     * waitq_readiness() - through waitq_wake_all on any queue - when the
+     * answer changes, or a poller sleeps through the event. */
+    int (*poll)(device_t *dev, int events);
+
+    /* The physical page behind byte `offset` of the device, for mmap(2) -
+     * the framebuffer is the first device with one. `offset` is page
+     * aligned. On success *phys is the page's physical address and
+     * *cache_flags the caching bits the mapping must carry (PAGE_PCD for
+     * video memory); -EINVAL for an offset past the end.
+     *
+     * The page is DEVICE memory: it is mapped with PAGE_DEVICE, which tells
+     * the VMM it owns no frame there - munmap and exit must not free it, and
+     * fork must share it rather than copy-on-write it. */
+    int (*mmap)(device_t *dev, uint64 offset, uint64 *phys,
+                uint64 *cache_flags);
+
     /* The medium went away. Called by dev_detach AFTER the namespace names
      * are gone and DEVICE_GONE is set, so a driver freeing its own state here
      * cannot race a lookup that is still in flight.
@@ -222,6 +242,13 @@ int64 dev_write(device_t *dev, uint64 offset, const void *buf, uint64 n);
 int64 dev_read_raw(device_t *dev, uint64 offset, void *buf, uint64 n);
 int64 dev_write_raw(device_t *dev, uint64 offset, const void *buf, uint64 n);
 int   dev_control(device_t *dev, uint32 code, void *arg, uint64 arg_size);
+/* poll: the driver's answer, or "always ready" for a driver with no poll
+ * slot or a device that has gone (its read then says -ENODEV). mmap: the physical
+ * page behind a page-aligned offset (see device_ops_t::mmap), -ENODEV for a
+ * device that cannot be mapped. */
+int   dev_poll(device_t *dev, int events);
+int   dev_mmap(device_t *dev, uint64 offset, uint64 *phys,
+               uint64 *cache_flags);
 int   dev_parse(device_t *dev, const char *remainder, uint32 access,
                 object_t **out);
 

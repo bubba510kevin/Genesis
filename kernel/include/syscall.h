@@ -317,6 +317,13 @@
 #define TIOCGPGRP     0x540F
 #define TIOCSPGRP     0x5410
 
+/* Linux's console display mode (<linux/kd.h>): a program that draws into
+ * /dev/fb0 asks the console to stop drawing over it. */
+#define KDSETMODE     0x4B3A
+#define KDGETMODE     0x4B3B
+#define KD_TEXT       0x00
+#define KD_GRAPHICS   0x01
+
 #define ARCH_SET_GS   0x1001
 #define ARCH_SET_FS   0x1002
 #define ARCH_GET_FS   0x1003

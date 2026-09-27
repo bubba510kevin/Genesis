@@ -104,8 +104,10 @@ them. See §17.
 | Driver models | ✅ | Newbus, LinuxKPI and WDM, loadable from 4 directories, with unload; each with its multiprocessor API |
 | Networking | 🟡 | IPv4, ICMP, ARP, UDP, **TCP**, loopback (FreeBSD's own code); no DHCP, no IPv6 |
 | Storage drivers | ✅ | ATA (PIO), AHCI (DMA), MBR partitions |
-| Console | ✅ | VGA text, PS/2 keyboard, serial console (usable as the only input) |
-| GUI / desktop | ❌ | Nothing graphical yet; see §20 |
+| Display | ✅ | VESA/VBE linear framebuffer (1024x768x32 by default), set by the bootloader; `/dev/fb0` with Linux fbdev ioctls and `mmap` |
+| Console | ✅ | Drawn into the framebuffer (128x48, BIOS 8x16 font) or VGA text; PS/2 keyboard; serial console (usable as the only input) |
+| Mouse | ✅ | PS/2 mouse (Newbus `psm` on `atkbdc`), wheel; `/dev/mouse0` delivers evdev `input_event` records |
+| GUI / desktop | ❌ | A framebuffer and a mouse exist; no window system yet; see §20 |
 
 **Latest test results** (2026-09-27, full machine under QEMU, `-smp 4`):
 `verification: 160 passed, 0 failed` · `systest: 510 passed, 0 failed` ·
@@ -125,6 +127,17 @@ kernel at `0x100000`. The kernel then enters **64-bit long mode**
 (`kernel/arch/boot64.c`). The boot sector keeps the MBR partition-table bytes
 zeroed and padded, so the kernel's own partition scanner can never mistake boot
 code for a partition. The build fails if the code ever grows into that area.
+
+It also sets the **graphics mode**, in real mode while the BIOS can still be
+called (ROADMAP 14(h)). The boot sector has eight bytes to spare, so after
+loading the kernel it makes one far call through the High Memory Area
+(`0xFFFF:0x0020` = linear `0x100010`) into a stub carried at the front of the
+kernel image (`kernel/arch/vbe_boot.c`). The stub copies the BIOS 8x16 font,
+walks the VBE mode list for the largest 32bpp direct-colour mode with a linear
+framebuffer that fits the request (1024x768 unless `GENESIS_VBE=WxH` or
+`GENESIS_VBE=off` says otherwise at build time), sets it, and leaves a
+description at physical `0x5400` (`kernel/include/bootvbe.h`). Any failure
+leaves the machine in VGA text mode, which is still fully supported.
 
 ### Real hardware ✅
 `python3 build.py usb` produces **one bootable disk image**: kernel and FAT16
@@ -201,14 +214,59 @@ and TSC-based short delays (a driver may call `DELAY()` before interrupts are
 on). Clock resolution is **one tick** and is reported honestly.
 
 ### Console and input ✅
-- **VGA text** screen and a **tty** with a line discipline, echo and Ctrl-C
-  (`kernel/dev/screen.c`, `tty.c`).
+- A **tty** with a line discipline, echo and Ctrl-C (`kernel/dev/screen.c`,
+  `tty.c`). The console draws into the **framebuffer** when there is one
+  (8x16 BIOS font, 16 VGA colours, 128x48 at 1024x768, repainting only the
+  cells that changed) and into **VGA text** otherwise. `TIOCGWINSZ` reports
+  the real grid. A program that draws to the screen takes it with Linux's
+  `KDSETMODE KD_GRAPHICS` and gives it back with `KD_TEXT` (the console then
+  repaints); a program that exits holding it loses it at the next line of
+  console output.
 - **PS/2 keyboard** (`kernel/dev/keyboard.c`).
 - **Serial console** (`kernel/dev/serial.c`): everything the kernel prints is
   mirrored to COM1, and **received serial bytes feed the same input ring as
   the keyboard**. A machine with no PS/2 keyboard (the bare-metal target has
   only USB) is therefore still usable over serial, and the automated test
   harness types into the machine this way.
+
+### Display: the linear framebuffer ✅ (`kernel/dev/fb.c`)
+ROADMAP 14(h). The kernel maps what the bootloader set (uncached-minus, so a
+write-combining MTRR still applies) and serves it three ways: to the console,
+to other kernel code (`fb_get()`), and to user space as **`/dev/fb0`** -
+`FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO` in Linux's layout, `read`/`write`
+at an offset, and **`mmap(MAP_SHARED)`** of the pixels. Device pages carry a
+`PAGE_DEVICE` bit in the page tables, so `munmap` and exit never free them and
+`fork` shares them writable instead of copy-on-write. No mode switching after
+boot (the BIOS is gone by then); `FBIOPUT_VSCREENINFO` accepts only the mode
+already set.
+
+**Verified by** the `fb` boot selftest (the bootloader's block and font, the
+mode really active - read back from the Bochs/QEMU adapter's own registers
+where it has them, the kernel mapping page by page, pixel readback, the
+console's glyph renderer checked pixel-for-pixel against the font, and
+`/dev/fb0`'s read and mmap paths) and by `/bin/fbtest` from ring 3 (below).
+
+### Mouse ✅ (`kernel/dev/atkbdc.c`, `psm.c`, `mouse.c`)
+The mouse half of ROADMAP 14(j). `atkbdc` is the i8042 controller as a bus;
+**`psm`** is the PS/2 mouse, written as a FreeBSD Newbus driver (DEVMETHOD
+table, `DRIVER_MODULE(psm, atkbdc, ...)`, `bus_alloc_resource` for IRQ 12,
+`bus_setup_intr` with a filter). It turns on the IntelliMouse wheel when the
+mouse has one, and its decoder handles the parts that go wrong: framing (bit 3
+of the first byte, plus a timeout for a half-received packet), the 9-bit
+signed motion, and overflowed packets. Reports go to a device-independent
+layer (`mouse.c`) that a USB HID driver will feed too, which serves
+**`/dev/mouse0`**: Linux evdev `struct input_event` records (`EV_REL`
+`REL_X`/`REL_Y`/`REL_WHEEL`, `EV_KEY` `BTN_LEFT`/`RIGHT`/`MIDDLE`, `EV_SYN`),
+down and right positive, blocking `read` and `poll`. One shared queue: a
+second reader steals from the first.
+
+**Verified by** the `psm` boot selftest, which injects packets through the
+controller's loopback command (0xD3) so they arrive exactly as a mouse's would
+(IRQ 12, the handler, the decoder, the queue) and checks every event: signs,
+the ninth bit, Y flipped to screen coordinates, button changes only, a stray
+byte, an overflow, the wheel, an abandoned packet, and the interrupt-driven
+command path. `/bin/fbtest` then reads **real QEMU mouse input** injected
+through the monitor by `guest_run.py`.
 
 ---
 
@@ -794,15 +852,19 @@ Four layers, and every feature above lives in at least one:
 | Layer | What it is | Runs |
 |---|---|---|
 | **Host suite** (`tests/host/run.sh`) | Kernel code (VFS, FAT, gnfs, ACLs, bcache, PE, paths, volumes, …) compiled natively and tested directly, plus a byte-for-byte check of the gnfs ACL fixture and staged-tree name collisions | On the build machine |
-| **Boot self-tests** | 25+ checks that run every boot: SMP TLB shootdown, the WDM, LinuxKPI and FreeBSD multiprocessor APIs, interrupt migration, IOAPIC, IDT, IRQ, MSI, locks on 4 CPUs, ULE, kernel threads, condvars, taskqueue, callout, mbuf, bus, W^X, module unload, WDM IRPs, AHCI DMA, page cache, low memory, dispatcher objects, ACL privilege, network ARP/ICMP/UDP | Inside the kernel |
+| **Boot self-tests** | 25+ checks that run every boot: the framebuffer and the PS/2 mouse, SMP TLB shootdown, the WDM, LinuxKPI and FreeBSD multiprocessor APIs, interrupt migration, IOAPIC, IDT, IRQ, MSI, locks on 4 CPUs, ULE, kernel threads, condvars, taskqueue, callout, mbuf, bus, W^X, module unload, WDM IRPs, AHCI DMA, page cache, low memory, dispatcher objects, ACL privilege, network ARP/ICMP/UDP | Inside the kernel |
 | **systest** (`src/systest.c`) | 510 checks of the syscall interface from a real user program, deliberately without libc so errnos aren't hidden: including TCP over lo0, gnfs v2, and threads running on two CPUs at once. Permission checks run in child processes as real uids | Inside the booted machine |
 | **verif** (`src/verif.c`) | 160 checks plus the bug postmortems and the "needs a human" queue | Inside the booted machine |
 | **Windows programs** | `sync.exe` (29), `thr.exe` (16), `smp.exe` (53), `k32.exe`, `hello.exe`, `hand.exe` | Inside the booted machine |
+| **fbtest** (`src/fbtest.c`) | 52 checks of `/dev/fb0` and `/dev/mouse0` from ring 3, freestanding like systest: draws a picture through `mmap` and checks it back through the mapping, `read(2)`, a second mapping and a forked child; the mmap refusals; then mouse events from real (monitor-injected) QEMU input, through `poll` and through a blocking `read` | Inside the booted machine |
 
 **`tools/guest_run.py`** boots the full machine (4 CPUs, FAT root, a fresh
 gnfs volume and the gnfs ACL fixture, AHCI, the NIC), types commands into the
 shell over the serial port, and collects each program's `N passed, M failed`
-tally (verif, systest, thr.exe and smp.exe by default). `GENESIS_SMP=1` runs
+tally (verif, systest, thr.exe, smp.exe, tls.exe and fbtest by default).
+For fbtest it also moves and clicks QEMU's mouse through the monitor
+(`mouse_move`, `mouse_button`) when the program prints its `MOUSE-WAIT`
+lines. `GENESIS_SMP=1` runs
 it on one CPU. The whole run takes about ten minutes:
 
 ```
@@ -834,10 +896,13 @@ points at this same working copy.
 | `python3 build.py test` | The kernel heap allocator's native test |
 | `python3 build.py clean` | Remove build products, keeping `disk.img` |
 | `bash tests/host/run.sh` | The host test suite |
-| `python3 tools/guest_run.py` | Boot and run verif, systest, thr.exe and smp.exe (`GENESIS_SMP=N` picks the CPU count, default 4) |
+| `python3 tools/guest_run.py` | Boot and run verif, systest, thr.exe, smp.exe, tls.exe and fbtest (`GENESIS_SMP=N` picks the CPU count, default 4) |
 | `python3 tools/guest_dump.py CMD...` | Run commands, then press Ctrl-T and print the task dump (for a guest that hangs) |
 | `sh src/<ntdll\|kernel32\|winthread\|…>/build.sh` | Build a Windows DLL or program (MinGW-w64) |
 | `tools/build_user.sh` | Build every user program (its final staging step needs `sudo`) |
+
+`GENESIS_VBE=WxH` (build time) caps the graphics mode the bootloader picks;
+`GENESIS_VBE=off` keeps VGA text mode.
 
 Toolchain: gcc, nasm, ld, QEMU, mkfs.fat, **MinGW-w64** (Windows programs),
 **musl-gcc** (musl programs). Commit history is in git on branch `main`.
@@ -855,11 +920,13 @@ Collected in one place so nobody has to discover them the hard way:
   and the per-CPU idle threads.
 - **Kernel code is not preemptible**; a kernel loop that doesn't yield holds
   the big lock and stalls every CPU's system calls.
-- **No GUI**: text console only.
+- **No window system**: a framebuffer, a console drawn into it and a mouse;
+  no mode switching after boot, and nothing yet above the raw pixels.
 - **No IPv6.**
 - gnfs has one dataset per volume; there are no symlinks on any filesystem;
   FAT is 8.3-only.
-- **No file-backed mmap, no swap, no demand paging.**
+- **No file-backed mmap, no swap, no demand paging.** Devices (`/dev/fb0`)
+  can be mapped; files cannot.
 - **No USB** (no controller or HID drivers); input is PS/2 or serial.
 - **No NVMe, no GPT**; ATA is PIO-only.
 - **BusyBox has no applets**, just the shell.
@@ -895,9 +962,9 @@ ROADMAP item 14's dependency-ordered list:
 | (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | ❌ |
 | (f) | kernel32, completed | 🟡 |
 | (g) | advapi32 (registry, security APIs) | ❌ |
-| (h) | The display: precompiled display drivers under win32k (VGA-class XDDM first) | ❌ |
+| (h) | The display: a VESA/VBE framebuffer (console), then precompiled display drivers under win32k | 🟡 framebuffer set at boot, `/dev/fb0` with mmap, console drawn into it; the Windows display driver path doesn't exist |
 | (i) | gdi32 (precompiled; win32k's NtGdi side underneath) | ❌ |
-| (j) | user32 (precompiled; win32k's NtUser side, a mouse driver) | ❌ |
+| (j) | user32 (precompiled; win32k's NtUser side) and input | 🟡 the PS/2 mouse driver and `/dev/mouse0` exist; user32 support doesn't |
 | (k) | COM/OLE | ❌ |
 | (l) | RPC | ❌ |
 | (m) | comctl32 (precompiled, v5 and v6 SxS) | ❌ |
@@ -926,7 +993,7 @@ Genesis/
 │   ├── proc/                  processes, threads, ULE scheduler, signals, futex, syscalls
 │   ├── fs/                    VFS, FAT16, ACLs, NT security descriptors, caches, pipes
 │   ├── gnfs/                  gnfs, Genesis's native COW filesystem
-│   ├── dev/                   ATA, AHCI, disks, partitions, volumes, PCI, IRQ, console, serial, timer, RTC
+│   ├── dev/                   ATA, AHCI, disks, partitions, volumes, PCI, IRQ, console, framebuffer, i8042 + PS/2 mouse, serial, timer, RTC
 │   ├── driver/                Newbus, LinuxKPI, WDM, module loaders, hints
 │   ├── exec/                  ELF, PE, NT syscalls, TEB/PEB construction
 │   ├── obj/                   NT object manager, namespace, dispatcher objects
@@ -939,6 +1006,7 @@ Genesis/
 │   ├── rtld/                  the ELF dynamic linker (ld-gen.so)
 │   ├── kmod/                  loadable driver modules (if_re, lkpi_ahci, lkpi_pcpu, nb_rtl, …)
 │   ├── systest.c  verif.c     the in-machine test suites
+│   ├── fbtest.c               the framebuffer and mouse, from ring 3
 │   └── hello.c hello_musl.c ls.c mkprobe.c
 ├── root/                      the files staged onto the boot disk (/bin, /lib, /boot, /wsr)
 ├── tests/host/                host test suite and the gnfs ACL fixture

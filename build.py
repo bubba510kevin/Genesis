@@ -345,6 +345,47 @@ def cmd_kernel():
     run([LD, *LDFLAGS, *objs, "-o", KERNEL_ELF])
     run([OBJCOPY, "-O", "binary", KERNEL_ELF, KERNEL_BIN])
     gen_ksyms(KERNEL_ELF, KERNEL_BIN)
+    patch_vbe_request(KERNEL_BIN)
+
+
+def patch_vbe_request(bin_path):
+    """Write the requested graphics mode into the image head.
+
+    kernel/arch/vbe_boot.c's real-mode stub reads two words at image offset 8
+    - the largest width and height it will accept - before choosing a VESA
+    mode. They default to 1024x768 in kernel/include/bootvbe.h; GENESIS_VBE
+    overrides them without a kernel rebuild's worth of source edits:
+
+        GENESIS_VBE=1280x1024   the largest 32bpp mode that fits in that
+        GENESIS_VBE=off         stay in VGA text mode (no /dev/fb0)
+
+    The "GVBE" tag at offset 12 is checked first, so this refuses to write
+    into an image whose first bytes are not that head - linker.ld placing
+    something else first would otherwise be patched silently.
+    """
+    import struct
+
+    want = os.environ.get("GENESIS_VBE")
+    with open(bin_path, "r+b") as f:
+        head = f.read(16)
+        if head[12:16] != b"GVBE":
+            raise SystemExit(
+                f"build.py: {bin_path} does not start with the VBE image head "
+                f"(no 'GVBE' at offset 12) - linker.ld must place "
+                f".lowtext.head first")
+        if want is None:
+            return
+        if want.lower() in ("off", "0", "text", "none"):
+            w, h = 0, 0
+        else:
+            try:
+                w, h = (int(x) for x in want.lower().split("x"))
+            except ValueError:
+                raise SystemExit(f"build.py: GENESIS_VBE={want!r} is not "
+                                 f"WIDTHxHEIGHT or 'off'")
+        f.seek(8)
+        f.write(struct.pack("<HH", w, h))
+    print(f"  vbe: mode request {w}x{h}" if w else "  vbe: text mode requested")
 
 
 def cmd_image():
