@@ -11,6 +11,80 @@ refer to "ROADMAP item 11", "item 6", "item 7" by number in dozens of places;
 renumbering would make every one of them point at the wrong thing. The gaps in
 the sequence are the completed items.
 
+================================================================================
+THE PLAN - FOUR PHASES (reorganized 2026-09-27)
+================================================================================
+
+Everything in this file hangs off four phases, in this order. The numbered
+items below keep their numbers (see above); this section says which phase
+each one serves and what is NEW. Items 15-18 are new and are defined at the
+end of the file. A phase does not wait for every line of the one before it:
+each phase names the pieces of the others it actually needs, and those are
+pulled forward.
+
+THE RULE FOR ANYTHING GRAPHICAL, which overrides every item below: nothing
+that deals with a GUI is written from scratch. It is TAKEN FROM SOMEWHERE -
+a precompiled binary (Microsoft's user32/gdi32/comctl32/shell32/explorer and
+win32k.sys from the user's own Windows install, a vendor's display driver) or
+an existing open-source project, ported (FreeType, Mesa, a Wayland
+compositor or X server, GTK/Qt, FreeBSD's framebuffer console). What Genesis
+writes is the SUPPORT under it: system calls, kernel export surfaces, loaders.
+The same rule holds for drivers whose source or binary exists (item 12b).
+
+PHASE 1 - RUN BASH (item 15).
+  GNU bash as the login shell, interactive with readline and job control, and
+  able to run its own test suite. It comes first because it is the tool every
+  later phase is worked from, and because a real, unmodified shell is the
+  cheapest broad test of the Linux personality there is: it touches process
+  groups, terminals, signals, pipes, redirection, here-documents, globbing and
+  the environment in the ways real programs do, not the ways systest checks.
+  Pulls forward from phase 2: select/pselect6, getrlimit/prlimit64, a writable
+  /tmp, /proc (at least /proc/self/fd for process substitution), /etc/passwd
+  and /etc/group, symlinks, and long filenames on the root volume.
+
+PHASE 2 - A MODERN KERNEL: LINUX AND NT 10.0 PARITY (item 16).
+  The feature set a current Linux kernel and the NT 10.0 kernel (Windows 10
+  and 11) give their programs, as a gap inventory against what exists. It
+  absorbs the kernel-side remainders already here: item 9 (syscalls), 4
+  (driver model), 6 (netinet), 12b (drivers), 13 (SMP - the big lock), and
+  from item 14 the kernel halves of (a) threads, (d) memory and sections,
+  (p) NTFS, (r) USB, plus the kernel side of the registry (NT's registry is
+  the Configuration Manager INSIDE the kernel; advapi32 is a thin client).
+  This phase is never "finished" - it is worked in the order the later phases
+  and real programs need it.
+
+PHASE 3 - BASH UNDERSTANDS WINDOWS (item 17).
+  Genesis's bash, patched: Windows paths and drive letters, running .exe/.bat
+  by bare name, Windows-style command lines and environment for PE children,
+  CRLF scripts, full 32-bit exit codes, Ctrl-C as a console control event.
+  The patches are kept as a series against upstream bash, not a fork, and
+  borrow from what MSYS2 and Cygwin already do in the other direction.
+
+PHASE 4 - THE LIBRARIES: MAJOR .SO AND DLLS (item 18; item 14 (e)-(o)).
+  Non-GUI Windows DLLs are Genesis's own, written the way ntdll and kernel32
+  were: kernel32/kernelbase completed, advapi32, the C runtime (msvcrt and
+  ucrtbase - every MinGW and MSVC program needs one), ws2_32 over the TCP
+  stack that exists, the api-ms-win-* API set forwarders Windows 10 binaries
+  import through, rpcrt4, the non-GUI half of ole32/combase, and the rest of
+  item 18's list. GUI DLLs are TAKEN, per the rule above: item 14's (h), (i),
+  (j), (m) and (o) are precompiled binaries on win32k.sys (route one). Linux
+  .so files are taken from upstream (musl, then glibc; libstdc++; zlib and
+  friends) and the work is making them load and run; Linux GUI libraries
+  (Wayland/X, Mesa, GTK/Qt) are taken the same way, never written.
+
+WHERE EACH EXISTING ITEM NOW LIVES
+  item 4  driver model remainders ......................... phase 2
+  item 6  netinet remainders (IPv6, SCM_RIGHTS, DNS) ...... phase 2
+  item 7  zfs (removed; record only) ...................... -
+  item 9  missing syscalls ................................ phase 1 (bash's), then phase 2
+  item 10 staged root / source cleanup .................... phase 1 (bash's /etc, /tmp, long names)
+  item 12, 12b, 12c drivers and the serial console ........ phase 2 (12b's sourcing policy is the rule above)
+  item 13 SMP remainders (the big kernel lock) ............ phase 2
+  item 14 (a)-(d), (p), (q), (r) .......................... phase 2
+  item 14 (e)-(g), (k), (l), (n) .......................... phase 4, written
+  item 14 (h), (i), (j), (m), (o) ......................... phase 4, taken (GUI)
+  item 14 (s) exclusions .................................. unchanged
+
 THE ONE DEPENDENCY WORTH SEEING FIRST is DONE. It said: there is no KERNEL
 THREAD, sched.c schedules only processes with user address spaces, and that
 single absence blocks ZFS's write path (item 7), the driver half of the
@@ -733,7 +807,7 @@ To know the file tree is the standard Linux tree with /wsr (Windows system repos
 NEW — with symlinks running both directions (/wsr/X ↔ /X), ns_lookup needs a cycle guard / max-redirect-depth or a path bouncing between the two roots resolves forever. The /dev \??\-vs-\Device\ merge already produced one real bug in exactly this class of double-view resolution
 
 
-14. THE LONG-TERM GOAL, WRITTEN DOWN SO IT STOPS BEING IMPLICIT: a daily-drivable desktop running the Windows 7 DE, real Win32 binaries included. Nothing below this line is started. It is written as a dependency-ordered inventory, not as history the way the rest of this file is - there is no "DONE" to report yet on any of it, and no numbered sub-item here is safe from being renumbered, split, or dropped once work on it actually begins. It exists so the size of the gap is a fact everyone can see, not a feeling.
+14. THE LONG-TERM GOAL, WRITTEN DOWN SO IT STOPS BEING IMPLICIT: a daily-drivable desktop running the Windows 7 DE, real Win32 binaries included. Under THE PLAN at the top of this file its letters are split between phase 2 (the kernel halves) and phase 4 (the DLLs, written or taken); the letters are not renumbered because source comments cite them. (a) through (c) are done or nearly so; the rest is not started. It is written as a dependency-ordered inventory, not as history the way the rest of this file is - there is no "DONE" to report yet on any of it, and no numbered sub-item here is safe from being renumbered, split, or dropped once work on it actually begins. It exists so the size of the gap is a fact everyone can see, not a feeling.
 
 THE ARCHITECTURAL FORK THAT DECIDES EVERYTHING BELOW IT - DECIDED 2026-09-27, THE OPPOSITE WAY FROM THIS ITEM'S FIRST DRAFT: GENESIS DOES NOT WRITE GUI DLLS OR DRIVERS FROM SCRATCH. It runs the PRECOMPILED ones - Microsoft's own user32.dll, gdi32.dll, comctl32.dll, shell32.dll and the .sys drivers they sit on - and what Genesis writes is the SUPPORT those binaries need underneath them. A driver whose source exists is ported and modified instead (item 12b's policy).
 
@@ -822,3 +896,100 @@ THE ARCHITECTURAL FORK THAT DECIDES EVERYTHING BELOW IT - DECIDED 2026-09-27, TH
 (s) THE HONEST EXCLUSIONS, stated rather than silently assumed away: the .NET Framework (an entire second runtime - the CLR - that a real share of Windows 7-era software depends on) and a modern web browser (nothing built from scratch here is remotely competitive with Chromium/WebKit's own scope) are both out of scope for this item. "Runs the Windows 7 DE" means the desktop, the shell, and ordinary native Win32 applications - not every binary that ever shipped for Windows 7.
 
 WHERE THIS STANDS RELATIVE TO EVERYTHING ELSE IN THIS FILE: every other item here is a real, load-bearing piece of the eventual answer - the NT object manager, the PE loader, WDM driver loading (now the road to every precompiled driver, win32k.sys included), and this session's ACL work in particular are exactly the foundation (a), (b) and (g) build on. But (a) through (r) above are, collectively, larger than everything this tree has built so far, and ReactOS's (and, for running precompiled Windows binaries on another kernel, Wine's) multi-decade timeline on almost exactly this problem is the honest comparison, not a discouraging one - it is evidence this is a real, hard, well-precedented problem rather than one this tree is failing to solve quickly.
+
+
+15. RUN BASH - PHASE 1. NOT STARTED.
+
+The target: GNU bash (current upstream release), built by this tree and staged as /bin/bash, is the login shell - interactive, with readline line editing and history, job control (^Z, fg, bg, jobs), and its own test suite passing in the guest except for tests that are recorded as not applicable. What runs today is BusyBox's shell with no applets.
+
+HOW IT IS BUILT: from the upstream source tarball, unmodified in this phase, cross-compiled against musl the way BusyBox already is (tools/build_user.sh, musl-gcc) - static first, so nothing depends on the dynamic loader while the shell is being brought up; dynamic against the staged musl once that works (phase 4). readline and the termcap fallback are bash's own bundled copies (--with-installed-readline=no, --without-curses or a vendored ncurses), so no terminfo database is needed to start. The source is fetched and checksum-pinned by the build script, not committed, the same as vendsrc/.
+
+WHAT IS MISSING UNDERNEATH, found by reading what bash and musl call - the list is the starting point, and the musl ptrace-trace method item 9 describes is how it is finished:
+  (a) select and pselect6 - readline's input loop and `read -t` use them; there is poll/ppoll but no select at all.
+  (b) getrlimit/setrlimit/prlimit64 - `ulimit`, and musl's sysconf(_SC_OPEN_MAX); prlimit64 is -ENOSYS today. Real limits, per process, inherited across fork, with RLIMIT_NOFILE and RLIMIT_STACK enforced rather than reported.
+  (c) getrusage and the child-time halves of times() - `time` and `times` builtins.
+  (d) A WRITABLE /tmp - here-documents and here-strings are temporary files. A tmpfs is the right answer (it is also phase 2's).
+  (e) /proc - at least /proc/self/fd/N (process substitution <(...) falls back to named pipes without /dev/fd, which needs mkfifo, which needs (f)), /proc/self/exe, /proc/cpuinfo and /proc/meminfo for scripts that read them.
+  (f) mkfifo/mknod for FIFOs, and /dev/fd, /dev/stdin, /dev/stdout, /dev/stderr, /dev/tty.
+  (g) /etc/passwd, /etc/group, /etc/profile, /etc/shells and /etc/hostname staged (item 10), and a HOME that exists for root and for a normal user.
+  (h) SYMLINKS on some filesystem - /bin/sh -> bash, BusyBox's applet links, and scripts that assume them. None exist on any filesystem today.
+  (i) LONG FILENAMES on the root volume - FAT is 8.3-only, so ~/.bashrc and ~/.bash_history cannot exist there. Either VFAT long-name entries in fatfs or the root moving to gnfs; the second is the better end state.
+  (j) BusyBox's applets turned on (ls, cat, cp, grep, sed, awk...) or GNU coreutils built the same way - a shell with nothing to run is not usable. Applets need (h) or hard links.
+  (k) Terminal completeness for readline: TIOCSCTTY and a controlling terminal acquired by setsid, SIGTTOU/SIGTTIN for background jobs touching the terminal, VMIN/VTIME in non-canonical mode, and the window size change signal (SIGWINCH) when the console grid changes.
+  (l) execve of a #! script (and bash's own fallback when a file has no magic), and exec honouring setuid/setgid (FEATURES known limitation).
+
+THE CHECK: tools/guest_run.py drives an interactive bash over the serial console (it already answers fbtest's prompts, so the plumbing exists): a pipeline, a here-document, process substitution, a background job stopped with ^Z and resumed with fg, `ulimit -n`, `read -t 1` timing out, history recalled across a new login, and tab completion of a path. Then bash's own tests/ directory run in the guest, with every skipped test named and its reason recorded here.
+
+
+16. A MODERN KERNEL: LINUX AND NT 10.0 PARITY - PHASE 2. INVENTORY, NOT STARTED AS A WHOLE.
+
+The target is the feature set a current Linux kernel (the 7.x series at the time of writing) and the NT 10.0 kernel (Windows 10/11) give user programs and drivers. This is a gap inventory, ordered within each group by what the other phases need first. Items already in this file are referenced, not repeated. Nothing here is written from scratch where a vendored FreeBSD or Linux implementation can be ported (item 12b's rule).
+
+LINUX SIDE
+
+(a) SYSCALL SURFACE. About 145 of Linux's ~460 x86-64 calls are dispatched (item 9). Missing, grouped: event interfaces (epoll_*, timerfd_*, signalfd4, inotify_*, fanotify_*, pidfd_open/pidfd_send_signal/pidfd_getfd); modern file calls (statx, openat2, close_range, copy_file_range, sendfile, splice/tee/vmsplice, fallocate, utimensat, linkat/symlinkat/readlinkat for real, renameat2 with RENAME_EXCHANGE/NOREPLACE, xattr calls); process calls (clone3, prlimit64, getrusage, ptrace, process_vm_readv/writev, sched_setscheduler/sched_setattr, membarrier, rseq); memory (memfd_create, mlock family, userfaultfd, MAP_SHARED anonymous across fork, shm_open over tmpfs, SysV IPC); io_uring; mount API (mount/umount2/pivot_root and fsopen/fsmount/move_mount); security (capget/capset, seccomp, landlock_*); keyctl; perf_event_open and bpf last.
+(b) MEMORY MANAGEMENT. Demand paging and a page cache, file-backed mmap (FEATURES known limitation), swap, transparent huge pages, memory accounting that can say no (overcommit policy), OOM handling that picks a victim instead of failing the allocation that happened to be last. KASLR for the kernel and ASLR for user mappings (NT needs the latter too).
+(c) PROCESSES AND ISOLATION. Namespaces (mount, PID, UTS, IPC, network, user) and cgroups v2 (cpu, memory, pids, io) - what containers and systemd assume. POSIX capabilities in place of the all-or-nothing root the tree has, alongside the supreme-privilege extension. Core dumps.
+(d) SCHEDULING AND CONCURRENCY. The big kernel lock split (item 13's remainder - only where lock_report measures contention), kernel preemption, real-time classes (SCHED_FIFO/RR/DEADLINE), high-resolution timers and a tickless idle (clock resolution is one tick today), a vDSO for clock_gettime/gettimeofday/getcpu, NUMA awareness, CPU hotplug.
+(e) FILESYSTEMS. Symlinks and hard links everywhere (15(h)), tmpfs, procfs and sysfs, devtmpfs, ext4 (read-write, ported - Linux's or FreeBSD's ext2fs), extended attributes, FUSE, overlayfs, file locking beyond flock (OFD locks), inotify's hooks in the VFS, and NTFS read-write (item 14(p)).
+(f) SECURITY HARDENING. SMEP/SMAP, stack protector and FORTIFY for the kernel build, CET shadow stacks and IBT, Spectre/Meltdown-class mitigations (KPTI, retpolines or IBRS), seccomp-bpf, an LSM hook layer, module signing for loaded drivers.
+(g) HARDWARE PLATFORM. UEFI boot with a GOP framebuffer (there is BIOS boot only), GPT, ACPI with an AML interpreter (ported ACPICA - FreeBSD vendors it) for power-off, sleep states, battery, lid and thermal; x2APIC, HPET and the TSC-deadline timer, MSI-X, an IOMMU (VT-d/AMD-Vi) with DMA remapping, PCIe hotplug, CPU frequency scaling, suspend/resume.
+(h) DEVICES. NVMe (item 12b), USB (item 14(r)), audio (HDA - ported), real NICs beyond re/rl (e1000, virtio-net per 12b), wifi via LinuxKPI (12b), a DRM/KMS interface for modesetting (ported from Linux via LinuxKPI, as FreeBSD does - the display side of the GUI rule), evdev for every input device (the mouse has it; the keyboard should).
+(i) NETWORKING. IPv6 (item 6), netlink (what ip(8) and every modern network tool speaks), AF_PACKET, AF_UNIX with SCM_RIGHTS and SCM_CREDENTIALS, a packet filter (pf or nftables-shaped - FreeBSD's pf is vendorable), multicast, TCP features real peers expect (SACK, window scaling, timestamps - check what the vendored stack already negotiates).
+(j) OBSERVABILITY. dmesg/syslog through /dev/kmsg, /proc/<pid>/{status,maps,stat}, a tracing facility (ftrace- or dtrace-shaped; FreeBSD's dtrace is vendorable), perf counters.
+
+NT 10.0 SIDE
+
+(k) THREADS AND SYNCHRONIZATION. Item 14(a)'s remainders (named mutexes, NtOpenMutant, MAX_PROCESSES), and the NT 6+/10 primitives modern ntdll leans on: keyed events (NtCreateKeyedEvent/NtWaitForKeyedEvent), NtWaitForAlertByThreadId/NtAlertThreadByThreadId (Windows 8+ SRW locks and critical sections), I/O completion ports (NtCreateIoCompletion/NtRemoveIoCompletionEx) and worker factories (NtCreateWorkerFactory - the kernel half of the Vista+ thread pool, TpAllocWork and friends), NtSuspendProcess/NtResumeProcess, and item 14(c)'s open ends.
+(l) MEMORY. Item 14(d) in full (page states, VirtualProtect/Query, guard pages, sections and views), plus what NT 10 adds: ASLR with high-entropy bottom-up/top-down, DEP on by default, Control Flow Guard (the loader must honour the image's guard CF function table and the kernel must support the CFG bitmap - Windows 10 binaries are built with it), NtAllocateVirtualMemoryEx/MapViewOfFile3 placeholders.
+(m) PROCESSES. NtCreateUserProcess (a Windows program cannot start another one today), process parameters and the environment block, handle inheritance, job objects (limits, kill-on-close), the process and thread attribute lists (STARTUPINFOEX), and WoW64 last (32-bit PE on 64-bit - a whole second personality).
+(n) SECURITY. Tokens with privileges and groups (the SID/ACL work in kernel/fs/acl.c and ntsec.c is the foundation), impersonation, integrity levels and UAC-style split tokens (Vista+ - every Windows 10 process has an integrity level), access checks on every object open (the object manager has the objects; this puts security descriptors on all of them), audit is last.
+(o) THE I/O MANAGER. IRPs, device stacks and filter drivers (item 12b's note on why WDM's model is better than Newbus here), asynchronous (overlapped) I/O completing through APCs (built, 14(b)) and completion ports ((k)), cancellation, the PnP manager with device enumeration and driver INF matching, the power manager - all of it required for precompiled drivers, win32k.sys included (item 14's route one).
+(p) THE CONFIGURATION MANAGER. The registry lives in the kernel on NT: hives in the real regf format loaded from files, NtCreateKey/NtOpenKey/NtQueryValueKey/NtSetValueKey/NtEnumerateKey, change notification, security on keys, and the \Registry namespace in the object manager. advapi32 (14(g)) is then a thin client. Needed by drivers (their service keys) as much as by programs.
+(q) IPC. ALPC (NtAlpc* - the local RPC transport under rpcrt4 and every system service on NT 6+), named pipes and mailslots in the I/O manager (\Device\NamedPipe - used by services, cmd pipelines, and rpcrt4's ncacn_np), and the CSRSS connection protocol precompiled user32 and kernel32-side code still expect (CsrClientConnectToServer).
+(r) THE KERNEL EXPORT SURFACE for precompiled drivers: ntoskrnl.exe and hal.dll exports (Ex, Ke, Mm, Io, Ob, Ps, Rtl, Zw, Se, Po, Wmi, Etw), then the family libraries (videoprt, ndis, storport, portcls/ks, usbd/hidclass, wdf01000 for KMDF drivers). Order: what win32k.sys imports first (item 14's route one), then what the VGA-class display driver and the i8042prt/mouclass input stack import.
+(s) SYSTEM INFORMATION. NtQuerySystemInformation's commonly used classes (process list, performance, processor, time of day, modules), NtQueryInformationProcess's, the KUSER_SHARED_DATA page (time, tick count, NT version fields that user mode reads directly - Windows 10 binaries check them), ETW's user-mode registration calls answered (succeed and discard is acceptable to start).
+
+
+17. BASH UNDERSTANDS WINDOWS - PHASE 3. NOT STARTED.
+
+Genesis's bash is upstream bash plus a patch series (src/bash/patches/, applied by the build), never a fork - so moving to a new bash release is re-applying patches, not merging. MSYS2's and Cygwin's bash patches solve the mirror-image problem (a POSIX shell on the Windows kernel) and are read first, borrowed where they apply. Everything below is switchable (a `shopt -s winmode`-style option, on by default for an interactive login), because a script written for Linux must see none of it.
+
+(a) PATHS. C:\Windows\System32 and C:/Windows/System32 resolve: a drive letter maps to a volume through the object manager's \??\C: links (the namespace already has \??\; drive letters are assigned to volumes by volume.c), and /wsr is the system drive's tree per the /wsr layout decided earlier in this file. A backslash stays bash's escape character everywhere EXCEPT inside a word that starts with a drive-letter prefix or \\server\share, where it is a separator - the one rule that lets both kinds of script work. `cd C:\Users` works; `pwd -W` prints the Windows form.
+(b) RUNNING WINDOWS PROGRAMS BY BARE NAME. Command lookup tries PATHEXT (.COM;.EXE;.BAT;.CMD) after the bare name fails, and compares case-insensitively inside /wsr and on FAT/NTFS volumes (case-insensitive filesystems). `notepad` finds /wsr/Windows/System32/notepad.exe.
+(c) THE COMMAND LINE A PE CHILD SEES. Windows programs get one command-line string, not argv. bash builds it with the quoting rules CommandLineToArgvW and the MSVC CRT undo (backslash-before-quote doubling), so an argument with spaces or quotes arrives intact. Arguments that are clearly POSIX paths (/home/x/file.txt) are converted to Windows paths for a PE child, MSYS2-style, with the same escape hatch MSYS2 has (a variable listing arguments not to convert).
+(d) THE ENVIRONMENT. For a PE child: PATH converted to Windows form with ';' separators, and the variables Windows programs expect (SystemRoot, windir, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP/TMP, COMSPEC, PATHEXT, SystemDrive, ProgramFiles) supplied if unset. Windows treats variable names case-insensitively; bash does not - a PE child's block is de-duplicated case-insensitively, bash's own variables are left alone.
+(e) SCRIPTS AND BATCH FILES. CRLF line endings are accepted in scripts (Cygwin's igncr). .bat/.cmd files are handed to cmd.exe - cmd is not a GUI program, so under the rule it may be Genesis's own or a ported one (ReactOS's cmd is the obvious candidate to port).
+(f) EXIT STATUS AND ERRORS. $? stays 0-255, but the full 32-bit exit code of the last PE child is kept in a new variable (e.g. $WINSTATUS), and an NTSTATUS exit (0xC0000005) is printed by name in bash's "terminated" message the way a signal is.
+(g) SIGNALS AND CONSOLE EVENTS. ^C to a foreground PE process becomes CTRL_C_EVENT delivered to its SetConsoleCtrlHandler handlers (kernel side: a console control event raises a thread in the process at kernel32's handler routine - the APC machinery from 14(b) is the mechanism), ^Break CTRL_BREAK_EVENT, closing the terminal CTRL_CLOSE_EVENT. ^Z suspends a PE job through NtSuspendProcess (16(k)), fg resumes it.
+(h) COMPLETION AND GLOBBING. Tab completion of drive-letter paths and case-insensitive completion inside /wsr; `nocaseglob` defaulted on inside case-insensitive volumes.
+(i) BUILTINS WHERE WINDOWS NEEDS THEM: `start` (run detached, like cmd's), `where` (PATHEXT-aware which), `wslpath`-style `winpath`/`unixpath` converters.
+
+THE CHECK: a systest-style script run by bash in the guest that cds by drive letter, runs a .exe by bare name with arguments containing spaces and quotes (the child echoes GetCommandLineW back), reads WINSTATUS after an ExitProcess(0xC0000005), runs a CRLF script, runs a .bat through cmd, and ^C's a PE program that has a console control handler registered and sees the handler ran.
+
+
+18. THE LIBRARIES: MAJOR .SO AND DLLS - PHASE 4. INVENTORY.
+
+Two lists, split by the GUI rule. Everything here is loaded by the loaders item 14(e) completes (LdrLoadDll, the search path, API sets, SxS) and by the ELF dynamic linker (src/rtld, ld-gen.so).
+
+WRITTEN BY GENESIS (non-GUI; clean-room from documentation, as src/ntdll and src/kernel32 were; porting Wine or ReactOS code is allowed where its license fits and it is faster):
+  ntdll.dll ........... the NT 10.0 surface 16(k)-(s) exposes, the loader (14(e)), the thread pool (Tp*), Rtl* completeness
+  kernelbase.dll ...... Windows 7+ splits kernel32's implementation into kernelbase; precompiled DLLs import from it directly
+  kernel32.dll ........ item 14(f), forwarding to kernelbase where Windows does
+  api-ms-win-*.dll .... the API-set contracts Windows 8/10 binaries import through; an API-set schema in the PEB (ApiSetMap) resolving each to its host, not hundreds of stub files
+  msvcrt.dll, ucrtbase.dll, vcruntime140.dll ... the C runtimes (every MinGW program imports msvcrt; every MSVC 2015+ program imports ucrtbase/vcruntime)
+  advapi32.dll ........ item 14(g), over the in-kernel registry (16(p)) and tokens (16(n)); sechost.dll for what Windows 8+ moved there
+  ws2_32.dll, mswsock.dll ... Winsock over the existing TCP stack, overlapped I/O through the I/O manager (16(o))
+  rpcrt4.dll .......... item 14(l), over ALPC and named pipes (16(q))
+  ole32.dll, combase.dll, oleaut32.dll ... item 14(k)'s non-GUI half (apartments, CoCreateInstance, marshalling, BSTR/VARIANT); the GUI half (OLE drag-drop, clipboard formats) is taken with user32
+  shlwapi.dll ......... its string/path/registry helpers are non-GUI; its few window helpers forward to user32
+  version.dll, psapi.dll, dbghelp.dll, secur32.dll, bcrypt.dll, crypt32.dll, iphlpapi.dll, userenv.dll, netapi32.dll, winmm.dll (timers and the non-UI audio API over 16(h)'s audio)
+  cmd.exe ............. per 17(e)
+
+TAKEN, NEVER WRITTEN (anything that deals with a GUI):
+  Windows, precompiled from the user's own install, on win32k.sys loaded as a precompiled driver (item 14's route one): win32k.sys, user32.dll, gdi32.dll (and gdi32full.dll on Windows 10), comctl32.dll (v5 and v6 SxS), comdlg32.dll, shell32.dll, uxtheme.dll, dwmapi.dll, imm32.dll, msctf.dll, the display driver, explorer.exe - items 14(h), (i), (j), (m), (o).
+  Linux, from upstream: a display server (a Wayland compositor such as weston or sway, or Xorg) on DRM/KMS (16(h)) or fbdev, Mesa (llvmpipe software rendering first), libX11/libxcb, wayland-client, GTK and/or Qt, fontconfig, FreeType, HarfBuzz, Cairo, Pango, libinput on evdev. The work is the kernel surface they need (DRM ioctls, evdev, udev-shaped device events, shared memory with memfd), not the libraries.
+
+LINUX .SO FILES, taken from upstream (they are not GUI, but they already exist and are not the interesting part): musl's libc.so as the dynamic C library first (ld-musl on the staged root), then glibc for running unmodified distribution binaries (which needs more of 16(a) - glibc probes for clone3, rseq, statx and friends), libstdc++ and libgcc_s, zlib, OpenSSL or LibreSSL, ncurses/terminfo (bash's readline moves onto it), libffi, and whatever the first real programs brought over need. Genesis's own ld-gen.so stays the ELF loader until glibc's ld.so can run.
+
+THE CHECK, per DLL: a real program that imports it - one MinGW-built and, from the point ucrtbase exists, one MSVC-built - run in the guest with its output compared to the same program run on Windows. For the taken GUI binaries: the program starts, a window appears on the framebuffer, and a mouse click reaches its window procedure.

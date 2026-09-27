@@ -66,7 +66,28 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
 
 ## What needs to be done now, in order
 
-### 1. Finish item 14(a) — threads (small, self-contained)
+`ROADMAP.md` is organized into **four phases** (THE PLAN, at its top). Work
+them in order; a later phase pulls forward only the pieces of an earlier one
+it needs. **The GUI rule:** nothing that deals with a GUI is written from
+scratch — it is taken (precompiled Windows binaries on the real win32k.sys,
+or ported open source); Genesis writes the support underneath.
+
+### Phase 1 — run bash (ROADMAP item 15)
+GNU bash from upstream, built static against musl like BusyBox, as the login
+shell with readline and job control, then its own test suite in the guest.
+Missing underneath (item 15 (a)-(l)): `select`/`pselect6`, real rlimits
+(`prlimit64` is ENOSYS), `getrusage`, a writable `/tmp` (tmpfs), `/proc`
+(`/proc/self/fd` at least), FIFOs and `/dev/fd`, staged `/etc/passwd` etc.,
+symlinks, long filenames on the root (FAT is 8.3 — `.bashrc` can't exist),
+BusyBox applets or coreutils, terminal completeness (TIOCSCTTY, SIGTTOU/
+SIGTTIN, VMIN/VTIME, SIGWINCH), `#!` scripts and setuid exec. Find the rest
+with the musl ptrace-trace method (item 9).
+
+### Phase 2 — a modern kernel, Linux and NT 10.0 parity (item 16)
+A gap inventory, worked in the order phases 3-4 and real programs need it.
+The pieces already queued from earlier work belong here:
+
+**Finish item 14(a) — threads**
 - **Named mutexes**: `CreateMutexW` refuses a name today, because the other
   half of the named form (opening the existing one, `ERROR_ALREADY_EXISTS`,
   `OpenMutexW`) has no kernel path. `NtOpenEvent` in `kernel/exec/nt.c` is
@@ -76,7 +97,7 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
   will hit it; the table is scanned linearly by the scheduler, so raising it
   far means a run queue.
 
-### 2. Loose ends of 14(b)/(c) — small, pick up alongside 14(d)
+**Loose ends of 14(b)/(c)**
 See the STILL OPEN note under item 14(c) in `ROADMAP.md`: MinGW C++
 exceptions are untested (libgcc's SEH unwinder needs a CRT - `malloc`,
 `abort` - that this tree does not have yet; once one exists, a `throw`/
@@ -85,21 +106,29 @@ exceptions are untested (libgcc's SEH unwinder needs a CRT - `malloc`,
 filter should unwind (run `__finally`s) before exiting; stack overflow
 (`STATUS_STACK_OVERFLOW` needs a guard page, 14(d)).
 
-### 3. Items 14(d)–(f) — memory, loader, kernel32
-- (d) NT page-state model (reserve/commit, `VirtualProtect`, `VirtualQuery`),
-  Section objects / `MapViewOfFile`.
-- (e) `LdrLoadDll`/`LdrGetProcedureAddress` at run time (`LoadLibrary`,
-  `GetProcAddress`), a DLL search path.
-- (f) kernel32 breadth: `CreateProcess`, `MultiByteToWideChar`/
-  `WideCharToMultiByte`, environment, console API, time/locale, file API
-  breadth. Test with real MinGW programs, not only purpose-built ones.
+**Item 14(d) — NT memory** (reserve/commit, `VirtualProtect`, `VirtualQuery`,
+guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
+events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
+tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
+export surface precompiled drivers (win32k.sys first) import.
 
-### 4. Then the graphical stack — 14(g) onward
-Registry (advapi32); the ntoskrnl/hal export surface so precompiled drivers
-load (win32k.sys first, then the VGA-class display driver and the
-i8042prt/mouclass input stack); the real gdi32/user32/comctl32/explorer on
-top; COM. Mouse: precompiled stack, or FreeBSD's psm ported meanwhile. See
-item 14.
+### Phase 3 — bash understands Windows (item 17)
+A patch series on upstream bash (MSYS2/Cygwin patches read first): drive-
+letter paths, `.exe`/`.bat` by bare name via PATHEXT, Windows command-line
+quoting and environment for PE children, CRLF scripts, the full 32-bit exit
+code in a variable, ^C as `CTRL_C_EVENT`.
+
+### Phase 4 — the libraries: major .so and DLLs (item 18; 14(e)-(o))
+Written (non-GUI): the loader (14(e): `LdrLoadDll`, search path, API sets,
+SxS), kernel32/kernelbase (14(f)), the C runtimes (msvcrt, ucrtbase),
+advapi32, ws2_32, rpcrt4, ole32/combase, and item 18's list. First in
+line: `LoadLibrary`/`GetProcAddress` at run time, and kernel32 breadth
+(`CreateProcess`, `MultiByteToWideChar`/`WideCharToMultiByte`, environment,
+console API, time/locale, file API) tested with real MinGW programs.
+Taken (GUI): win32k.sys, user32, gdi32, comctl32, shell32, explorer, the
+VGA-class display driver and the i8042prt/mouclass input stack, precompiled;
+Linux GUI stacks from upstream. Genesis's part is the ntoskrnl/hal export
+surface (16(r)) they load on.
 The framebuffer (14(h), boot console and `/dev/fb0`) and the PS/2 mouse
 (`/dev/mouse0`, `mouse_take()` in `kernel/dev/mouse.c`) are done. Open ends
 there: no mode switch after boot, no PAT write-combining, one mouse queue
