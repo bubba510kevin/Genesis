@@ -39,8 +39,15 @@ void timer_init(uint32 hz) {
     outb(PIT_CH0, (uint8)((divisor >> 8) & 0xFF));
 }
 
-void timer_tick(void) {
+/* The clock itself, split out of timer_tick so the interrupt path can run
+ * it before taking the big kernel lock: a tick that had to wait for another
+ * CPU to leave the kernel would otherwise be late, and a second tick arriving
+ * while the first waited would be lost - the PIT latches one. */
+void timer_advance(void) {
     ticks++;
+}
+
+void timer_tick(void) {
 
     /* The callout wheel's only clock source. Deliberately after the
      * increment, so a handler that reads timer_ticks_now() sees the tick it
@@ -90,4 +97,48 @@ uint64 timer_ticks_now(void) {
 
 uint64 timer_ms(void) {
     return (ticks * 1000ULL) / tick_hz;
+}
+
+/* --- the TSC, calibrated ---------------------------------------------------
+ *
+ * The tick is 10ms; a performance counter has to resolve far less than
+ * that. The TSC does, and runs regardless of interrupt state, but its rate
+ * is not architecturally known - so it is measured once against the PIT,
+ * over the same ten ticks the LAPIC timer is calibrated across (see
+ * smp_start_scheduling). Until then timer_tsc_hz() is 0 and callers fall
+ * back to the tick or to a deliberately high assumed rate. */
+static uint64 tsc_hz;
+
+static uint64 rdtsc_raw(void) {
+    uint32 lo, hi;
+
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64)hi << 32) | lo;
+}
+
+void timer_calibrate_tsc(uint32 pit_ticks) {
+    uint64 t0, c0, c1;
+
+    if (pit_ticks == 0) {
+        return;
+    }
+    t0 = ticks;
+    while (ticks == t0) {
+        __asm__ volatile ("pause");
+    }
+    c0 = rdtsc_raw();
+    t0 = ticks;
+    while (ticks - t0 < pit_ticks) {
+        __asm__ volatile ("pause");
+    }
+    c1 = rdtsc_raw();
+    tsc_hz = ((c1 - c0) * (uint64)tick_hz) / pit_ticks;
+}
+
+uint64 timer_tsc_hz(void) {
+    return tsc_hz;
+}
+
+uint64 timer_tsc(void) {
+    return rdtsc_raw();
 }

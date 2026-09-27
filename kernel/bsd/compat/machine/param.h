@@ -45,6 +45,21 @@
  *
  * MUST agree with paging.h's PHYSMAP_BASE. They are two spellings of one
  * constant and there is no compiler check that they match. */
+/* The amd64 page-table geometry, copied from vendsrc/sys/amd64/include/
+ * param.h. <machine/pmap.h> (vendored) uses them in its pmap_pte_index
+ * family, which TCP's headers pull in through vm/pmap.h. */
+#ifndef PDRSHIFT
+#define NPTEPGSHIFT     9
+#define NPDEPGSHIFT     9
+#define PDRSHIFT        21
+#define NPDPEPGSHIFT    9
+#define PDPSHIFT        30
+#define NPML4EPGSHIFT   9
+#define PML4SHIFT       39
+#define NPML5EPGSHIFT   9
+#define PML5SHIFT       48
+#endif
+
 #ifndef PHYS_TO_DMAP
 #define PHYSMAP_BASE_COMPAT 0xFFFFFE0000000000ULL
 #define PHYS_TO_DMAP(x)  ((void *)(PHYSMAP_BASE_COMPAT + (unsigned long long)(x)))

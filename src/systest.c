@@ -77,6 +77,15 @@ static i64 sc6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 #define SYS_recvfrom       45
 #define SYS_bind           49
 #define SYS_getsockname    51
+#define SYS_accept         43
+#define SYS_sendmsg        46
+#define SYS_recvmsg        47
+#define SYS_shutdown       48
+#define SYS_listen         50
+#define SYS_getpeername    52
+#define SYS_setsockopt     54
+#define SYS_getsockopt     55
+#define SYS_accept4       288
 #define SYS_poll            7
 #define SYS_brk            12
 #define SYS_rt_sigaction   13
@@ -705,11 +714,12 @@ static void test_socketpair(void) {
 
 /* --- ROADMAP item 6: sockets as descriptors ------------------------------ */
 
+/* Linux's layout: a 16-bit family at offset 0. The stack underneath is
+ * FreeBSD's, whose sockaddr starts with a length byte and an 8-bit family -
+ * kern_socketfd.c translates at the boundary, and these tests are written the
+ * way a Linux program is, so they prove it does. */
 struct k_sockaddr_in {
-    unsigned char  sin_len;      /* BSD has this; Linux does not - the kernel
-                                  * rewrites it from addrlen, so what is put
-                                  * here is deliberately WRONG to prove it */
-    unsigned char  sin_family;
+    unsigned short sin_family;
     unsigned short sin_port;     /* network order */
     unsigned int   sin_addr;     /* network order */
     unsigned char  sin_zero[8];
@@ -733,16 +743,8 @@ static void test_socket(void) {
 
     section("socket / bind / connect / sendto / poll");
 
-    /* The refusals. SOCK_STREAM is the interesting one: it must fail because
-     * the PROTOCOL SWITCH refuses it (netinet/in_proto.c's tcp_protosw
-     * pr_attach returns EPROTONOSUPPORT), not because a check in the syscall
-     * layer says so - so the day TCP is vendored this starts working with no
-     * edit here. Asserted as "fails" rather than as a specific errno for
-     * exactly that reason. */
     check(sc3(SYS_socket, 99, 2 /*SOCK_DGRAM*/, 0) < 0,
           "an unknown address family is refused");
-    check(sc3(SYS_socket, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 0) < 0,
-          "SOCK_STREAM is refused - TCP is not vendored yet");
 
     fd = sc3(SYS_socket, 2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
     check(fd >= 0, "AF_INET/SOCK_DGRAM returns a descriptor");
@@ -750,12 +752,11 @@ static void test_socket(void) {
 
     /* Bind to a wildcard address and a kernel-chosen port. */
     for (unsigned i = 0; i < sizeof(dst); i++) ((unsigned char *)&dst)[i] = 0;
-    dst.sin_len    = 0;              /* deliberately wrong: see the struct */
     dst.sin_family = 2;
     dst.sin_port   = 0;
     dst.sin_addr   = 0;
     check_eq(sc3(SYS_bind, fd, &dst, sizeof(dst)), 0,
-             "bind to 0.0.0.0:0 succeeds even with sin_len left at 0");
+             "bind to 0.0.0.0:0 succeeds with a Linux-layout sockaddr");
 
     /* And READ IT BACK. This is what makes the bind above a test rather than
      * a call that returned zero: bind to port 0 asks the kernel to choose,
@@ -766,7 +767,8 @@ static void test_socket(void) {
 
         for (unsigned i = 0; i < sizeof(me); i++) ((unsigned char *)&me)[i] = 0;
         check_eq(sc3(SYS_getsockname, fd, &me, &melen), 0, "getsockname succeeds");
-        check_eq(me.sin_family, 2, "it reports AF_INET");
+        check_eq(me.sin_family, 2,
+                 "it reports AF_INET, as a 16-bit Linux family");
         check(me.sin_port != 0,
               "bind to port 0 really CHOSE a port (not just returned 0)");
         check(melen >= 8, "and wrote back a plausible address length");
@@ -785,8 +787,9 @@ static void test_socket(void) {
     check_eq(sc3(SYS_write, fd, dns_q, sizeof(dns_q)), (i64)sizeof(dns_q),
              "write(2) works on a connected socket");
 
-    check(sc6a(SYS_sendto, fd, dns_q, sizeof(dns_q), 1 /*MSG_OOB*/, 0, 0) < 0,
-          "a non-zero flags argument is refused rather than ignored");
+    check_eq(sc6a(SYS_sendto, fd, dns_q, sizeof(dns_q), 0x4000000 /*MSG_ZEROCOPY*/,
+                  0, 0), -95,
+             "an unsupported flag is refused (EOPNOTSUPP) rather than ignored");
 
     /* --- poll(2) ON A SOCKET, tested on the half that does not need a peer -
      *
@@ -826,6 +829,224 @@ static void test_socket(void) {
     check_eq(sc1(SYS_close, fd), 0, "closing the socket");
     check(sc3(SYS_bind, fd, &dst, sizeof(dst)) < 0,
           "and the descriptor is really gone");
+}
+
+/* --- TCP over lo0 -----------------------------------------------------------
+ *
+ * The vendored FreeBSD TCP, driven entirely from ring 3 through the Linux
+ * syscall ABI, with both ends in this one process: a listener on 127.0.0.1,
+ * a client connecting to it, and the loopback interface carrying every
+ * segment between them through the deferred netisr queue.
+ *
+ * One process is enough because connect(2) sleeps while the handshake runs
+ * on the taskqueue thread, and the completed connection waits in the
+ * listener's accept queue until this code asks for it. */
+
+#define LX_EAGAIN       11
+#define LX_EINPROGRESS 115
+#define LX_ECONNREFUSED 111
+#define LX_ENOTCONN    107
+
+static void tcp_addr(struct k_sockaddr_in *a, unsigned short port_be) {
+    for (unsigned i = 0; i < sizeof(*a); i++) ((unsigned char *)a)[i] = 0;
+    a->sin_family = 2;
+    a->sin_port   = port_be;
+    a->sin_addr   = 0x0100007FU;        /* 127.0.0.1 */
+}
+
+static void test_tcp(void) {
+    struct k_sockaddr_in a, peer;
+    unsigned int alen;
+    i64 lfd, cfd, sfd, n;
+    unsigned short port;
+    char buf[64];
+    int one = 1, v;
+    unsigned int vlen;
+
+    section("TCP over the loopback interface");
+
+    lfd = sc3(SYS_socket, 2, 1 /*SOCK_STREAM*/, 0);
+    check(lfd >= 0, "socket(AF_INET, SOCK_STREAM) - TCP is vendored now");
+    if (lfd < 0) return;
+
+    check_eq(sc5(SYS_setsockopt, lfd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/,
+                 &one, sizeof(one)), 0, "setsockopt SO_REUSEADDR");
+    tcp_addr(&a, 0);
+    check_eq(sc3(SYS_bind, lfd, &a, sizeof(a)), 0, "bind to 127.0.0.1:0");
+    check_eq(sc2(SYS_listen, lfd, 4), 0, "listen");
+
+    vlen = sizeof(v); v = 0;
+    check_eq(sc5(SYS_getsockopt, lfd, 1, 30 /*SO_ACCEPTCONN*/, &v, &vlen), 0,
+             "getsockopt SO_ACCEPTCONN");
+    check(v != 0, "and the socket reports it is listening");
+
+    alen = sizeof(a);
+    check_eq(sc3(SYS_getsockname, lfd, &a, &alen), 0, "getsockname on the listener");
+    port = a.sin_port;
+    check(port != 0, "the kernel chose a port");
+
+    /* Nothing has connected yet: a non-blocking accept must say so rather
+     * than sleep forever. */
+    sc3(SYS_fcntl, lfd, 4 /*F_SETFL*/, 0x800 /*O_NONBLOCK*/);
+    check_eq(sc3(SYS_accept, lfd, 0, 0), -LX_EAGAIN,
+             "accept on an empty queue, non-blocking, is EAGAIN");
+    sc3(SYS_fcntl, lfd, 4, 0);
+
+    cfd = sc3(SYS_socket, 2, 1, 0);
+    check(cfd >= 0, "a second TCP socket for the client");
+    tcp_addr(&a, port);
+    check_eq(sc3(SYS_connect, cfd, &a, sizeof(a)), 0,
+             "connect to 127.0.0.1 completes the three-way handshake");
+
+    {
+        struct { int fd; short events; short revents; } pfd;
+        pfd.fd = (int)lfd; pfd.events = 1 /*POLLIN*/; pfd.revents = 0;
+        check_eq(sc3(SYS_poll, &pfd, 1, 1000), 1,
+                 "poll says the listener has a connection to accept");
+        check(pfd.revents & 1, "as POLLIN");
+    }
+
+    alen = sizeof(peer);
+    sfd = sc3(SYS_accept, lfd, &peer, &alen);
+    check(sfd >= 0, "accept returns the server end");
+    if (sfd < 0) return;
+    check_eq(peer.sin_family, 2, "accept reports the peer as AF_INET");
+    check_eq(peer.sin_addr, 0x0100007FU, "from 127.0.0.1");
+    check_eq(alen, 16, "with a 16-byte address");
+
+    alen = sizeof(a);
+    check_eq(sc3(SYS_getpeername, cfd, &a, &alen), 0, "getpeername on the client");
+    check_eq(a.sin_port, port, "names the listener's port");
+    alen = sizeof(a);
+    check_eq(sc3(SYS_getsockname, cfd, &a, &alen), 0, "getsockname on the client");
+    check_eq(a.sin_port, peer.sin_port,
+             "and the client's own port is the one accept reported");
+
+    check_eq(sc5(SYS_setsockopt, cfd, 6 /*IPPROTO_TCP*/, 1 /*TCP_NODELAY*/,
+                 &one, sizeof(one)), 0, "setsockopt TCP_NODELAY");
+    vlen = sizeof(v); v = 0;
+    check_eq(sc5(SYS_getsockopt, cfd, 6, 1, &v, &vlen), 0, "getsockopt TCP_NODELAY");
+    check(v != 0, "reads back set");
+    vlen = sizeof(v); v = -1;
+    check_eq(sc5(SYS_getsockopt, cfd, 1, 3 /*SO_TYPE*/, &v, &vlen), 0,
+             "getsockopt SO_TYPE");
+    check_eq(v, 1, "is SOCK_STREAM");
+    check_eq(sc5(SYS_setsockopt, cfd, 1, 9999, &one, sizeof(one)), -92,
+             "an unknown option is ENOPROTOOPT");
+
+    /* Data, both ways. */
+    check_eq(sc3(SYS_write, cfd, "hello, tcp", 10), 10, "client writes 10 bytes");
+    for (unsigned i = 0; i < sizeof(buf); i++) buf[i] = 0;
+    n = sc3(SYS_read, sfd, buf, sizeof(buf));
+    check_eq(n, 10, "server reads 10 bytes");
+    check(buf[0] == 'h' && buf[9] == 'p', "and they are the bytes that were sent");
+
+    check_eq(sc6a(SYS_sendto, sfd, "pong", 4, 0, 0, 0), 4, "server sendto()s a reply");
+    n = sc6a(SYS_recvfrom, cfd, buf, sizeof(buf), 0x100 /*MSG_WAITALL*/, 0, 0);
+    check_eq(n, 4, "client recvfrom(MSG_WAITALL) gets it");
+
+    /* MSG_PEEK leaves the data queued. */
+    sc3(SYS_write, sfd, "peek", 4);
+    n = sc6a(SYS_recvfrom, cfd, buf, 4, 2 /*MSG_PEEK*/, 0, 0);
+    check_eq(n, 4, "MSG_PEEK sees the data");
+    n = sc3(SYS_read, cfd, buf, 4);
+    check_eq(n, 4, "and a read after it still gets the same data");
+
+    /* sendmsg / recvmsg with two iovecs each. */
+    {
+        struct { void *base; u64 len; } iov[2];
+        struct {
+            void *name; u32 namelen; u32 pad0;
+            void *iov; u64 iovlen;
+            void *control; u64 controllen;
+            int flags; u32 pad1;
+        } mh;
+        char a1[3], a2[3];
+
+        iov[0].base = "abc"; iov[0].len = 3;
+        iov[1].base = "def"; iov[1].len = 3;
+        for (unsigned i = 0; i < sizeof(mh); i++) ((char *)&mh)[i] = 0;
+        mh.iov = iov; mh.iovlen = 2;
+        check_eq(sc3(SYS_sendmsg, cfd, &mh, 0), 6, "sendmsg gathers two iovecs");
+
+        iov[0].base = a1; iov[0].len = 3;
+        iov[1].base = a2; iov[1].len = 3;
+        mh.iov = iov; mh.iovlen = 2; mh.flags = -1;
+        check_eq(sc3(SYS_recvmsg, sfd, &mh, 0x100 /*MSG_WAITALL*/), 6,
+                 "recvmsg scatters them");
+        check(a1[0] == 'a' && a1[2] == 'c' && a2[0] == 'd' && a2[2] == 'f',
+              "into both buffers, in order");
+        check_eq(mh.flags, 0, "with no truncation flags");
+    }
+
+    /* Non-blocking read of an empty stream. */
+    sc3(SYS_fcntl, sfd, 4, 0x800);
+    check_eq(sc3(SYS_read, sfd, buf, sizeof(buf)), -LX_EAGAIN,
+             "a non-blocking read with nothing queued is EAGAIN");
+    sc3(SYS_fcntl, sfd, 4, 0);
+
+    /* Half-close: the client stops sending, the server reads EOF, and can
+     * still send the other way. */
+    check_eq(sc2(SYS_shutdown, cfd, 1 /*SHUT_WR*/), 0, "shutdown(SHUT_WR)");
+    check_eq(sc3(SYS_read, sfd, buf, sizeof(buf)), 0,
+             "the server reads end-of-file (the FIN arrived)");
+    check_eq(sc3(SYS_write, sfd, "late", 4), 4,
+             "the server can still send on its half");
+    check_eq(sc3(SYS_read, cfd, buf, sizeof(buf)), 4,
+             "and the half-closed client still receives");
+
+    sc1(SYS_close, sfd);
+    check_eq(sc3(SYS_read, cfd, buf, sizeof(buf)), 0,
+             "closing the server end gives the client EOF");
+    sc1(SYS_close, cfd);
+
+    /* A second connection, accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC. */
+    cfd = sc3(SYS_socket, 2, 1, 0);
+    tcp_addr(&a, port);
+    check_eq(sc3(SYS_connect, cfd, &a, sizeof(a)), 0, "a second connect");
+    sfd = sc4(SYS_accept4, lfd, 0, 0, 0x800 | 0x80000);
+    check(sfd >= 0, "accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)");
+    check_eq(sc3(SYS_fcntl, sfd, 3 /*F_GETFL*/, 0) & 0x800, 0x800,
+             "the accepted descriptor is non-blocking");
+    check_eq(sc3(SYS_fcntl, sfd, 1 /*F_GETFD*/, 0) & 1, 1,
+             "and close-on-exec");
+    sc1(SYS_close, sfd);
+    sc1(SYS_close, cfd);
+    sc1(SYS_close, lfd);
+
+    /* Nobody is listening on the old port any more: a connect is refused by
+     * the RST TCP answers, and the errno is LINUX's number for it. */
+    cfd = sc3(SYS_socket, 2, 1, 0);
+    tcp_addr(&a, port);
+    check_eq(sc3(SYS_connect, cfd, &a, sizeof(a)), -LX_ECONNREFUSED,
+             "connect to a closed port is ECONNREFUSED (111, not BSD's 61)");
+    alen = sizeof(a);
+    check_eq(sc3(SYS_getpeername, cfd, &a, &alen), -LX_ENOTCONN,
+             "getpeername on an unconnected socket is ENOTCONN");
+    sc1(SYS_close, cfd);
+
+    /* Non-blocking connect: EINPROGRESS, then POLLOUT, then SO_ERROR 0. */
+    lfd = sc3(SYS_socket, 2, 1, 0);
+    tcp_addr(&a, 0);
+    sc3(SYS_bind, lfd, &a, sizeof(a));
+    sc2(SYS_listen, lfd, 1);
+    alen = sizeof(a);
+    sc3(SYS_getsockname, lfd, &a, &alen);
+    cfd = sc3(SYS_socket, 2, 1 | 0x800 /*SOCK_NONBLOCK*/, 0);
+    n = sc3(SYS_connect, cfd, &a, sizeof(a));
+    check(n == -LX_EINPROGRESS || n == 0,
+          "a non-blocking connect returns EINPROGRESS (or 0 if already done)");
+    {
+        struct { int fd; short events; short revents; } pfd;
+        pfd.fd = (int)cfd; pfd.events = 4 /*POLLOUT*/; pfd.revents = 0;
+        check_eq(sc3(SYS_poll, &pfd, 1, 2000), 1, "poll(POLLOUT) reports it done");
+    }
+    vlen = sizeof(v); v = -1;
+    check_eq(sc5(SYS_getsockopt, cfd, 1, 4 /*SO_ERROR*/, &v, &vlen), 0,
+             "getsockopt SO_ERROR");
+    check_eq(v, 0, "and the connection succeeded");
+    sc1(SYS_close, cfd);
+    sc1(SYS_close, lfd);
 }
 
 static u64 tls_block[8];
@@ -2667,6 +2888,7 @@ void _start(void) {
     test_eventfd();
     test_socketpair();
     test_socket();
+    test_tcp();
     test_sigaltstack();
     test_waitid();
     test_arch_prctl();

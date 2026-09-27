@@ -39,6 +39,7 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/linker_set.h>
+#include <sys/module.h>
 
 #include "kprintf.h"
 #include "ksyms.h"
@@ -160,4 +161,21 @@ void genesis_sysinit_report(uint8 color) {
     kprintf_c(color, "sysinit: %d of %d initialisers ran, subsystems %x..%x\n",
               sysinit_count, (int)total,
               (unsigned)(*first)->subsystem, (unsigned)(*(last - 1))->subsystem);
+}
+
+/* The SYSINIT that <sys/module.h>'s DECLARE_MODULE expands to: deliver
+ * MOD_LOAD to a module linked into the kernel. A handler's failure is
+ * printed, not fatal - upstream's module_register_init does the same. */
+void genesis_module_load(const void *moddata) {
+    const moduledata_t *md = moddata;
+    int error;
+
+    if (md->evhand == NULL) {
+        return;
+    }
+    error = md->evhand(NULL, MOD_LOAD, md->priv);
+    if (error != 0) {
+        kprintf_c(0x0C, "module %s: MOD_LOAD failed, error %d\n",
+                  md->name, error);
+    }
 }

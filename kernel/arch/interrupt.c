@@ -16,6 +16,8 @@
 #include "pic.h"
 #include "screen.h"
 #include "typesk.h"
+#include "bkl.h"
+#include "ksmp.h"
 
 /* Single dispatch point, replacing the split isr_handler.c / irq_handler.c of
  * the 32-bit tree. There is one stub table and one frame layout now, so a
@@ -135,7 +137,7 @@ static void kill_faulting_process(uint64 vector) {
     proc_retire(p, 128 + SIGSEGV);
 }
 
-void interrupt_dispatch(struct interrupt_frame *frame) {
+static void interrupt_dispatch_locked(struct interrupt_frame *frame) {
     /* --- the user RSP, for whichever door the kernel was entered by ------
      *
      * The per-CPU block's user_rsp slot is written by exactly one instruction
@@ -166,10 +168,6 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
      * RSP in its frame, and the slot already holds the right value from the
      * syscall that got us here. Overwriting it with a kernel stack pointer is
      * how a syscall returns to ring 3 on the wrong stack. */
-    if (frame_from_user(frame)) {
-        syscall_set_user_rsp(frame->rsp);
-    }
-
     if (frame->vector < 32) {
         int from_user = frame_from_user(frame);
 
@@ -242,6 +240,8 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
         uint64 irq = frame->vector - 32;
 
         if (irq == 0) {
+            /* ticks itself already advanced, before the lock - see
+             * interrupt_dispatch. This is the rest of the tick. */
             timer_tick();
             /* Only flags a pending switch. Switching here would unwind an
              * interrupt frame from underneath the handler that is still
@@ -293,6 +293,109 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
         lapic_eoi();
     }
 
+    /* The preemption point for user code - taken by the caller,
+     * interrupt_dispatch, which owns the big kernel lock's release and so
+     * must be the one to decide when this thread leaves the kernel. */
+    (void)0;
+}
+
+/* The interrupt entry, and where the big kernel lock is taken and dropped
+ * for it (see bkl.h's table).
+ *
+ * THE LOCK-FREE PATH. The SMP IPIs and an AP's LAPIC timer run without it:
+ * a shootdown or remote-call IPI is by definition answered while the CPU
+ * that sent it holds the lock and waits, and the AP's tick is 100 interrupts
+ * a second per CPU that almost never need anything but a counter. Each takes
+ * the lock only if, coming from ring 3, it leaves something for the return
+ * path to do - a reschedule, a thread killed from another CPU, a fatal
+ * signal - and otherwise goes straight back to the user.
+ *
+ * The PIT tick advances `ticks` before the lock for the same reason: the
+ * machine's clock must not lose a tick because another CPU was in the
+ * kernel when it fired.
+ *
+ * EVERYTHING ELSE takes the lock unless this CPU already holds it - an
+ * interrupt from ring 3 always, an interrupt that woke an idle CPU always,
+ * an interrupt nested in kernel code on this CPU never (the lock is this
+ * CPU's already). */
+static int wants_kernel(struct cpu_local *c) {
+    process_t *me = c->current;
+
+    return c->resched || smp_deferred_pending() ||
+           (me != NULL && !me->is_kthread &&
+            (me->state == PROC_ZOMBIE || signal_pending(me)));
+}
+
+/* A signal that arrives while its target is in ring 3 on another CPU used
+ * to wait for the target's next system call. The one kind that cannot wait
+ * - a signal whose action is to terminate - is acted on here, on the way
+ * back to ring 3 from any interrupt. Handled signals still wait for the
+ * next syscall boundary, which needs a syscall frame to rewrite. */
+static void kill_on_fatal_signal(void) {
+    process_t *me = proc_current();
+
+    if (me != NULL && !me->is_kthread && me->state != PROC_ZOMBIE &&
+        signal_pending(me)) {
+        signal_kill_if_fatal(me);
+    }
+}
+
+void interrupt_dispatch(struct interrupt_frame *frame) {
+    struct cpu_local *c = smp_this_cpu();
+    int from_user = frame_from_user(frame);
+    int vec = (int)frame->vector;
+    int took = 0;
+
+    /* The user RSP, for whichever door the kernel was entered by: schedule()
+     * parks the per-CPU slot into the outgoing thread, so an interrupt from
+     * ring 3 must fill it just as SYSCALL does. Conditional on the frame's
+     * CS: an interrupt taken inside the kernel has no user RSP in its frame. */
+    if (from_user) {
+        syscall_set_user_rsp(frame->rsp);
+    }
+
+    if (vec >= 48 && smp_is_ipi_vector(vec)) {
+        c->irq_depth++;
+        idt_dispatch_vector((uint8)vec);
+        lapic_eoi();
+        c->irq_depth--;
+        if (!from_user || !wants_kernel(c)) {
+            return;
+        }
+        bkl_acquire();
+        c->user_entries++;
+        kill_on_fatal_signal();
+        return_to_user(1);
+        bkl_exit_to_user();
+        return;
+    }
+
+    if (vec == 32) {
+        timer_advance();
+    }
+
+    if (from_user || c->bkl_depth == 0) {
+        bkl_acquire();
+        took = 1;
+        if (from_user) {
+            c->user_entries++;
+        }
+    }
+    if (vec >= 32) {
+        c->irq_depth++;
+    }
+    interrupt_dispatch_locked(frame);
+    if (vec >= 32) {
+        c->irq_depth--;
+    }
+    /* Deferred work (NT DPCs) queued by the handler, run now that the
+     * handler is done - but only from the OUTERMOST level: an interrupt
+     * nested in kernel code that holds the lock must not run work under the
+     * interrupted code's feet. took, or from ring 3, is exactly "outermost". */
+    if ((took || from_user) && c->irq_depth == 0) {
+        smp_run_deferred();
+    }
+
     /* The preemption point for user code.
      *
      * Without this, only a syscall could yield the CPU, so a compute-bound
@@ -304,5 +407,13 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
      * Only when returning to ring 3. An interrupt taken while the kernel was
      * already running has that kernel's frames live below this one, and
      * switching away would abandon them. */
-    return_to_user(frame_from_user(frame));
+    if (from_user) {
+        kill_on_fatal_signal();
+        return_to_user(1);
+        /* Possibly on another CPU now - schedule() may have moved this
+         * thread - so the release goes through the CPU it is on. */
+        bkl_exit_to_user();
+    } else if (took) {
+        bkl_release();
+    }
 }

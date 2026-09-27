@@ -1,3 +1,4 @@
+#include "bkl.h"
 #include "process.h"
 #include "sched.h"
 #include "signal.h"
@@ -187,7 +188,7 @@ int waitq_wait_until(wait_queue_t *q, int (*ready)(void *ctx), void *ctx,
          * entered with: SFMASK clears IF on every SYSCALL, so a wait for an
          * interrupt that did not turn them on waits forever. That is the
          * whole reason this is not simply a while loop. */
-        __asm__ volatile ("sti; hlt; cli");
+        bkl_wait_for_interrupt();
     }
     return WAITQ_READY;
 }

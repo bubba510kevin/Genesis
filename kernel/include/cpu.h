@@ -48,6 +48,7 @@ void cpu_report(uint8 color);
  *
  * Must run before entering ring 3. */
 void fpu_init(void);
+void fpu_init_ap(void);   /* CR0/CR4 on an AP; see cpu.c */
 
 /* --- per-thread FPU state ------------------------------------------------
  *

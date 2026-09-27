@@ -1,3 +1,5 @@
+#include "ksmp.h"
+#include "io.h"
 #include "gdt.h"
 #include "typesk.h"
 
@@ -147,7 +149,16 @@ void gdt_init_ap(int cpu) {
     /* Reload the segment registers so the CPU reads the new table now, at a
      * line you can find, rather than at the next interrupt. CS needs a far
      * transfer, and long mode has no ljmp to an absolute address - so push the
-     * selector and target and lretq into it. */
+     * selector and target and lretq into it.
+     *
+     * Loading a selector into GS or FS also loads its BASE from the
+     * descriptor - zero - so the per-CPU block pointer smp_early_init put in
+     * GS_BASE would be wiped, and the next smp_this_cpu() reads address 0x10.
+     * The three base MSRs are saved around the reload and put back. */
+    uint64 fs_base  = rdmsr(0xC0000100u);
+    uint64 gs_base  = rdmsr(0xC0000101u);
+    uint64 kgs_base = rdmsr(0xC0000102u);
+
     __asm__ volatile (
         "mov %0, %%ax\n\t"
         "mov %%ax, %%ds\n\t"
@@ -164,6 +175,10 @@ void gdt_init_ap(int cpu) {
     );
 
     __asm__ volatile ("ltr %w0" : : "r"((uint16)GDT_TSS) : "memory");
+
+    wrmsr(0xC0000100u, fs_base);
+    wrmsr(0xC0000101u, gs_base);
+    wrmsr(0xC0000102u, kgs_base);
 }
 
 /* Set the stack the CPU switches to on a ring 3 -> ring 0 transition. Call
@@ -173,16 +188,17 @@ void gdt_init(void) {
     gdt_init_ap(0);
 }
 
-/* BSP only, and that is a real restriction rather than an oversight: only
- * the BSP runs user processes in this pass, so only the BSP's TSS is ever
- * consulted for a ring transition. An AP never leaves smp_ap_entry's idle
- * loop. When a scheduler starts placing processes on APs (Part 13), this
- * has to become per-CPU - and it will need the current CPU's index, which
- * means reading it through GS rather than taking it as an argument, since
- * every existing caller is a context switch that does not know which CPU it
- * is on. */
+/* The EXECUTING CPU's TSS.rsp0 - the stack a ring 3 -> ring 0 transition
+ * through an IDT gate lands on. Per CPU because every CPU runs processes:
+ * each context switch points its own CPU's TSS at the incoming thread's
+ * kernel stack, and writing CPU 0's from an AP would land the AP's next
+ * interrupt from ring 3 on some other thread's stack. */
 void gdt_set_kernel_stack(uint64 rsp0) {
-    tss[0].rsp0 = rsp0;
+    int cpu = smp_cpu_index();
+
+    if (cpu >= 0 && cpu < GDT_MAX_CPUS) {
+        tss[cpu].rsp0 = rsp0;
+    }
 }
 
 /* Install an alternate stack for a given IST index (1-7). An IDT gate with a

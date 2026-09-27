@@ -1,4 +1,5 @@
 #include "ksleep.h"
+#include "ksmp.h"
 #include "kthread.h"
 #include "process.h"
 #include "sched.h"
@@ -39,7 +40,17 @@ static void intr_restore(uint64 flags) {
 }
 
 int ksleep_can_block(void) {
-    return kthread_running();
+    struct cpu_local *c = smp_this_cpu();
+    process_t *me = c->current;
+
+    if (me == NULL || me->is_idle || c->irq_depth > 0) {
+        return 0;
+    }
+    /* A kernel thread can always be switched away from. A process in a
+     * syscall can once its CPU has an idle thread to fall back to - before
+     * smp_start_scheduling a block with nothing else runnable would come
+     * straight back out of schedule() still marked blocked. */
+    return me->is_kthread || c->idle != NULL;
 }
 
 struct gen_ctx {

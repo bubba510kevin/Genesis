@@ -545,6 +545,10 @@ def qemu_args():
     #
     # The graphical window stays: keyboard input still comes from the emulated
     # PS/2 controller, so -display none would leave the shell unreachable.
+    # Four CPUs unless told otherwise: the kernel runs processes on every
+    # one, and a single-CPU boot would leave all of that untested. GENESIS_SMP=1
+    # is the uniprocessor configuration, which must keep working too.
+    args += ["-smp", os.environ.get("GENESIS_SMP", "4")]
     args += ["-serial", "stdio"]
     return args
 

@@ -94,6 +94,15 @@
  * netinet/in_pcb.c uses it to continue a hash-bucket scan after a lookup
  * that was interrupted. Same adaptation as every other CK_ macro in this
  * file - onto sys/queue.h - for the reason at the top. */
+/* Two more the TCP host cache walks its buckets with. */
+#ifndef CK_SLIST_REMOVE_AFTER
+#define CK_SLIST_REMOVE_AFTER(elm, field)   SLIST_REMOVE_AFTER(elm, field)
+#endif
+#ifndef CK_SLIST_FOREACH_SAFE
+#define CK_SLIST_FOREACH_SAFE(var, head, field, tvar) \
+	SLIST_FOREACH_SAFE(var, head, field, tvar)
+#endif
+
 #ifndef CK_LIST_FOREACH_FROM
 #define	CK_LIST_FOREACH_FROM(var, head, field)				\
 	for ((var) = ((var) ? (var) : CK_LIST_FIRST((head)));		\

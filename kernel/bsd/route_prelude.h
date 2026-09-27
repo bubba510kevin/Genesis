@@ -46,6 +46,7 @@
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/proc.h>
+#include <sys/ucred.h>
 #include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/sockio.h>

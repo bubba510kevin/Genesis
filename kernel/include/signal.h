@@ -85,6 +85,12 @@ struct process;
  * an interrupt handler - it only sets bits and marks the process ready. */
 void signal_send(struct process *p, int signo);
 
+/* Terminate `p` now if its lowest pending signal is fatal (SIGKILL, or a
+ * default-action-terminate signal with no handler). For the interrupt
+ * return path, which has no syscall frame to deliver a handler into.
+ * Returns 1 if it did. */
+int signal_kill_if_fatal(struct process *p);
+
 /* The same for every process in a process group. This is what Ctrl-C does. */
 void signal_send_group(int pgid, int signo);
 

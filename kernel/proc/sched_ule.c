@@ -33,10 +33,11 @@
  *
  * --- what is deliberately not here ---------------------------------------
  *
- * No per-CPU run queues, no load balancing, no CPU affinity, no ithread or
- * realtime bands. Those are the parts that need processes running on more
- * than one CPU, and nothing does yet. Adding inert versions would be code
- * with no consumer, which is what this whole pass exists to stop.
+ * No per-CPU run queues and no load balancer. Processes DO run on every CPU
+ * now (see ksmp.h), but they share one table-scan queue under the big
+ * kernel lock, so there is no per-CPU queue to balance: an idle CPU takes
+ * the best eligible thread directly, and sched_eligible() applies affinity.
+ * No ithread or realtime bands.
  */
 
 #define SCHED_INTERACT_MAX     100
@@ -51,7 +52,6 @@
 #define SCHED_SLICE_INTERACTIVE 2    /* 20ms - shorter, so it comes back  */
 #define SCHED_DECAY_TICKS       200  /* 2s between halvings               */
 
-static int quantum_left;
 static uint64 decay_at;
 static uint64 tick_count;
 
@@ -123,8 +123,8 @@ static void ule_decay(void) {
     }
 }
 
-static process_t *ule_pick_next(void) {
-    process_t *start = proc_current();
+static process_t *ule_pick_next(int cpu) {
+    process_t *start = smp_cpu(cpu)->current;
     process_t *best = NULL;
     int best_score = SCHED_INTERACT_MAX + 1;
     int i;
@@ -141,7 +141,7 @@ static process_t *ule_pick_next(void) {
         process_t *p = proc_at((proc_index(start) + i) % MAX_PROCESSES);
         int score;
 
-        if (p == NULL || (p->state != PROC_READY && p->state != PROC_RUNNING)) {
+        if (!sched_eligible(p, cpu)) {
             continue;
         }
         score = sched_ule_score(p);
@@ -152,9 +152,6 @@ static process_t *ule_pick_next(void) {
     }
 
     if (best == NULL) {
-        if (start != NULL && start->state == PROC_RUNNING) {
-            return start;
-        }
         return NULL;
     }
 
@@ -166,18 +163,21 @@ static process_t *ule_pick_next(void) {
     return best;
 }
 
-static int ule_tick(process_t *p) {
+/* Aging, once per global tick - on the BSP only, so N CPUs do not decay the
+ * counters N times as fast. */
+static void ule_decay_tick(void) {
     tick_count++;
-
     if (tick_count >= decay_at) {
         ule_decay();
         decay_at = tick_count + SCHED_DECAY_TICKS;
     }
+}
 
-    if (quantum_left > 0) {
-        quantum_left--;
+static int ule_tick(process_t *p, int *quantum) {
+    if (*quantum > 0) {
+        (*quantum)--;
     }
-    if (quantum_left != 0) {
+    if (*quantum != 0) {
         return 0;
     }
 
@@ -185,17 +185,16 @@ static int ule_tick(process_t *p) {
      * it - so an interactive process gets a short one and comes back to the
      * picker sooner, which is how a low score turns into more frequent
      * scheduling rather than just into being picked first once. */
-    quantum_left = sched_ule_is_interactive(p) ? SCHED_SLICE_INTERACTIVE
-                                               : SCHED_SLICE_TICKS;
+    *quantum = sched_ule_is_interactive(p) ? SCHED_SLICE_INTERACTIVE
+                                           : SCHED_SLICE_TICKS;
     return 1;
 }
 
 static const sched_policy_t ule_policy = {
-    "ULE", ule_enqueue, ule_dequeue, ule_pick_next, ule_tick
+    "ULE", ule_enqueue, ule_dequeue, ule_pick_next, ule_tick, ule_decay_tick
 };
 
 const sched_policy_t *sched_ule_policy(void) {
-    quantum_left = SCHED_SLICE_TICKS;
     decay_at     = SCHED_DECAY_TICKS;
     tick_count   = 0;
     return &ule_policy;

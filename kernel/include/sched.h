@@ -27,15 +27,49 @@ typedef struct sched_policy {
     /* A process stopped being runnable - blocked, exited, or was reaped. */
     void (*dequeue)(process_t *p);
 
-    /* Which process should run now? NULL means nothing is runnable, and the
-     * caller idles. Must not return a process in any state but READY or
-     * RUNNING. */
-    process_t *(*pick_next)(void);
+    /* Which process should CPU `cpu` run now? NULL means nothing is runnable
+     * there, and it runs its idle thread. Must return only a process for
+     * which sched_eligible(p, cpu) holds. */
+    process_t *(*pick_next)(int cpu);
 
-    /* One timer tick has elapsed for `p`. Returns non-zero if `p` has used
-     * its quantum and should be preempted. */
-    int (*tick)(process_t *p);
+    /* One timer tick has elapsed for `p` on a CPU whose remaining slice is
+     * *quantum. Returns non-zero if `p` has used its slice and should be
+     * preempted (and refills *quantum for whatever runs next). */
+    int (*tick)(process_t *p, int *quantum);
+
+    /* Once per global tick, for statistics that age (ULE's decay). May be
+     * NULL. */
+    void (*decay)(void);
 } sched_policy_t;
+
+/* Can CPU `cpu` run `p` now: READY and allowed by its affinity mask, or
+ * already RUNNING on that very CPU. Never a thread running elsewhere, never
+ * an idle thread. Every policy's pick_next filters through this. */
+int sched_eligible(const process_t *p, int cpu);
+
+/* The two halves of a timer tick: global (BSP, once per tick - sleepers,
+ * sleep accounting, decay) and local (every CPU's own timer - charge the
+ * current thread, run down its slice). sched_tick() is both, for the BSP. */
+void sched_tick_global(void);
+void sched_tick_local(void);
+
+/* A CPU's idle thread body; see sched.c. */
+void sched_idle_loop(void *arg);
+
+/* Make the CPU running `p` (if any) reschedule soon - after its affinity
+ * changed or it was killed. */
+void sched_poke(process_t *p);
+
+/* Restrict `p` to the CPUs in `mask` (intersected with those online).
+ * -EINVAL if that leaves none. Moves it off a CPU it may no longer use. */
+int sched_set_affinity(process_t *p, uint64 mask);
+
+/* After narrowing the CURRENT thread's affinity: move it off this CPU if it
+ * may no longer run here. Returns on an allowed CPU. */
+void sched_migrate_self(void);
+
+/* Non-zero if CPU `cpu` is running its idle thread. */
+int sched_cpu_is_idle(int cpu);
 
 /* Install round-robin and make `first` the running process. */
 void sched_init(process_t *first);

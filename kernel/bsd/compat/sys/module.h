@@ -33,13 +33,18 @@ typedef struct moduledata {
     void           *priv;
 } moduledata_t;
 
-/* Accepted and NOT wired up. Upstream puts the moduledata into a linker set
- * that the module loader walks; Genesis's loader looks in .genesis_modinit
- * for a function pointer instead. A driver declaring one of these compiles
- * and its event handler is never called - which matters for MOD_UNLOAD, and
- * does not for MOD_LOAD, since DRIVER_MODULE's generated init covers that. */
+/* DECLARE_MODULE delivers MOD_LOAD at boot, at the SYSINIT position the
+ * module asked for - which is what upstream's module_register_init does for a
+ * module linked into the kernel. The network stack depends on it: NewReno
+ * registers itself as TCP's congestion control this way, and IGMP sets up its
+ * lock and timers.
+ *
+ * MOD_UNLOAD is still not delivered - nothing linked into this kernel is
+ * ever unloaded. (kldload'ed drivers use .genesis_modinit, not this.) */
+#include <sys/kernel.h>
+void genesis_module_load(const void *moddata);   /* kernel/bsd/sysinit.c */
 #define DECLARE_MODULE(name, data, sub, order)  \
-    static const moduledata_t *const __unused_##name##_moddata = &(data)
+    SYSINIT(name##_module, sub, order, genesis_module_load, &(data))
 #define MODULE_VERSION(module, version)
 #define MODULE_DEPEND(module, mdepend, vmin, vpref, vmax)
 

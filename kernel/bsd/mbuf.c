@@ -272,6 +272,57 @@ _mb_unmapped_to_ext(struct mbuf *m, struct mbuf **mres) {
 #include "vendor/uipc_mbuf.inc"
 #include "vendor/uipc_mbuf2.inc"
 
+/* Three small functions from the parts of uipc_mbuf.c and kern_mbuf.c that
+ * were not extracted, copied verbatim: TCP calls them. max_hdr is the room a
+ * packet header mbuf leaves for link + protocol headers; a protocol that
+ * registers a bigger header (TCP with options) grows it. */
+static void
+max_hdr_grow(void)
+{
+
+	max_hdr = max_linkhdr + max_protohdr;
+	MPASS(max_hdr <= MHLEN);
+}
+
+void
+max_linkhdr_grow(u_int new)
+{
+
+	if (new > max_linkhdr) {
+		max_linkhdr = new;
+		max_hdr_grow();
+	}
+}
+
+void
+max_protohdr_grow(u_int new)
+{
+
+	if (new > max_protohdr) {
+		max_protohdr = new;
+		max_hdr_grow();
+	}
+}
+
+/* Free the first `count` not-yet-ready mbufs of a chain - the undo for a
+ * send that queued data still being filled in (sendfile's M_NOTREADY). An
+ * EXTPG mbuf counts once per page. */
+void
+mb_free_notready(struct mbuf *m, int count)
+{
+	int i;
+
+	for (i = 0; i < count && m != NULL; i++) {
+		if ((m->m_flags & M_EXTPG) != 0) {
+			m->m_epg_nrdy--;
+			if (m->m_epg_nrdy != 0)
+				continue;
+		}
+		m = m_free(m);
+	}
+	KASSERT(i == count, ("Removed only %d items from %p", i, m));
+}
+
 /* ------------------------------------------------------------------------
  * Genesis entry points.
  */

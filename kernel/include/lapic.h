@@ -89,6 +89,14 @@ int lapic_send_sipi(uint32 apic_id, uint8 page);
  * with, for this CPU. See pci_msi_alloc in pci.h. */
 uint64 lapic_msi_address(void);
 
+/* The LAPIC timer. calibrate counts timer units (divide-by-16) across
+ * `pit_ticks` ticks of ticks_now and returns units per tick - or 0 if there
+ * is no LAPIC. periodic arms it on THIS CPU to fire `vector` every `count`
+ * units; stop masks it. */
+uint32 lapic_timer_calibrate(uint64 (*ticks_now)(void), uint32 pit_ticks);
+void   lapic_timer_periodic(uint8 vector, uint32 count);
+void   lapic_timer_stop(void);
+
 /* One line for the boot log, the same posture as pci_report/e820_report. */
 void lapic_report(uint8 color);
 

@@ -489,36 +489,6 @@ int pfil_mbuf_fwd(pfil_head_t head, struct mbuf **mp, struct ifnet *ifp,
     return (PFIL_PASS);
 }
 
-/* ========================================================================
- * TCP
- * ------------------------------------------------------------------------
- * netinet/in_proto.c's protocol switch table names tcp_protosw, so the symbol
- * must exist for the inet domain to link. TCP ITSELF IS NOT VENDORED.
- *
- * This is the one absence in this file that is a missing FEATURE rather than
- * a missing Genesis subsystem, so it deserves the plainest statement: this
- * machine speaks IPv4, ICMP, ARP and UDP. It does not speak TCP.
- *
- * What it would take is bounded and known: netinet/tcp_{input,output,subr,
- * usrreq,timer,reass,sack,timewait}.c plus the congestion-control modules,
- * the syncache and the host cache. Every dependency they have below them -
- * in_pcb, the socket layer, the routing table, sleep, sysctl - is now here,
- * which is why this is a next step rather than a rewrite.
- *
- * pr_attach returning EPROTONOSUPPORT is what socreate() turns into the error
- * a caller sees for socket(AF_INET, SOCK_STREAM, 0). That is the correct
- * answer for a kernel without TCP, and it is what a caller can distinguish
- * from a bug.
- * ==================================================================== */
-
-static int tcp_attach_notsup(struct socket *so, int proto, struct thread *td) {
-    (void)so; (void)proto; (void)td;
-    return (EPROTONOSUPPORT);
-}
-
-struct protosw tcp_protosw = {
-    .pr_type =      SOCK_STREAM,
-    .pr_protocol =  IPPROTO_TCP,
-    .pr_flags =     PR_CONNREQUIRED | PR_WANTRCVD | PR_CAPATTACH,
-    .pr_attach =    tcp_attach_notsup,
-};
+/* TCP used to be an absence here - a tcp_protosw whose attach returned
+ * EPROTONOSUPPORT, because in_proto.c's table names it. It is vendored now
+ * (kernel/bsd/tcp_*.c, cc*.c), and tcp_usrreq.c defines the real one. */

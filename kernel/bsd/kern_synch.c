@@ -38,6 +38,7 @@
 
 #define _KERNEL 1
 
+#include "bkl.h"
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -208,7 +209,7 @@ static int gsleep(const void *chan, void *lock, int locktype, int timo) {
              * delivered AFTER the hlt begins, which is what stops the wakeup
              * from arriving in the window between the two and leaving this
              * halted forever. */
-            __asm__ volatile ("sti; hlt");
+            bkl_wait_for_interrupt();
         }
     }
 

@@ -114,6 +114,15 @@ static __inline void le32enc(void *p, uint32 v) {
     b[0] = (unsigned char)v;         b[1] = (unsigned char)(v >> 8);
     b[2] = (unsigned char)(v >> 16); b[3] = (unsigned char)(v >> 24);
 }
+static __inline uint64 le64dec(const void *p) {
+    const unsigned char *b = (const unsigned char *)p;
+    return ((uint64)le32dec(b + 4) << 32) | le32dec(b);
+}
+static __inline void le64enc(void *p, uint64 v) {
+    unsigned char *b = (unsigned char *)p;
+    le32enc(b, (uint32)v);
+    le32enc(b + 4, (uint32)(v >> 32));
+}
 
 /* The double-underscore spellings. netinet/in.h's inline ntohl/htonl are
  * written in terms of these, because on some architectures they are compiler

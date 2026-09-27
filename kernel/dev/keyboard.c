@@ -231,6 +231,12 @@ void kbd_scancode(uint8 code) {
  * make/break code.
  */
 void kbd_inject(char c) {
+    /* Ctrl-T: the task dump, consumed here rather than delivered - see
+     * proc_dump. Nothing reading the console expects the byte. */
+    if (c == 0x14) {
+        proc_dump();
+        return;
+    }
     ring_push(c);
     /* Woken here rather than left to the caller, because forgetting it is a
      * character that sits in the ring until the next unrelated keystroke -

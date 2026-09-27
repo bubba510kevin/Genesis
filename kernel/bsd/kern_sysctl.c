@@ -940,6 +940,34 @@ int sbuf_finish(struct sbuf *s) {
     return (error);
 }
 
+/* Push what is buffered so far out to the sysctl request and start the
+ * buffer again, so a handler producing more than one buffer's worth (the
+ * TCP host cache's list) can keep going. Without a request there is
+ * nowhere to drain to, which is the same as upstream's -EDOOFUS-free
+ * answer for an sbuf with no drain function: nothing to do. The trailing
+ * NUL is sbuf_finish's job, so it is not sent here. */
+int sbuf_drain(struct sbuf *s) {
+    int error;
+
+    if (s == NULL) {
+        return (EINVAL);
+    }
+    if (s->s_error != 0) {
+        return (s->s_error);
+    }
+    if (s->s_req == NULL || s->s_len == 0) {
+        return (0);
+    }
+    error = SYSCTL_OUT(s->s_req, s->s_buf, (size_t)s->s_len);
+    if (error != 0) {
+        s->s_error = error;
+        return (error);
+    }
+    s->s_len = 0;
+    s->s_buf[0] = '\0';
+    return (0);
+}
+
 /* --- report --------------------------------------------------------------
  *
  * Prints one named OID per line. Not a tree walk: a walk of a tree with a few

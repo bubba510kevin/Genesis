@@ -94,8 +94,91 @@ int netisr_dispatch(u_int proto, struct mbuf *m) {
     return 0;
 }
 
+/* netisr_queue is the DEFERRED half, and unlike dispatch it cannot be inline.
+ *
+ * Its caller is if_simloop / looutput: the loopback interface handing a
+ * packet this machine sent to itself back to its own input. That call is made
+ * from deep inside the SEND path - tcp_output holding the pcb's write lock -
+ * and running ip_input -> tcp_input inline from there would try to take the
+ * same pcb lock again (a connection to 127.0.0.1 has both ends on this
+ * machine) and deadlock. Upstream's queue exists for exactly this, and so this
+ * one is a real queue: packets are chained on m_nextpkt under a spin lock and
+ * a task on taskqueue_thread drains them, one handler call per packet, with no
+ * send-path lock held.
+ *
+ * Bounded like upstream's (net.isr.defaultqlimit is 256): past the limit the
+ * packet is dropped and counted, which is what a full input queue does. */
+#define NETISR_QLIMIT 256
+
+static struct mtx     netisr_qlock;
+static struct mbuf   *netisr_qhead, *netisr_qtail;
+static int            netisr_qlen;
+static u_int64_t      netisr_qdrops;
+static struct task    netisr_task;
+static int            netisr_qready;
+
+static void netisr_drain(void *arg, int pending) {
+    struct mbuf *m;
+    u_int proto;
+
+    (void)arg; (void)pending;
+    for (;;) {
+        mtx_lock_spin(&netisr_qlock);
+        m = netisr_qhead;
+        if (m != NULL) {
+            netisr_qhead = m->m_nextpkt;
+            if (netisr_qhead == NULL) {
+                netisr_qtail = NULL;
+            }
+            netisr_qlen--;
+        }
+        mtx_unlock_spin(&netisr_qlock);
+        if (m == NULL) {
+            return;
+        }
+        /* The protocol rode in PH_loc, the packet header's protocol-local
+         * scratch, set at enqueue. */
+        proto = (u_int)m->m_pkthdr.PH_loc.eight[0];
+        m->m_nextpkt = NULL;
+        netisr_dispatch(proto, m);
+    }
+}
+
+static void netisr_queue_init(void) {
+    mtx_init(&netisr_qlock, "netisr queue", NULL, MTX_SPIN);
+    TASK_INIT(&netisr_task, 0, netisr_drain, NULL);
+    netisr_qready = 1;
+}
+
 int netisr_queue(u_int proto, struct mbuf *m) {
-    return netisr_dispatch(proto, m);
+    if (!netisr_qready) {
+        netisr_queue_init();
+    }
+    m->m_pkthdr.PH_loc.eight[0] = (uint8_t)proto;
+    m->m_nextpkt = NULL;
+    mtx_lock_spin(&netisr_qlock);
+    if (netisr_qlen >= NETISR_QLIMIT) {
+        netisr_qdrops++;
+        mtx_unlock_spin(&netisr_qlock);
+        m_freem(m);
+        return (ENOBUFS);
+    }
+    if (netisr_qtail != NULL) {
+        netisr_qtail->m_nextpkt = m;
+    } else {
+        netisr_qhead = m;
+    }
+    netisr_qtail = m;
+    netisr_qlen++;
+    mtx_unlock_spin(&netisr_qlock);
+    taskqueue_enqueue(taskqueue_thread, &netisr_task);
+    return (0);
+}
+
+/* Packets currently waiting in the deferred queue - the loopback selftest
+ * reads it to prove the queue is really deferred. */
+int genesis_netisr_qlen(void) {
+    return netisr_qlen;
 }
 
 /* Withdraw a registration. netinet/igmp.c does this on unload; nothing here
@@ -193,15 +276,8 @@ pfil_head_t pfil_head_register(struct pfil_head_args *pa) {
  * WHOLE now and upstream defines them there, which is where they belong.
  * They were here only while this file stood in for that one. */
 
-/* if_simloop - loop a packet back to the sending interface, for a broadcast
- * or multicast the machine also has to receive. Genesis has no loopback
- * interface, so this frees the copy rather than delivering it. Real
- * consequence: the machine does not see its own broadcasts. */
-int if_simloop(struct ifnet *ifp, struct mbuf *m, int af, int hlen) {
-    (void)ifp; (void)af; (void)hlen;
-    m_freem(m);
-    return 0;
-}
+/* if_simloop moved: net/if_loop.c is vendored now and upstream defines it
+ * there, delivering the copy through netisr_queue above. */
 
 /* devctl - the userland device-event notification socket. Nothing listens. */
 void devctl_notify(const char *system, const char *subsystem,
@@ -309,6 +385,10 @@ int asprintf(char **ret, struct malloc_type *type, const char *fmt, ...) {
 struct proc   genesis_proc0;
 struct thread genesis_threads[SMP_MAX_CPUS];
 
+/* Upstream's first thread, named by the TCP syncache (it connects new
+ * pcbs with thread0.td_ucred). Same process, same one credential. */
+struct thread thread0;
+
 /* Point every thread at the one process and the one credential. Called from
  * flk.c before anything that can reach curthread->td_ucred - which is the
  * socket layer, and netinet/in.c's privilege checks. */
@@ -319,6 +399,9 @@ void genesis_threads_init(void) {
     int i;
 
     genesis_limits_init();
+    thread0.td_proc  = &genesis_proc0;
+    thread0.td_ucred = &genesis_ucred0;
+    thread0.td_limit = genesis_limit();
     for (i = 0; i < SMP_MAX_CPUS; i++) {
         genesis_threads[i].td_proc = &genesis_proc0;
         genesis_threads[i].td_ucred = &genesis_ucred0;
@@ -334,15 +417,76 @@ void genesis_threads_init(void) {
 /* --- interface cloning ---------------------------------------------------
  *
  * net/if_clone.c is NOT vendored, and the reason is recorded in
- * kernel/bsd/radix.c: it drags in netlink. These three are what net/if.c's
- * ioctl path calls, and "no cloners are registered" is a true statement about
- * this machine rather than a placeholder.
+ * kernel/bsd/radix.c: it drags in netlink. What is here instead is the part
+ * of its KPI a vendored driver calls - ifc_attach_cloner to register a
+ * cloner, ifc_create_ifp to make an instance, ifc_detach_cloner - over a
+ * small fixed table. net/if_loop.c is the one user: it registers "lo" and
+ * creates lo0 at boot, which is how this machine has 127.0.0.1.
  *
- * The consequence, named rather than hidden: there is no lo0. Nothing can
- * create a pseudo-interface, so 127.0.0.1 is not reachable and a packet this
- * machine sends to its own address is not looped back. Every address this
- * kernel has belongs to a real NIC.
+ * Not here: creating clones from userland (SIOCIFCREATE, "ifconfig lo1
+ * create"), which is the netlink half. if_clone_create answers EINVAL.
  */
+#define GENESIS_MAX_CLONERS 4
+
+struct if_clone {
+    char             ifc_name[IFNAMSIZ];
+    ifc_create_f    *ifc_create;
+    ifc_destroy_f   *ifc_destroy;
+    uint32_t         ifc_flags;
+    int              ifc_nextunit;
+    int              ifc_inuse;
+};
+static struct if_clone genesis_cloners[GENESIS_MAX_CLONERS];
+
+struct if_clone *ifc_attach_cloner(const char *name, struct if_clone_addreq *req) {
+    int i;
+
+    for (i = 0; i < GENESIS_MAX_CLONERS; i++) {
+        struct if_clone *ifc = &genesis_cloners[i];
+        if (!ifc->ifc_inuse) {
+            strlcpy(ifc->ifc_name, name, sizeof(ifc->ifc_name));
+            ifc->ifc_create   = req->create_f;
+            ifc->ifc_destroy  = req->destroy_f;
+            ifc->ifc_flags    = req->flags;
+            ifc->ifc_nextunit = 0;
+            ifc->ifc_inuse    = 1;
+            return (ifc);
+        }
+    }
+    kprintf_c(0x0C, "if_clone: no room for cloner %s\n", name);
+    return (NULL);
+}
+
+void ifc_detach_cloner(struct if_clone *ifc) {
+    if (ifc != NULL) {
+        ifc->ifc_inuse = 0;
+    }
+}
+
+int ifc_create_ifp(const char *name, struct ifc_data *ifd, struct ifnet **ifpp) {
+    char ifname[IFNAMSIZ];
+    int i, error;
+
+    for (i = 0; i < GENESIS_MAX_CLONERS; i++) {
+        struct if_clone *ifc = &genesis_cloners[i];
+        if (ifc->ifc_inuse && strcmp(ifc->ifc_name, name) == 0) {
+            struct ifnet *ifp = NULL;
+            ifd->unit = (ifc->ifc_flags & IFC_F_AUTOUNIT) != 0 &&
+                        ifd->unit == 0 ? (uint32_t)ifc->ifc_nextunit : ifd->unit;
+            snprintf(ifname, sizeof(ifname), "%s%u", name, ifd->unit);
+            error = ifc->ifc_create(ifc, ifname, sizeof(ifname), ifd, &ifp);
+            if (error == 0) {
+                ifc->ifc_nextunit = (int)ifd->unit + 1;
+                if (ifpp != NULL) {
+                    *ifpp = ifp;
+                }
+            }
+            return (error);
+        }
+    }
+    return (ENXIO);
+}
+
 int if_clone_create(char *name, size_t len, caddr_t params) {
     (void)name; (void)len; (void)params;
     return (EINVAL);
@@ -465,21 +609,8 @@ size_t strnlen(const char *s, size_t maxlen) {
     return (n);
 }
 
-/* --- the loopback interface ---------------------------------------------
- *
- * `loif` is upstream's pointer to lo0, and it is NULL here.
- *
- * That is a consequence of if_clone not being vendored (see above and
- * kernel/bsd/radix.c): net/if_loop.c creates lo0 through the cloner, so with
- * no cloner there is no lo0. netinet/in.c tests loif before using it -
- * in_ifinit() adds a loopback route for each address only when one exists -
- * so a NULL here is a supported configuration and not a crash waiting.
- *
- * What it costs, plainly: 127.0.0.1 is not an address of this machine, and a
- * packet sent to one of this machine's OWN addresses goes out of the NIC
- * rather than being looped back internally.
- */
-struct ifnet *loif;
+/* `loif`, upstream's pointer to lo0, is defined by the vendored
+ * net/if_loop.c now, which creates lo0 through the cloner above. */
 
 /* rt_newmaddrmsg tells a routing-socket listener that a multicast address was
  * added to or removed from an interface. net/rtsock.c is not vendored (it is

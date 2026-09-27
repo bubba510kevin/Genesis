@@ -117,7 +117,7 @@ uint64 net_stat_icmp_echoes(void) {
  * for its privilege check and accepts NULL as "kernel", which is what this
  * is.
  */
-static int configure_address(struct ifnet *ifp) {
+static int configure_address(struct ifnet *ifp, uint32_t addr, uint32_t mask) {
     struct in_aliasreq ifra;
     struct sockaddr_in *sin;
 
@@ -127,17 +127,21 @@ static int configure_address(struct ifnet *ifp) {
     sin = &ifra.ifra_addr;
     sin->sin_len = sizeof(*sin);
     sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = MY_IP;
+    sin->sin_addr.s_addr = addr;
 
     sin = (struct sockaddr_in *)&ifra.ifra_mask;
     sin->sin_len = sizeof(*sin);
     sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = MY_MASK;
+    sin->sin_addr.s_addr = mask;
 
-    sin = &ifra.ifra_broadaddr;
-    sin->sin_len = sizeof(*sin);
-    sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = (MY_IP & MY_MASK) | ~MY_MASK;
+    /* A broadcast address only on an interface that has broadcast; lo0 is
+     * point-to-self and gets none, as `ifconfig lo0 127.0.0.1/8` gives it. */
+    if ((ifp->if_flags & IFF_BROADCAST) != 0) {
+        sin = &ifra.ifra_broadaddr;
+        sin->sin_len = sizeof(*sin);
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = (addr & mask) | ~mask;
+    }
 
     return (in_control(NULL, SIOCAIFADDR, (caddr_t)&ifra, ifp, NULL));
 }
@@ -229,14 +233,39 @@ int net_ping(uint32 dst_be) {
     return (ip_output(m, NULL, NULL, 0, NULL, NULL));
 }
 
+/* lo0: `ifconfig lo0 inet 127.0.0.1/8 up`, as rc.d/netif does before any
+ * other interface. net/if_loop.c created lo0 at SYSINIT time; this gives it
+ * its address, which also installs the 127/8 interface route every
+ * connection to 127.0.0.1 is looked up through. */
+static void configure_loopback(void) {
+    int error;
+
+    if (V_loif == NULL) {
+        kprintf_c(0x0E, "net: no lo0 - 127.0.0.1 is not reachable\n");
+        return;
+    }
+    V_loif->if_flags |= IFF_UP;
+    V_loif->if_drv_flags |= IFF_DRV_RUNNING;
+    error = configure_address(V_loif, htonl(INADDR_LOOPBACK),
+                              htonl(0xff000000U));
+    if (error != 0) {
+        kprintf_c(0x0C, "net: SIOCAIFADDR on lo0 failed, error %d\n", error);
+        return;
+    }
+    kprintf_c(0x0A, "net: lo0 is 127.0.0.1/8\n");
+}
+
 void net_stack_init(void) {
     struct ifnet *ifp;
     int error;
 
-    /* The interface everything else is configured on. One NIC, so the first
-     * named one on the list is it. */
+    configure_loopback();
+
+    /* The interface everything else is configured on: the first real NIC -
+     * lo0 is on the same list and is skipped. */
     CK_STAILQ_FOREACH(ifp, &V_ifnet_list, if_link) {
-        if (ifp->if_xname[0] != '\0') {
+        if (ifp->if_xname[0] != '\0' &&
+            (ifp->if_flags & IFF_LOOPBACK) == 0) {
             net_ifp = ifp;
             break;
         }
@@ -265,7 +294,7 @@ void net_stack_init(void) {
         net_ifp->if_init(net_ifp->if_softc);
     }
 
-    error = configure_address(net_ifp);
+    error = configure_address(net_ifp, MY_IP, MY_MASK);
     if (error != 0) {
         kprintf_c(0x0C, "net: SIOCAIFADDR on %s failed, error %d\n",
                   net_ifp->if_xname, error);

@@ -48,7 +48,10 @@ def wait_for(path, pattern, timeout, since=0):
             with open(path, "r", errors="replace") as f:
                 f.seek(since)
                 chunk = f.read()
-        except FileNotFoundError:
+        except OSError:
+            # FileNotFoundError before QEMU creates it, and on WSL an
+            # occasional ENODATA when something on the Windows side reads the
+            # log at the same moment. Both mean "try again".
             chunk = ""
         if rx.search(chunk):
             return since + len(chunk)

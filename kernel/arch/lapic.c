@@ -306,3 +306,65 @@ void lapic_report(uint8 color) {
               lapic_id(), version_reg & 0xFF,
               (version_reg >> 16) & 0xFF, (uint64)(uintptr)lapic_base);
 }
+
+/* --- the LAPIC timer ------------------------------------------------------
+ *
+ * Every CPU has one, and it is what lets an AP preempt a user process: the
+ * PIT is wired to the BSP alone, so without this an AP running a thread that
+ * never enters the kernel would keep it forever.
+ *
+ * Its rate is the bus clock divided by the divide-configuration value, which
+ * is not architecturally known - so it is CALIBRATED once, against the PIT's
+ * tick, and every CPU is then programmed with the same count. (All CPUs in a
+ * package share the bus clock; a machine where they did not would be broken
+ * in ways far worse than this.) */
+#define LAPIC_LVT_TIMER    0x320
+#define LAPIC_TIMER_INIT   0x380
+#define LAPIC_TIMER_CUR    0x390
+#define LAPIC_TIMER_DIV    0x3E0
+#define LVT_MASKED         (1u << 16)
+#define LVT_TIMER_PERIODIC (1u << 17)
+#define TIMER_DIV_16       0x3
+
+uint32 lapic_timer_calibrate(uint64 (*ticks_now)(void), uint32 pit_ticks) {
+    uint64 t0;
+    uint32 elapsed;
+
+    if (!available || ticks_now == 0 || pit_ticks == 0) {
+        return 0;
+    }
+    lapic_write(LAPIC_TIMER_DIV, TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+
+    /* Line up on a tick edge first, so the window is whole ticks and not a
+     * partial one at the front. */
+    t0 = ticks_now();
+    while (ticks_now() == t0) {
+        __asm__ volatile ("pause");
+    }
+    lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFFu);
+    t0 = ticks_now();
+    while (ticks_now() - t0 < pit_ticks) {
+        __asm__ volatile ("pause");
+    }
+    elapsed = 0xFFFFFFFFu - lapic_read(LAPIC_TIMER_CUR);
+    lapic_write(LAPIC_TIMER_INIT, 0);
+    return elapsed / pit_ticks;
+}
+
+void lapic_timer_periodic(uint8 vector, uint32 count) {
+    if (!available || count == 0) {
+        return;
+    }
+    lapic_write(LAPIC_TIMER_DIV, TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, (uint32)vector | LVT_TIMER_PERIODIC);
+    lapic_write(LAPIC_TIMER_INIT, count);
+}
+
+void lapic_timer_stop(void) {
+    if (!available) {
+        return;
+    }
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+    lapic_write(LAPIC_TIMER_INIT, 0);
+}

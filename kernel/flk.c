@@ -452,6 +452,11 @@ void flk(void) {
 
     /* Before anything that can fault: the boot trampoline's GDT has no TSS,
      * and the double fault gate needs an IST stack to be worth having. */
+    /* Before the GDT, and before anything else that asks which CPU it is on:
+     * puts CPU 0's per-CPU block behind GS and takes the big kernel lock,
+     * which the boot path then holds until the first return to ring 3. */
+    smp_early_init();
+
     gdt_init();
     gdt_set_kernel_stack((uint64)&kernel_stack_top);
     gdt_set_ist(1, (uint64)&ist1_stack_top);
@@ -961,6 +966,12 @@ void flk(void) {
 
 
     __asm__ volatile ("sti");
+
+    /* Every CPU gets an idle thread, the LAPIC timer is calibrated against
+     * the PIT (which needs interrupts on), and the APs join the scheduler.
+     * First thing after sti: from here a blocking call really blocks, which
+     * the selftests below depend on. */
+    smp_start_scheduling();
     print_string("Interrupts enabled\n", 0x0F);
 
     /* After sti, and it has to be: the callout selftest waits on real timer
@@ -1008,6 +1019,9 @@ void flk(void) {
      * IPIs to be delivered and answered, which cannot happen with
      * interrupts masked on the sender. */
     smp_selftest();
+    /* The NT driver model's multiprocessor calls, on the CPUs that are
+     * actually running - after smp_selftest has shown the IPIs work. */
+    wdm_smp_selftest();
     lock_selftest();
     lock_report(0x0F);
     sched_ule_selftest();

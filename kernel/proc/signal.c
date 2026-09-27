@@ -45,6 +45,12 @@ void signal_send(struct process *p, int signo) {
      * there is no user context to rewrite from one. */
     if (p->state == PROC_BLOCKED) {
         sched_wake(p);
+    } else if (p->state == PROC_RUNNING && p->oncpu) {
+        /* Running in ring 3 on another CPU: it would not look at its pending
+         * set until its next system call. Make that CPU enter the kernel
+         * now, so a fatal signal lands (interrupt_dispatch acts on those)
+         * without waiting for the target to cooperate. */
+        sched_poke(p);
     }
 }
 
@@ -102,6 +108,30 @@ static int lowest_pending(struct process *p) {
         if (deliverable & sigmask_of(i)) {
             return i;
         }
+    }
+    return 0;
+}
+
+static void terminate(struct process *p, int signo);
+
+/* Act on a pending signal whose effect is to terminate - SIGKILL, or one
+ * left at its default action where that action is to terminate - without a
+ * syscall frame. The interrupt return path calls this for a thread it is
+ * about to resume in ring 3, which is how a signal reaches a thread that
+ * never makes a system call. Anything with a handler is left pending for
+ * signal_deliver at the next syscall boundary. Returns 1 if it killed. */
+int signal_kill_if_fatal(struct process *p) {
+    int signo = lowest_pending(p);
+
+    if (signo == 0) {
+        return 0;
+    }
+    if (signo == SIGKILL ||
+        (p->sig_handlers[signo].handler == SIG_DFL_HANDLER &&
+         default_action(signo) == DFL_TERM)) {
+        p->sig_pending &= ~sigmask_of(signo);
+        terminate(p, signo);
+        return 1;
     }
     return 0;
 }

@@ -23,6 +23,12 @@ void timer_init(uint32 hz);
 /* Ticks since boot. Wraps after ~5.8 billion years at 100Hz. */
 uint64 timer_ticks_now(void);
 
+/* The timer interrupt's two halves: timer_advance is ticks++ alone, run
+ * before the big kernel lock so the clock never waits for another CPU;
+ * timer_tick is everything else a tick drives (callouts, serial poll). */
+void timer_advance(void);
+void timer_tick(void);
+
 /* Milliseconds since boot, derived rather than counted separately so the two
  * can never disagree. */
 uint64 timer_ms(void);
@@ -38,6 +44,14 @@ uint32 timer_hz(void);
  * (clock_gettime, nanosleep) are defined in. A finer clock means the TSC,
  * which means calibrating it against something, and that is its own change. */
 uint64 timer_ns(void);
+
+/* The TSC, as a high-resolution counter. timer_calibrate_tsc measures its
+ * rate against `pit_ticks` PIT ticks (interrupts must be on); timer_tsc_hz is
+ * that rate, or 0 before calibration; timer_tsc is the raw count. What
+ * QueryPerformanceCounter and KeQueryPerformanceCounter are built on. */
+void   timer_calibrate_tsc(uint32 pit_ticks);
+uint64 timer_tsc_hz(void);
+uint64 timer_tsc(void);
 
 /* --- wall clock ----------------------------------------------------------
  * The tick counts elapsed time and knows nothing about dates. Boot reads the

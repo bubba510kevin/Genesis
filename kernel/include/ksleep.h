@@ -31,8 +31,12 @@
  * #defines itself to this so the two cannot drift. */
 #define KSLEEP_SLOTS 64
 
-/* Non-zero if the caller is on something that can be descheduled - which
- * today means a kernel thread and nothing else.
+/* Non-zero if the caller is on something that can be descheduled: a kernel
+ * thread, or a process inside a system call - anything but an interrupt
+ * handler and a CPU's idle thread. It used to be kernel threads only, which
+ * made a system call that slept in BSD code (a blocking TCP connect) halt
+ * its CPU in place instead of yielding - and the thread that would have
+ * completed the connect never got to run.
  *
  * This is the question that decides whether a sleep blocks or idles, and it
  * has to be asked at the sleep rather than answered once at boot: the same

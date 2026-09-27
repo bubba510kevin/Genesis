@@ -22,6 +22,44 @@ void smp_tlb_shootdown(uint64 addr) {
     (void)addr;
 }
 
+/* The per-CPU block, for a harness that is one CPU: paging.c keeps "the
+ * space loaded here" in it, so there has to be exactly one, and it is this.
+ * Nothing else is simulated - no other CPU exists to shoot down or to ask. */
+#include "ksmp.h"
+
+static struct cpu_local host_cpu = { .self = &host_cpu, .online = 1 };
+
+struct cpu_local *smp_this_cpu(void) {
+    return &host_cpu;
+}
+
+struct cpu_local *smp_cpu(int index) {
+    return index == 0 ? &host_cpu : 0;
+}
+
+int smp_cpu_count(void) {
+    return 1;
+}
+
+int smp_cpu_index(void) {
+    return 0;
+}
+
+void smp_tlb_shootdown_space(struct address_space *as, uint64 addr) {
+    (void)as; (void)addr;
+}
+
+/* --- bkl.h --------------------------------------------------------------
+ * waitq.c halts through this with the lock released. The harness has no
+ * lock and no interrupts; run.sh already strips the loop's own asm for the
+ * same reason, and returning is the stripped loop's behaviour. */
+void bkl_wait_for_interrupt(void) {
+}
+
+/* --- process.h: the Ctrl-T dump keyboard.c calls. No tasks here. */
+void proc_dump(void) {
+}
+
 /* --- vmalloc.h ----------------------------------------------------------
  * The kernel VA allocator. Answering 0 is not a failure to implement it: 0 is
  * "the region is exhausted", which is exactly the answer both callers here

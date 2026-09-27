@@ -30,18 +30,19 @@
 #include "paging.h"
 #include "pmm.h"
 #include "ksmp.h"
+#include "bkl.h"
+#include "kprintf.h"
 #include "screen.h"
 #include "typesk.h"
 
-/* The per-CPU block moved to smp.h when a second CPU became possible - it is
- * one structure with one set of offsets, and having syscall.c define its own
- * would mean two structures at the same GS base disagreeing about what is at
- * gs:0x10. The offsets are still load-bearing: the assembly below hardcodes
- * gs:0 and gs:8.
+/* The per-CPU block lives in ksmp.h - one structure with one set of offsets.
+ * The offsets are load-bearing: the assembly below hardcodes gs:0 and gs:8.
  *
- * cpu0 is now smp.c's array entry 0 rather than a local static, so the BSP's
- * block is the same object smp_report and smp_this_cpu see. */
-#define cpu0 (*smp_cpu(0))
+ * Every accessor here is for the EXECUTING CPU. Each CPU runs its own
+ * thread, so "the kernel stack the SYSCALL stub switches to" and "where the
+ * user's RSP is parked" are that CPU's, and a context switch on one CPU must
+ * not touch another's. */
+#define thiscpu (*smp_this_cpu())
 
 extern void syscall_entry(void);
 
@@ -50,7 +51,7 @@ extern void syscall_entry(void);
  * So a context switch has to update BOTH this and gdt_set_kernel_stack, or
  * half the entry paths land on the outgoing thread's stack. */
 void syscall_set_kernel_stack(uint64 rsp) {
-    cpu0.kernel_rsp = rsp;
+    thiscpu.kernel_rsp = rsp;
 }
 
 /* Where the entry stub will restore RSP from on the way out.
@@ -61,11 +62,11 @@ void syscall_set_kernel_stack(uint64 rsp) {
  * ordinary return path lands in the new image, with no second exit route to
  * write or keep correct. */
 void syscall_set_user_rsp(uint64 rsp) {
-    cpu0.user_rsp = rsp;
+    thiscpu.user_rsp = rsp;
 }
 
 uint64 syscall_get_user_rsp(void) {
-    return cpu0.user_rsp;
+    return thiscpu.user_rsp;
 }
 
 /* The user's GS base, which is not simply "the GS base MSR".
@@ -85,21 +86,24 @@ uint64 syscall_get_user_rsp(void) {
  * is the same failure the interrupt path's missing swapgs produced, and it
  * took a disassembly to find once already.
  *
- * So ask rather than assume. The test is exact: GS_BASE holds the block if
- * and only if the CPU is on the kernel side of a swapgs. */
+ * That ambiguity is gone now: smp_early_init puts the per-CPU block in
+ * GS_BASE before anything else runs, and the first entry to ring 3
+ * (enter_user_mode) swaps like every later one - so while the kernel runs,
+ * on any CPU, GS_BASE is the block and the user's value is in
+ * KERNEL_GS_BASE. It had to be made unconditional: an AP has no "before the
+ * first swapgs" phase, and smp_this_cpu() reads the block through GS. The
+ * test is kept as a check, because a GS_BASE that is NOT the block here is
+ * a machine about to fault in the next syscall_entry, and saying so is
+ * worth one MSR read. */
 void syscall_set_user_gs_base(uint64 base) {
-    if (rdmsr(MSR_GS_BASE) == (uint64)&cpu0) {
-        wrmsr(MSR_KERNEL_GS_BASE, base);
-    } else {
-        wrmsr(MSR_GS_BASE, base);
+    if (rdmsr(MSR_GS_BASE) != (uint64)smp_this_cpu()->self) {
+        kprintf_c(0x0C, "syscall: GS_BASE is not this CPU's block\n");
     }
+    wrmsr(MSR_KERNEL_GS_BASE, base);
 }
 
 uint64 syscall_get_user_gs_base(void) {
-    if (rdmsr(MSR_GS_BASE) == (uint64)&cpu0) {
-        return rdmsr(MSR_KERNEL_GS_BASE);
-    }
-    return rdmsr(MSR_GS_BASE);
+    return rdmsr(MSR_KERNEL_GS_BASE);
 }
 
 /* Lay out a kernel stack so that switch_context's tail lands in
@@ -144,19 +148,10 @@ uint64 thread_bootstrap_stack(uint64 kstack_top, const struct syscall_frame *fra
     return sp;
 }
 
-void syscall_init(uint64 kernel_stack_top) {
+/* The SYSCALL machinery's MSRs, which are PER CPU: an AP that never had
+ * these written takes #UD on a user thread's first syscall instruction. */
+static void syscall_msrs(void) {
     uint64 star;
-
-    cpu0.kernel_rsp = kernel_stack_top;
-    cpu0.user_rsp   = 0;
-
-    /* swapgs exchanges GS_BASE and KERNEL_GS_BASE. The convention here: while
-     * in ring 3, GS_BASE is the user's (zero) and KERNEL_GS_BASE holds this
-     * block. syscall_entry swaps on the way in and back on the way out, so the
-     * kernel never needs swapgs anywhere else - including on the initial
-     * iretq into ring 3, which is why enter_user_mode has none. */
-    wrmsr(MSR_GS_BASE, 0);
-    wrmsr(MSR_KERNEL_GS_BASE, (uint64)&cpu0);
 
     /* See the header for why these two constants are what they are. */
     star = ((uint64)0x0008u << 32)    /* SYSCALL: CS 0x08, SS 0x10 */
@@ -171,6 +166,24 @@ void syscall_init(uint64 kernel_stack_top) {
     wrmsr(MSR_SFMASK, 0x200u | 0x100u | 0x40000u);  /* IF | TF | AC */
 
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
+}
+
+void syscall_init(uint64 kernel_stack_top) {
+    thiscpu.kernel_rsp = kernel_stack_top;
+    thiscpu.user_rsp   = 0;
+
+    /* swapgs exchanges GS_BASE and KERNEL_GS_BASE. The convention: while the
+     * KERNEL runs, GS_BASE holds this CPU's block (smp_early_init set it);
+     * while ring 3 runs, the user's value is there and the block is in
+     * KERNEL_GS_BASE. Every door between the two swaps - syscall_entry and
+     * syscall_return, isr_common in both directions, and enter_user_mode on
+     * the very first descent. */
+    wrmsr(MSR_KERNEL_GS_BASE, 0);
+    syscall_msrs();
+}
+
+void syscall_init_ap(void) {
+    syscall_msrs();
 }
 
 /* --- entry stub ---------------------------------------------------------
@@ -227,6 +240,19 @@ __asm__(
  * second copy of the pops that would have to stay in step with these. */
 "    .globl syscall_return\n"
 "syscall_return:\n"
+
+/* The exit to ring 3 is where the big kernel lock is released - here rather
+ * than at the end of syscall_dispatch because a NEW thread never ran
+ * syscall_dispatch: it arrives at this label straight out of the context
+ * switch, holding the lock the switching CPU held. Interrupts off first, so
+ * nothing can enter the kernel on this CPU between the release and the
+ * sysret with the user's GS half-restored. The eight bytes keep the call
+ * 16-byte aligned (RSP is 8 mod 16 at the frame). Every register the call
+ * may clobber is popped from the frame below. */
+"    cli\n"
+"    subq $8, %rsp\n"
+"    call bkl_exit_to_user\n"
+"    addq $8, %rsp\n"
 
 "    popq %rax\n"
 "    popq %rdi\n"
@@ -388,6 +414,14 @@ uint64 user_stack_create(uint64 top, uint64 size,
 /* --- ring 3 ------------------------------------------------------------- */
 
 void enter_user_mode(uint64 entry, uint64 stack) {
+    /* The first descent into ring 3 is an exit from the kernel like any
+     * other: the big kernel lock goes (the boot path held it since
+     * smp_early_init), and GS swaps so the user's base is live and this
+     * CPU's block is parked in KERNEL_GS_BASE for the next entry. Interrupts
+     * off across both - an interrupt taken between the swap and the iretq
+     * would enter from "kernel mode" with the user's GS. */
+    __asm__ volatile ("cli");
+    bkl_exit_to_user();
     /* There is no instruction that simply "returns to ring 3" - the only way
      * down is to make the CPU believe it is returning from an interrupt that
      * came FROM ring 3. So we fabricate the exact frame iretq expects and
@@ -399,6 +433,7 @@ void enter_user_mode(uint64 entry, uint64 stack) {
         "pushq $0x202\n\t"   /* RFLAGS */
         "pushq %2\n\t"       /* CS     */
         "pushq %3\n\t"       /* RIP    */
+        "swapgs\n\t"
         "iretq\n\t"
         :
         : "i"((uint64)USER_SS), "r"(stack), "i"((uint64)USER_CS), "r"(entry)
@@ -1094,27 +1129,29 @@ static open_file_t *sock_file(process_t *p, uint64 fd) {
     return handle_get(p->handles, (int)fd);
 }
 
-static uint64 sys_socket(uint64 domain, uint64 type, uint64 protocol) {
+static void sock_sigpipe(void) {
+    signal_send(proc_current(), SIGPIPE);
+}
+
+/* Install a new socket object as a descriptor, with SOCK_NONBLOCK /
+ * SOCK_CLOEXEC applied - shared by socket(2) and accept4(2). */
+static uint64 sock_install(object_t *obj, uint64 flags) {
     process_t   *p = proc_current();
-    object_t    *obj = NULL;
     open_file_t *of;
     uint32       hflags = 0;
-    uint64       base_type = type & ~(uint64)(SOCK_NONBLOCK_ | SOCK_CLOEXEC_);
-    int          fd, rc;
+    int          fd;
 
-    rc = socketfd_create((int)domain, (int)base_type, (int)protocol, &obj);
-    if (rc != 0) {
-        return (uint64)(int64)rc;
-    }
+    socketfd_set_sigpipe_hook(sock_sigpipe);
     of = of_open(obj, ACCESS_READ | ACCESS_WRITE);
     ob_deref(obj);
     if (of == NULL) {
         return (uint64)-23;
     }
-    if (type & SOCK_NONBLOCK_) {
+    if (flags & SOCK_NONBLOCK_) {
         of->status |= O_NONBLOCK;
+        socketfd_set_nonblock(of->obj, 1);
     }
-    if (type & SOCK_CLOEXEC_) {
+    if (flags & SOCK_CLOEXEC_) {
         hflags |= HANDLE_CLOEXEC;
     }
     fd = handle_alloc(p->handles, of, hflags);
@@ -1124,6 +1161,20 @@ static uint64 sys_socket(uint64 domain, uint64 type, uint64 protocol) {
     return (uint64)fd;
 }
 
+static uint64 sys_socket(uint64 domain, uint64 type, uint64 protocol) {
+    object_t    *obj = NULL;
+    uint64       base_type = type & ~(uint64)(SOCK_NONBLOCK_ | SOCK_CLOEXEC_);
+    int          rc;
+
+    rc = socketfd_create((int)domain, (int)base_type, (int)protocol, &obj);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    return sock_install(obj, type);
+}
+
+/* Every call below starts the same way: the descriptor must exist (EBADF)
+ * and be a socket (ENOTSOCK, which the socketfd_* side answers). */
 static uint64 sys_bind(uint64 fd, uint64 addr, uint64 len) {
     open_file_t *f = sock_file(proc_current(), fd);
 
@@ -1150,6 +1201,81 @@ static uint64 sys_connect(uint64 fd, uint64 addr, uint64 len) {
                                            (unsigned int)len);
 }
 
+static uint64 sys_listen(uint64 fd, uint64 backlog) {
+    open_file_t *f = sock_file(proc_current(), fd);
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    return (uint64)(int64)socketfd_listen(f->obj, (int)backlog);
+}
+
+/* An in/out socklen_t: validate the length word, then the buffer it sizes. */
+static int user_socklen(uint64 addr, uint64 alen_ptr, unsigned int *alen) {
+    if ((addr != 0) != (alen_ptr != 0)) {
+        return -14;
+    }
+    if (alen_ptr == 0) {
+        return 0;
+    }
+    if (!user_range_ok(alen_ptr, sizeof(unsigned int))) {
+        return -14;
+    }
+    *alen = *(unsigned int *)alen_ptr;
+    if ((int)*alen < 0) {
+        return -22;
+    }
+    if (!user_range_ok(addr, *alen)) {
+        return -14;
+    }
+    return 0;
+}
+
+static uint64 sys_accept4(uint64 fd, uint64 addr, uint64 alen_ptr,
+                          uint64 flags) {
+    open_file_t *f = sock_file(proc_current(), fd);
+    object_t    *nobj = NULL;
+    unsigned int alen = 0;
+    int          rc;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if (flags & ~(uint64)(SOCK_NONBLOCK_ | SOCK_CLOEXEC_)) {
+        return (uint64)-22;
+    }
+    rc = user_socklen(addr, alen_ptr, &alen);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    /* The LISTENER's O_NONBLOCK decides whether this waits; the flag
+     * argument decides what the NEW descriptor gets. Linux keeps the two
+     * separate (accept4's SOCK_NONBLOCK is not inherited from the listener)
+     * and so does this. */
+    rc = socketfd_accept(f->obj, (f->status & O_NONBLOCK) != 0, &nobj,
+                         addr != 0 ? (void *)addr : NULL,
+                         alen_ptr != 0 ? &alen : NULL);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    if (alen_ptr != 0) {
+        *(unsigned int *)alen_ptr = alen;
+    }
+    return sock_install(nobj, flags);
+}
+
+static uint64 sys_shutdown(uint64 fd, uint64 how) {
+    open_file_t *f = sock_file(proc_current(), fd);
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    return (uint64)(int64)socketfd_shutdown(f->obj, (int)how);
+}
+
+/* A descriptor with O_NONBLOCK behaves as if every call carried
+ * MSG_DONTWAIT - the socket's SS_NBIO says so to the stack already, so the
+ * flags pass through untouched. */
 static uint64 sys_sendto(uint64 fd, uint64 buf, uint64 len, uint64 flags,
                          uint64 addr, uint64 alen) {
     open_file_t *f = sock_file(proc_current(), fd);
@@ -1157,20 +1283,13 @@ static uint64 sys_sendto(uint64 fd, uint64 buf, uint64 len, uint64 flags,
     if (f == NULL) {
         return (uint64)-9;
     }
-    /* Flags are refused rather than ignored. MSG_OOB, MSG_DONTROUTE and
-     * MSG_NOSIGNAL each change what the call does, and a caller that passes
-     * one and is silently given the default gets behaviour it did not ask
-     * for at a moment it cannot see. */
-    if (flags != 0) {
-        return (uint64)-95;                      /* -EOPNOTSUPP */
-    }
     if (!user_range_ok(buf, len)) {
         return (uint64)-14;
     }
     if (addr != 0 && !user_range_ok(addr, alen)) {
         return (uint64)-14;
     }
-    return (uint64)socketfd_sendto(f->obj, (const void *)buf, len,
+    return (uint64)socketfd_sendto(f->obj, (const void *)buf, len, (int)flags,
                                    addr != 0 ? (const void *)addr : NULL,
                                    (unsigned int)alen);
 }
@@ -1180,12 +1299,10 @@ static uint64 sys_recvfrom(uint64 fd, uint64 buf, uint64 len, uint64 flags,
     open_file_t *f = sock_file(proc_current(), fd);
     unsigned int alen = 0;
     int64        got;
+    int          rc;
 
     if (f == NULL) {
         return (uint64)-9;
-    }
-    if (flags != 0) {
-        return (uint64)-95;
     }
     if (!user_range_ok(buf, len)) {
         return (uint64)-14;
@@ -1195,17 +1312,11 @@ static uint64 sys_recvfrom(uint64 fd, uint64 buf, uint64 len, uint64 flags,
     if ((addr != 0) != (alen_ptr != 0)) {
         return (uint64)-22;
     }
-    if (alen_ptr != 0) {
-        if (!user_range_ok(alen_ptr, sizeof(unsigned int))) {
-            return (uint64)-14;
-        }
-        alen = *(unsigned int *)alen_ptr;
-        if (!user_range_ok(addr, alen)) {
-            return (uint64)-14;
-        }
+    rc = user_socklen(addr, alen_ptr, &alen);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
     }
-
-    got = socketfd_recvfrom(f->obj, (void *)buf, len,
+    got = socketfd_recvfrom(f->obj, (void *)buf, len, (int)flags,
                             addr != 0 ? (void *)addr : NULL,
                             alen_ptr != 0 ? &alen : NULL);
     if (alen_ptr != 0 && got >= 0) {
@@ -1214,9 +1325,109 @@ static uint64 sys_recvfrom(uint64 fd, uint64 buf, uint64 len, uint64 flags,
     return (uint64)got;
 }
 
+/* struct msghdr, as Linux lays it out on amd64. */
+typedef struct {
+    uint64 msg_name;
+    uint32 msg_namelen;
+    uint32 pad0;
+    uint64 msg_iov;
+    uint64 msg_iovlen;
+    uint64 msg_control;
+    uint64 msg_controllen;
+    int32  msg_flags;
+    uint32 pad1;
+} lx_msghdr_t;
+
+#define SOCK_IOV_MAX 1024                /* UIO_MAXIOV */
+
+static int user_iov(uint64 iov, uint64 iovcnt) {
+    uint64 i;
+
+    if (iovcnt > SOCK_IOV_MAX) {
+        return -22;
+    }
+    if (!user_range_ok(iov, iovcnt * 16)) {
+        return -14;
+    }
+    for (i = 0; i < iovcnt; i++) {
+        uint64 base = ((uint64 *)iov)[2 * i];
+        uint64 len  = ((uint64 *)iov)[2 * i + 1];
+        if (len != 0 && !user_range_ok(base, len)) {
+            return -14;
+        }
+    }
+    return 0;
+}
+
+static uint64 sys_sendmsg(uint64 fd, uint64 msg, uint64 flags) {
+    open_file_t *f = sock_file(proc_current(), fd);
+    lx_msghdr_t *m = (lx_msghdr_t *)msg;
+    int          rc;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if (!user_range_ok(msg, sizeof(*m))) {
+        return (uint64)-14;
+    }
+    /* Ancillary data is refused: there is nothing it could carry here
+     * (no SCM_RIGHTS over AF_INET, no IP_PKTINFO) and dropping it silently
+     * would be the same kind of lie as ignoring a flag. */
+    if (m->msg_controllen != 0) {
+        return (uint64)-95;
+    }
+    rc = user_iov(m->msg_iov, m->msg_iovlen);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    if (m->msg_name != 0 && !user_range_ok(m->msg_name, m->msg_namelen)) {
+        return (uint64)-14;
+    }
+    return (uint64)socketfd_sendmsg(f->obj, (const void *)m->msg_iov,
+                                    (int)m->msg_iovlen, (int)flags,
+                                    m->msg_name != 0 ? (const void *)m->msg_name
+                                                     : NULL,
+                                    m->msg_namelen);
+}
+
+static uint64 sys_recvmsg(uint64 fd, uint64 msg, uint64 flags) {
+    open_file_t *f = sock_file(proc_current(), fd);
+    lx_msghdr_t *m = (lx_msghdr_t *)msg;
+    unsigned int alen;
+    int          rc, oflags = 0;
+    int64        got;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if (!user_range_ok(msg, sizeof(*m))) {
+        return (uint64)-14;
+    }
+    rc = user_iov(m->msg_iov, m->msg_iovlen);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    alen = m->msg_namelen;
+    if (m->msg_name != 0 && !user_range_ok(m->msg_name, alen)) {
+        return (uint64)-14;
+    }
+    got = socketfd_recvmsg(f->obj, (void *)m->msg_iov, (int)m->msg_iovlen,
+                           (int)flags,
+                           m->msg_name != 0 ? (void *)m->msg_name : NULL,
+                           m->msg_name != 0 ? &alen : NULL, &oflags);
+    if (got >= 0) {
+        if (m->msg_name != 0) {
+            m->msg_namelen = alen;
+        }
+        m->msg_controllen = 0;          /* no ancillary data, ever */
+        m->msg_flags = oflags;
+    }
+    return (uint64)got;
+}
+
 static uint64 sys_getsockname(uint64 fd, uint64 addr, uint64 alen_ptr) {
     open_file_t *f = sock_file(proc_current(), fd);
-    unsigned int alen;
+    unsigned int alen = 0;
     int64        rc;
 
     if (f == NULL) {
@@ -1225,18 +1436,75 @@ static uint64 sys_getsockname(uint64 fd, uint64 addr, uint64 alen_ptr) {
     if (addr == 0 || alen_ptr == 0) {
         return (uint64)-14;
     }
-    if (!user_range_ok(alen_ptr, sizeof(unsigned int))) {
-        return (uint64)-14;
-    }
-    alen = *(unsigned int *)alen_ptr;
-    if (!user_range_ok(addr, alen)) {
-        return (uint64)-14;
+    rc = user_socklen(addr, alen_ptr, &alen);
+    if (rc != 0) {
+        return (uint64)rc;
     }
     rc = socketfd_getsockname(f->obj, (void *)addr, &alen);
     if (rc == 0) {
         *(unsigned int *)alen_ptr = alen;
     }
     return (uint64)rc;
+}
+
+static uint64 sys_getpeername(uint64 fd, uint64 addr, uint64 alen_ptr) {
+    open_file_t *f = sock_file(proc_current(), fd);
+    unsigned int alen = 0;
+    int64        rc;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if (addr == 0 || alen_ptr == 0) {
+        return (uint64)-14;
+    }
+    rc = user_socklen(addr, alen_ptr, &alen);
+    if (rc != 0) {
+        return (uint64)rc;
+    }
+    rc = socketfd_getpeername(f->obj, (void *)addr, &alen);
+    if (rc == 0) {
+        *(unsigned int *)alen_ptr = alen;
+    }
+    return (uint64)rc;
+}
+
+static uint64 sys_setsockopt(uint64 fd, uint64 level, uint64 name,
+                             uint64 val, uint64 len) {
+    open_file_t *f = sock_file(proc_current(), fd);
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if ((int)len < 0 || (len != 0 && !user_range_ok(val, len))) {
+        return (uint64)-14;
+    }
+    return (uint64)(int64)socketfd_setsockopt(f->obj, (int)level, (int)name,
+                                              (const void *)val,
+                                              (unsigned int)len);
+}
+
+static uint64 sys_getsockopt(uint64 fd, uint64 level, uint64 name,
+                             uint64 val, uint64 len_ptr) {
+    open_file_t *f = sock_file(proc_current(), fd);
+    unsigned int len;
+    int          rc;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if (val == 0 || len_ptr == 0) {
+        return (uint64)-14;
+    }
+    rc = user_socklen(val, len_ptr, &len);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    rc = socketfd_getsockopt(f->obj, (int)level, (int)name, (void *)val, &len);
+    if (rc == 0) {
+        *(unsigned int *)len_ptr = len;
+    }
+    return (uint64)(int64)rc;
 }
 
 static uint64 sys_pipe(uint64 fds_ptr) {
@@ -1330,6 +1598,11 @@ static uint64 sys_fcntl(uint64 fd, uint64 cmd, uint64 arg) {
              * covers the pair rather than each being handled separately. */
             f->status = (f->status & ~(uint32)O_SETFL_MASK) |
                         ((uint32)arg & (uint32)O_SETFL_MASK);
+            /* A socket reads its own copy of the flag (SS_NBIO), which a
+             * blocking connect or accept consults inside the stack. */
+            if (socketfd_is_socket(f->obj)) {
+                socketfd_set_nonblock(f->obj, (f->status & O_NONBLOCK) != 0);
+            }
             return 0;
 
         case F_GETLK:
@@ -1787,7 +2060,7 @@ static uint64 sys_vfork(struct syscall_frame *frame) {
 
     /* Suspend the parent exactly where it is. */
     parent->saved_frame    = *frame;
-    parent->saved_user_rsp = cpu0.user_rsp;
+    parent->saved_user_rsp = thiscpu.user_rsp;
     parent->state          = PROC_BLOCKED;
     child->vfork_waiter    = parent->pid;
 
@@ -1803,7 +2076,7 @@ static uint64 sys_vfork(struct syscall_frame *frame) {
         child_frame.rax = 0;
         child->thread.saved_rsp =
             thread_bootstrap_stack(child->thread.kstack_top, &child_frame);
-        child->saved_user_rsp = cpu0.user_rsp;
+        child->saved_user_rsp = thiscpu.user_rsp;
     }
 
     /* Become the child and return 0 into it. The user RSP is untouched - the
@@ -2384,7 +2657,7 @@ static process_t *wait_reap_blocking(process_t *p, uint64 options, int64 *err) {
          * arrive while this loop holds the CPU. Same fix as kbd_wait, and
          * the same ordering: sti leaves interrupts off for exactly one more
          * instruction, so the wakeup cannot slip in before the hlt. */
-        __asm__ volatile ("sti; hlt; cli");
+        bkl_wait_for_interrupt();
     }
 }
 
@@ -3456,6 +3729,88 @@ static uint64 sys_umask(uint64 mask) {
  * same schedule() every preemption does. */
 static uint64 sys_sched_yield(void) {
     schedule();
+    return 0;
+}
+
+/* --- CPUs: affinity and "where am I" ---------------------------------------
+ *
+ * sched_setaffinity / sched_getaffinity name a THREAD (pid 0 is the caller;
+ * any other number is a tid, as on Linux), and the mask is a bit per CPU.
+ * The mask a thread may be given is intersected with the CPUs that exist;
+ * one naming none of them is EINVAL, which is Linux's answer too. Moving a
+ * thread off the CPU it is running on happens at once - sched_set_affinity
+ * makes that CPU reschedule.
+ *
+ * The length rules are Linux's, because musl's sysconf(_SC_NPROCESSORS_ONLN)
+ * reads the CPU count out of sched_getaffinity's mask and passes 128 bytes:
+ * the buffer must hold at least the kernel's mask (8 bytes, 64 CPUs) and be
+ * a whole number of longs, and the return value is the byte count written. */
+static process_t *affinity_target(uint64 pid) {
+    process_t *p;
+
+    if (pid == 0) {
+        return proc_current();
+    }
+    p = proc_find((int)pid);
+    if (p == NULL || p->is_kthread || p->state == PROC_ZOMBIE) {
+        return NULL;
+    }
+    return p;
+}
+
+static uint64 sys_sched_setaffinity(uint64 pid, uint64 len, uint64 mask_ptr) {
+    process_t *p = affinity_target(pid);
+    uint64 mask = 0;
+    uint64 i;
+
+    if (p == NULL) {
+        return (uint64)-3;                          /* -ESRCH */
+    }
+    if (len == 0 || !user_range_ok(mask_ptr, len)) {
+        return (uint64)-14;
+    }
+    for (i = 0; i < len && i < sizeof(uint64); i++) {
+        mask |= (uint64)((const uint8 *)mask_ptr)[i] << (8 * i);
+    }
+    return (uint64)(int64)sched_set_affinity(p, mask);
+}
+
+static uint64 sys_sched_getaffinity(uint64 pid, uint64 len, uint64 mask_ptr) {
+    process_t *p = affinity_target(pid);
+    uint64 mask, i;
+
+    if (p == NULL) {
+        return (uint64)-3;
+    }
+    if (len < sizeof(uint64) || (len & (sizeof(uint64) - 1)) != 0) {
+        return (uint64)-22;
+    }
+    if (!user_range_ok(mask_ptr, sizeof(uint64))) {
+        return (uint64)-14;
+    }
+    mask = p->affinity & smp_online_mask();
+    for (i = 0; i < sizeof(uint64); i++) {
+        ((uint8 *)mask_ptr)[i] = (uint8)(mask >> (8 * i));
+    }
+    return sizeof(uint64);
+}
+
+/* getcpu(cpu, node, cache): the CPU this thread is on at the moment of the
+ * call - true when it is answered and possibly stale the instant after,
+ * which is the documented contract. One NUMA node. */
+static uint64 sys_getcpu(uint64 cpu_ptr, uint64 node_ptr) {
+    if (cpu_ptr != 0) {
+        if (!user_range_ok(cpu_ptr, sizeof(uint32))) {
+            return (uint64)-14;
+        }
+        *(uint32 *)cpu_ptr = (uint32)smp_cpu_index();
+    }
+    if (node_ptr != 0) {
+        if (!user_range_ok(node_ptr, sizeof(uint32))) {
+            return (uint64)-14;
+        }
+        *(uint32 *)node_ptr = 0;
+    }
     return 0;
 }
 
@@ -4699,7 +5054,7 @@ static uint64 sys_nanosleep(uint64 req_ptr, uint64 rem_ptr) {
         if (me == NULL) {
             /* No process context: the idle path before anything runs. Halt
              * until the next interrupt rather than spinning. */
-            __asm__ volatile ("sti; hlt; cli");
+            bkl_wait_for_interrupt();
             continue;
         }
         if (signal_pending(me)) {
@@ -4729,7 +5084,7 @@ static uint64 sys_nanosleep(uint64 req_ptr, uint64 rem_ptr) {
          */
         if (me->state == PROC_BLOCKED) {
             me->state = PROC_RUNNING;
-            __asm__ volatile ("sti; hlt; cli");
+            bkl_wait_for_interrupt();
         }
     }
     return 0;
@@ -5274,6 +5629,18 @@ static const char *syscall_name(uint64 nr) {
         case SYS_execveat:        return "execveat";
         case SYS_socketpair:      return "socketpair";
         case SYS_socket:          return "socket";
+        case SYS_sched_setaffinity: return "sched_setaffinity";
+        case SYS_sched_getaffinity: return "sched_getaffinity";
+        case SYS_getcpu:          return "getcpu";
+        case SYS_listen:          return "listen";
+        case SYS_accept:          return "accept";
+        case SYS_accept4:         return "accept4";
+        case SYS_shutdown:        return "shutdown";
+        case SYS_getpeername:     return "getpeername";
+        case SYS_setsockopt:      return "setsockopt";
+        case SYS_getsockopt:      return "getsockopt";
+        case SYS_sendmsg:         return "sendmsg";
+        case SYS_recvmsg:         return "recvmsg";
         case SYS_bind:            return "bind";
         case SYS_connect:         return "connect";
         case SYS_sendto:          return "sendto";
@@ -5396,11 +5763,20 @@ int linux_is_sigreturn(uint64 nr) {
 }
 
 uint64 syscall_dispatch(struct syscall_frame *frame) {
+    const syscall_personality_t *pers;
+    uint64 rc;
+
+    /* Into the kernel: take the big kernel lock. SYSCALL cleared IF, so the
+     * spin (if another CPU is in the kernel) runs with interrupts off and
+     * answers IPIs through the mailboxes. Released at syscall_return. */
+    bkl_acquire();
+    smp_this_cpu()->user_entries++;
+
     /* The fork in the road, taken once per syscall. Everything below this
      * line is personality-independent: signals, preemption and the return to
      * user mode work the same whichever ABI made the call. */
-    const syscall_personality_t *pers = personality_current();
-    uint64 rc = pers->dispatch(frame);
+    pers = personality_current();
+    rc = pers->dispatch(frame);
 
     /* Signal delivery goes here rather than in return_to_user, because it
      * needs a syscall_frame to rewrite and the interrupt path has a different
@@ -5520,6 +5896,26 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
 
         case SYS_getsockname:
             return sys_getsockname(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_getpeername:
+            return sys_getpeername(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_listen:
+            return sys_listen(frame->rdi, frame->rsi);
+        case SYS_accept:
+            return sys_accept4(frame->rdi, frame->rsi, frame->rdx, 0);
+        case SYS_accept4:
+            return sys_accept4(frame->rdi, frame->rsi, frame->rdx, frame->r10);
+        case SYS_shutdown:
+            return sys_shutdown(frame->rdi, frame->rsi);
+        case SYS_sendmsg:
+            return sys_sendmsg(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_recvmsg:
+            return sys_recvmsg(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_setsockopt:
+            return sys_setsockopt(frame->rdi, frame->rsi, frame->rdx,
+                                  frame->r10, frame->r8);
+        case SYS_getsockopt:
+            return sys_getsockopt(frame->rdi, frame->rsi, frame->rdx,
+                                  frame->r10, frame->r8);
 
         case SYS_socketpair:
             return sys_socketpair(frame->rdi, frame->rsi, frame->rdx,
@@ -5717,6 +6113,12 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
             return sys_umask(frame->rdi);
         case SYS_sched_yield:
             return sys_sched_yield();
+        case SYS_sched_setaffinity:
+            return sys_sched_setaffinity(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_sched_getaffinity:
+            return sys_sched_getaffinity(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_getcpu:
+            return sys_getcpu(frame->rdi, frame->rsi);
         case SYS_setsid:
             return sys_setsid();
         case SYS_getsid:

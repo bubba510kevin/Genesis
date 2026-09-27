@@ -9,6 +9,7 @@
 #include "timer.h"
 #include "typesk.h"
 #include "waitq.h"
+#include "bkl.h"
 
 /* Kernel threads. See kernel/include/kthread.h for what one is, what it
  * unblocks, and the one rule that comes with it (they are not preemptible).
@@ -83,6 +84,12 @@ static uint64 kthread_bootstrap_stack(uint64 kstack_top) {
         *(uint64 *)sp = 0;
     }
     return sp;
+}
+
+/* The same layout, for proc_create_idle - an idle thread starts exactly the
+ * way any other kernel thread does. */
+uint64 kthread_boot_stack(uint64 kstack_top) {
+    return kthread_bootstrap_stack(kstack_top);
 }
 
 /* Where every kernel thread starts.
@@ -255,7 +262,7 @@ void kthread_exit(void) {
      * unmap the stack it is standing on. */
     for (;;) {
         schedule();
-        __asm__ volatile ("sti; hlt");
+        bkl_wait_for_interrupt();
     }
 }
 
@@ -269,7 +276,13 @@ void kthread_reap(void) {
         if (p == NULL || p == me) {
             continue;
         }
-        if (p->is_kthread && p->state == PROC_ZOMBIE) {
+        /* oncpu: a CPU that has not yet switched away from it. With the
+         * big kernel lock passed across every switch that window is closed
+         * before anyone can get here - but the check is what proc_free
+         * relies on, and clearing is_kthread first on a slot proc_free then
+         * refused would leave a zombie that no reaper recognises. */
+        if (p->is_kthread && !p->is_idle && p->state == PROC_ZOMBIE &&
+            !p->oncpu) {
             /* Cleared BEFORE proc_free, because proc_free hands the slot
              * back and the next kthread_create can be handed the same one.
              * A flag left set on a recycled slot would make a user process

@@ -101,6 +101,20 @@ void genesis_critical_exit(void);
 static __inline int genesis_pcpu_get_domain(void) { return 0; }
 static __inline int genesis_pcpu_get_cpuid(void)  { return (int)curcpu; }
 
+/* thread0 - upstream's first thread, whose credential is the unrestricted
+ * one. The TCP syncache connects a new pcb with thread0's credential.
+ * Defined in kernel/bsd/netglue.c. */
+extern struct thread thread0;
+
+/* "May cred a see objects owned by cred b" - there is one credential in the
+ * network stack (see net_absences.c), so the answer is always yes. */
+struct ucred;
+static __inline int cr_cansee(struct ucred *a, struct ucred *b) {
+    (void)a;
+    (void)b;
+    return 0;
+}
+
 #define PROC_LOCK(p)     do { } while (0)
 #define PROC_UNLOCK(p)   do { } while (0)
 

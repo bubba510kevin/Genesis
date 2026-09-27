@@ -99,6 +99,10 @@ int genesis_rw_sleep(const void *chan, struct rwlock *rw, int pri,
  * under any other reader. */
 #define rw_unlock(rw)      krw_unlock(&(rw)->grw)
 
+/* "Do I hold it for writing" - in_pcb.h's INP_WLOCKED, which TCP asks
+ * throughout. The rwlock records its writer's CPU for exactly this. */
+#define rw_wowned(rw)      krw_wowned(&(rw)->grw)
+
 int genesis_rw_try_wlock(struct rwlock *rw);
 
 #endif

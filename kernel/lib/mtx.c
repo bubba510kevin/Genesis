@@ -365,6 +365,11 @@ void krw_init(rwlock_t *rw, const char *name) {
     rw->readers     = 0;
     rw->saved_flags = 0;
     rw->name        = name;
+    rw->wcpu        = 0xFFFFFFFFu;
+}
+
+int krw_wowned(rwlock_t *rw) {
+    return rw->readers < 0 && rw->wcpu == this_cpu();
 }
 
 void krw_rlock(rwlock_t *rw) {
@@ -430,11 +435,13 @@ void krw_wlock(rwlock_t *rw) {
         }
         __asm__ volatile ("pause");
     }
+    rw->wcpu = this_cpu();
     rw_held_push(rw);
 }
 
 void krw_wunlock(rwlock_t *rw) {
     rw_held_pop(rw);
+    rw->wcpu = 0xFFFFFFFFu;
     __asm__ volatile ("" : : : "memory");
     rw->readers = 0;
     spin_exit();
@@ -499,6 +506,9 @@ int krw_tryupgrade(rwlock_t *rw) {
                       : "=a"(prev), "+m"(rw->readers)
                       : "r"(-1), "0"(1)
                       : "memory", "cc");
+    if (prev == 1) {
+        rw->wcpu = this_cpu();
+    }
     return (prev == 1);
 }
 
@@ -506,6 +516,7 @@ int krw_tryupgrade(rwlock_t *rw) {
 void krw_downgrade(rwlock_t *rw) {
     if (rw->readers < 0) {
         rw_held_pop(rw);
+        rw->wcpu = 0xFFFFFFFFu;
         rw->readers = 1;
     }
 }
@@ -523,6 +534,7 @@ int krw_trywlock(rwlock_t *rw) {
                       : "r"(-1), "0"(0)
                       : "memory", "cc");
     if (prev == 0) {
+        rw->wcpu = this_cpu();
         rw_held_push(rw);
         return 1;
     }

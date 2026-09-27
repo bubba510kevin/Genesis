@@ -124,6 +124,26 @@ void fpu_restore(const void *area) {
     __asm__ volatile ("fxrstor (%0)" : : "r"(area) : "memory");
 }
 
+/* The per-CPU half of fpu_init, for an application processor: CR0 and CR4
+ * are that CPU's own registers, and a user thread scheduled onto a CPU
+ * without OSFXSR takes #UD on its first SSE instruction. The template is
+ * NOT recaptured - it is the BSP's, and every thread starts from it on any
+ * CPU. */
+void fpu_init_ap(void) {
+    uint64 cr0, cr4;
+    uint32 mxcsr = 0x1F80;
+
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);
+    cr0 |=  (1ULL << 1);
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+    __asm__ volatile ("fninit");
+    __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
+}
+
 void fpu_init(void) {
     uint64 cr0, cr4;
 

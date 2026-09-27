@@ -59,6 +59,9 @@
 #define SYS_madvise         28
 #define SYS_msync           26
 #define SYS_sched_yield     24
+#define SYS_sched_setaffinity 203
+#define SYS_sched_getaffinity 204
+#define SYS_getcpu         309
 #define SYS_setsid         112
 #define SYS_getsid         124
 #define SYS_setresuid      117
@@ -224,6 +227,15 @@
 #define SYS_recvfrom        45
 #define SYS_bind            49
 #define SYS_getsockname     51
+#define SYS_accept          43
+#define SYS_sendmsg         46
+#define SYS_recvmsg         47
+#define SYS_shutdown        48
+#define SYS_listen          50
+#define SYS_getpeername     52
+#define SYS_setsockopt      54
+#define SYS_getsockopt      55
+#define SYS_accept4        288
 
 /* Terminal ioctls. Only the handful a shell asks on startup; everything else
  * is answered with -ENOTTY rather than a blanket success. */
@@ -356,6 +368,9 @@ struct syscall_frame {
 /* Program the MSRs and point the per-CPU block at a kernel stack. Call after
  * gdt_init(), since the selectors it encodes must already exist. */
 void syscall_init(uint64 kernel_stack_top);
+
+/* The SYSCALL MSRs on an application processor - they are per CPU. */
+void syscall_init_ap(void);
 
 /* Stack the SYSCALL entry stub switches to. Must be updated on every context
  * switch alongside gdt_set_kernel_stack - they feed different entry paths

@@ -25,6 +25,7 @@ struct sbuf *sbuf_new_for_sysctl(struct sbuf *s, char *buf, int length,
                                  struct sysctl_req *req);
 void  sbuf_delete(struct sbuf *s);
 int   sbuf_finish(struct sbuf *s);
+int   sbuf_drain(struct sbuf *s);
 int   sbuf_bcat(struct sbuf *s, const void *buf, size_t len);
 int   sbuf_cat(struct sbuf *s, const char *str);
 int   sbuf_printf(struct sbuf *s, const char *fmt, ...);

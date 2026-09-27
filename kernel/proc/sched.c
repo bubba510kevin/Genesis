@@ -1,4 +1,6 @@
+#include "bkl.h"
 #include "cpu.h"
+#include "ksmp.h"
 #include "kthread.h"
 #include "process.h"
 #include "sched.h"
@@ -7,24 +9,44 @@
 #include "timer.h"
 #include "typesk.h"
 
-/* --- round-robin ---------------------------------------------------------
- * A circular scan over the process table rather than a linked list.
+/* --- the scheduler, on every CPU --------------------------------------------
  *
- * The table is 16 entries, so a scan is cheaper than the pointer chasing a
- * list would need, and it cannot develop the failure a list can: a process
- * freed while still enqueued leaves a dangling next pointer, which corrupts
- * the run queue rather than the process. Scanning reads state that is always
- * true by construction.
+ * One run "queue" - the process table, scanned - shared by all CPUs, and
+ * everything about the CURRENT run per CPU: which thread each CPU is
+ * running, its slice, its resched flag, its idle thread (see ksmp.h's
+ * struct cpu_local). A shared queue rather than per-CPU queues because the
+ * table is small and a scan reads state that is true by construction; ULE's
+ * per-CPU queues exist to avoid lock contention on a queue lock, and the
+ * big kernel lock already serialises every reader and writer of this one.
  *
- * ULE will want a real queue, because its interactivity scoring means the
- * order is not simply "whoever is next in the table". That is a reason to
- * replace this implementation, not this interface. */
+ * What makes a table entry runnable ON A GIVEN CPU is sched_eligible(), and
+ * every policy goes through it: READY and allowed by affinity, or already
+ * RUNNING on this very CPU. A thread RUNNING on another CPU is never picked -
+ * that would be two CPUs executing one thread's kernel stack.
+ *
+ * --- round-robin ---------------------------------------------------------
+ * A circular scan over the table from after the CPU's current thread. The
+ * table is small, so a scan is cheaper than the pointer chasing a list would
+ * need, and it cannot develop the failure a list can: a process freed while
+ * still enqueued leaves a dangling next pointer. */
 
 #define QUANTUM_TICKS 5     /* 50ms at 100Hz */
 
-static process_t *run_current;
-static int quantum_left;
-static volatile int resched;
+int sched_eligible(const process_t *p, int cpu) {
+    if (p == NULL || p->is_idle) {
+        return 0;
+    }
+    if ((p->affinity & (1ULL << cpu)) == 0) {
+        return 0;
+    }
+    if (p->state == PROC_READY) {
+        return !p->oncpu;
+    }
+    if (p->state == PROC_RUNNING) {
+        return p == smp_cpu(cpu)->current;
+    }
+    return 0;
+}
 
 static void rr_enqueue(process_t *p) {
     if (p != NULL && p->state == PROC_BLOCKED) {
@@ -36,37 +58,38 @@ static void rr_dequeue(process_t *p) {
     (void)p;   /* nothing to unlink: readiness is the process's own state */
 }
 
-static process_t *rr_pick_next(void) {
-    process_t *start = proc_current();
+static process_t *rr_pick_next(int cpu) {
+    process_t *start = smp_cpu(cpu)->current;
     process_t *p;
     int i;
 
     /* Begin AFTER the current process so a runnable peer is preferred over
      * running the same one again - that is the whole of round-robin's
-     * fairness, and starting at index 0 would starve everything behind a
-     * process that never blocks. */
+     * fairness. The current one is reached last (i == MAX_PROCESSES), so it
+     * keeps the CPU only when nothing else here can have it. */
     for (i = 1; i <= MAX_PROCESSES; i++) {
         p = proc_at((proc_index(start) + i) % MAX_PROCESSES);
-        if (p != NULL && (p->state == PROC_READY || p->state == PROC_RUNNING)) {
+        if (sched_eligible(p, cpu)) {
             return p;
         }
-    }
-    if (start != NULL && start->state == PROC_RUNNING) {
-        return start;
     }
     return NULL;
 }
 
-static int rr_tick(process_t *p) {
+static int rr_tick(process_t *p, int *quantum) {
     (void)p;
-    if (quantum_left > 0) {
-        quantum_left--;
+    if (*quantum > 0) {
+        (*quantum)--;
     }
-    return quantum_left == 0;
+    if (*quantum == 0) {
+        *quantum = QUANTUM_TICKS;
+        return 1;
+    }
+    return 0;
 }
 
 static const sched_policy_t round_robin = {
-    "round-robin", rr_enqueue, rr_dequeue, rr_pick_next, rr_tick
+    "round-robin", rr_enqueue, rr_dequeue, rr_pick_next, rr_tick, NULL
 };
 
 static const sched_policy_t *policy = &round_robin;
@@ -74,10 +97,16 @@ static const sched_policy_t *policy = &round_robin;
 /* --- mechanism ----------------------------------------------------------- */
 
 void sched_init(process_t *first) {
-    policy       = &round_robin;
-    run_current  = first;
-    quantum_left = QUANTUM_TICKS;
-    resched      = 0;
+    struct cpu_local *c = smp_this_cpu();
+
+    policy          = &round_robin;
+    c->current      = first;
+    c->quantum_left = QUANTUM_TICKS;
+    c->resched      = 0;
+    if (first != NULL) {
+        first->cpu   = (int)c->index;
+        first->oncpu = 1;
+    }
 }
 
 void sched_set_policy(const sched_policy_t *pol) {
@@ -93,226 +122,182 @@ const char *sched_policy_name(void) {
 void sched_enqueue(process_t *p) { policy->enqueue(p); }
 void sched_dequeue(process_t *p) { policy->dequeue(p); }
 
-void sched_tick(void) {
-    process_t *p = proc_current();
+/* The half of a tick that belongs to the MACHINE: wake sleepers whose
+ * deadline passed, charge sleep time to every blocked thread, and let the
+ * policy age its statistics. Once per tick, on the BSP, whose PIT is the one
+ * clock every deadline is written in.
+ *
+ * Sleep is charged to every thread that is blocked; PROC_READY is charged
+ * to NEITHER counter. A process that is runnable and waiting for a CPU is
+ * not sleeping - counting that as sleep would make a compute-bound process
+ * on a busy machine look interactive, which is precisely backwards. */
+void sched_tick_global(void) {
+    int i;
 
-    /* Before the null check, not after. A sleeping process is exactly one
-     * that is NOT current, so making the wakeups conditional on there being a
-     * current process would be a deadlock on the one path where it matters
-     * least obviously. */
     sched_wake_sleepers(timer_ticks_now());
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = proc_at(i);
 
-    /* Charge the tick.
-     *
-     * The CURRENT process is charged unconditionally, with no test on its
-     * state, and that is the whole correctness argument: being current when
-     * the timer fires IS what consumed the tick. p->state is derived
-     * bookkeeping, and this kernel already has paths where it disagrees with
-     * reality - waitq_wait leaves a process marked PROC_BLOCKED while it goes
-     * round its own `sti; hlt; cli` loop, which is exactly why sys_nanosleep
-     * has to write PROC_RUNNING back by hand before halting. Gating on
-     * `state == PROC_RUNNING` meant those ticks were either dropped or, worse,
-     * charged to sleep_ticks for a process that was demonstrably running.
-     *
-     * This is the only place in the kernel that knows a tick has elapsed AND
-     * which process it elapsed for, which is why the accounting lives here
-     * rather than in the policy - a second policy would otherwise have to
-     * remember to do it, and the one that forgot would score every process
-     * identically and look like it was working.
-     *
-     * Sleep is charged separately, to every OTHER process that is blocked. A
-     * blocked process accrues sleep precisely because it is not running, so
-     * charging only the current one would leave sleep_ticks at zero for
-     * exactly the processes an interactivity score exists to promote. The
-     * current process is excluded from that scan whatever its state says,
-     * for the reason above: it cannot be both.
-     *
-     * PROC_READY is charged to NEITHER. A process that is runnable and
-     * waiting for a CPU is not sleeping - it has work to do - and counting
-     * that as sleep would make a compute-bound process on a busy machine look
-     * interactive, which is precisely backwards. It is not running either.
-     * The time is real and belongs to a third counter nothing needs yet.
-     *
-     * A table scan at 100Hz over MAX_PROCESSES entries, for the same reason
-     * sched_wake_sleepers is one. */
-    if (p != NULL) {
-        /* Two counters, one event. run_ticks is ULE's scoring input and gets
-         * halved every couple of seconds; cpu_ticks is the accounting total
-         * and nothing may touch it. See process.h on why they are separate -
-         * they were one field, and the CPU-time clock every process reads
-         * halved with the scheduler's heuristic. */
-        p->run_ticks++;
-        p->cpu_ticks++;
-    }
-    {
-        int i;
-
-        for (i = 0; i < MAX_PROCESSES; i++) {
-            process_t *t = proc_at(i);
-
-            if (t == NULL || t == p) {
-                continue;
-            }
-            if (t->state == PROC_BLOCKED) {
-                t->sleep_ticks++;
-            }
+        if (t != NULL && t->state == PROC_BLOCKED && !t->is_idle) {
+            t->sleep_ticks++;
         }
     }
+    if (policy->decay != NULL) {
+        policy->decay();
+    }
+}
 
+/* The half that belongs to THIS CPU: charge the tick to the thread it was
+ * running, and ask the policy whether that thread's slice is spent.
+ *
+ * The current thread is charged unconditionally, with no test on its state:
+ * being current when the timer fires IS what consumed the tick. Two
+ * counters, one event - run_ticks is ULE's scoring input and gets halved
+ * every couple of seconds; cpu_ticks is the accounting total and nothing may
+ * touch it. An idle thread is charged nothing: its time is the CPU's idle
+ * time, counted separately. */
+void sched_tick_local(void) {
+    struct cpu_local *c = smp_this_cpu();
+    process_t *p = c->current;
+
+    c->ticks++;
     if (p == NULL) {
         return;
     }
-    if (policy->tick(p)) {
-        resched = 1;
+    if (p->is_idle) {
+        c->idle_ticks++;
+        return;
+    }
+    p->run_ticks++;
+    p->cpu_ticks++;
+    if (policy->tick(p, &c->quantum_left)) {
+        c->resched = 1;
     }
 }
 
+void sched_tick(void) {
+    sched_tick_global();
+    sched_tick_local();
+}
+
 int sched_needs_resched(void) {
-    return resched;
+    return smp_this_cpu()->resched;
+}
+
+/* Wake anyone waiting to reap `z`, which has just stopped running here.
+ *
+ * A zombie is not reapable while it is still on a CPU (see process.h's
+ * oncpu), so a parent that looked while it was - and found nothing to reap -
+ * went back to sleep. Nothing else would wake it: the child's exit already
+ * sent its SIGCHLD and wakeup. So the switch away is the event, and it wakes
+ * every thread in wait4. Spurious wakeups are cheap - they re-scan - and a
+ * missed one is a shell hung on a finished job. */
+static void zombie_left_cpu(process_t *z) {
+    int i;
+
+    (void)z;
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = proc_at(i);
+
+        if (t != NULL && t->waiting_for_child && t->state == PROC_BLOCKED) {
+            sched_wake(t);
+        }
+    }
 }
 
 void schedule(void) {
-    process_t *prev = proc_current();
+    struct cpu_local *c = smp_this_cpu();
+    process_t *prev = c->current;
     process_t *next;
 
-    resched = 0;
-    quantum_left = QUANTUM_TICKS;
+    c->resched = 0;
 
-    /* Reclaim any kernel thread that has exited.
-     *
-     * Here rather than in kthread_exit, because a thread cannot unmap the
-     * stack it is standing on: the exiting thread marks itself PROC_ZOMBIE
-     * and the reclaim has to happen in somebody else's context. This is the
-     * first point in the kernel that is guaranteed to be somebody else - the
-     * dead thread is by definition not proc_current() here, and kthread_reap
-     * skips proc_current() anyway so the guarantee is asserted rather than
-     * assumed.
-     *
-     * Before pick_next, not after, so a freed slot is not a candidate on the
-     * same pass that freed it. */
+    /* Reclaim exited kernel threads and user threads here: this is the
+     * first point guaranteed to be running on somebody else's stack. */
     kthread_reap();
-    /* And user threads, for the same reason and with the same guarantee -
-     * see proc_reap_threads. */
     proc_reap_threads();
 
-    next = policy->pick_next();
-    if (next == NULL || next == prev) {
-        /* Nothing else to run - but the process that carries on running must
-         * still be MARKED as running, and for a long time it was not.
-         *
-         * The path that made this matter: a process blocks (sched_block ->
-         * PROC_BLOCKED), something wakes it (sched_wake -> PROC_READY), and
-         * it resumes as the only runnable process. schedule() then took the
-         * early return above, so the `next->state = PROC_RUNNING` below was
-         * never reached, and the process ran on marked PROC_READY - for the
-         * rest of its life, since nothing else ever writes that field for a
-         * process that does not block again.
-         *
-         * It stayed invisible because the only consumer was rr_pick_next,
-         * which accepts PROC_READY and PROC_RUNNING alike and so could not
-         * tell the difference. The first thing to actually READ the state -
-         * per-process CPU accounting - measured zero for every process that
-         * had ever called wait4, which is every shell and every program that
-         * forks.
-         *
-         * A state field that only one caller reads, and that caller treats
-         * two values as equivalent, is a field with no test behind it. */
-        if (next != NULL) {
-            next->state = PROC_RUNNING;
+    next = policy->pick_next((int)c->index);
+    if (next == NULL) {
+        /* Nothing runnable on this CPU. The idle thread, if there is one yet;
+         * before smp_start_scheduling there is not, and the caller falls
+         * back to halting in its own context as it always did. */
+        next = c->idle;
+        if (next == NULL) {
+            if (prev != NULL && prev->state == PROC_READY) {
+                prev->state = PROC_RUNNING;
+            }
+            return;
         }
+    }
+    /* A fresh slice for whatever runs next under round-robin. ULE sizes its
+     * own slices by score when one runs out, so it is left alone. */
+    if (policy == &round_robin) {
+        c->quantum_left = QUANTUM_TICKS;
+    }
+
+    if (next == prev) {
+        /* Carrying on. The state must still SAY running: a process woken
+         * (BLOCKED -> READY) that resumes as the only runnable one would
+         * otherwise run on marked READY for the rest of its life. */
+        next->state = PROC_RUNNING;
         return;
     }
 
     /* The user stack pointer lives in the per-CPU block, which the next
-     * thread is about to overwrite. Saving it here rather than in the entry
-     * stub keeps the stub free of any knowledge that processes exist.
-     *
-     * This read is only correct because BOTH entry paths fill that slot: the
-     * SYSCALL stub parks it directly, and interrupt_dispatch parks the
-     * frame's RSP when the interrupt came from ring 3. Without the second
-     * one, a thread preempted by the timer parked whatever thread last made
-     * a syscall - see the comment there for why that was invisible. */
+     * thread is about to overwrite. A kernel thread has none to park. */
     if (prev != NULL) {
-        /* A kernel thread has no user RSP to park, and the per-CPU slot it
-         * would read holds whatever the last user process left there. Parking
-         * that into the kernel thread and handing it back on the way out
-         * would be harmless today - the value round-trips - and is skipped
-         * anyway, because "the kernel thread is carrying a user process's
-         * stack pointer" is exactly the kind of state that stops being
-         * harmless the first time something reads it for a different reason.
-         *
-         * The slot itself is left alone rather than zeroed, so the user
-         * process that resumes after this kernel thread gets its own value
-         * back from its own saved_user_rsp below. */
         if (!prev->is_kthread) {
             prev->saved_user_rsp = syscall_get_user_rsp();
         }
         if (prev->state == PROC_RUNNING) {
             prev->state = PROC_READY;
         }
+        /* Off this CPU. Safe to publish before the switch below has saved
+         * prev's registers because the big kernel lock is held, and passes
+         * to `next` rather than being released: no other CPU can look at
+         * prev until the switch is long complete. */
+        prev->oncpu = 0;
+        if (prev->state == PROC_ZOMBIE) {
+            zombie_left_cpu(prev);
+        }
     }
 
     next->state = PROC_RUNNING;
-    proc_set_current_raw(next);
+    next->oncpu = 1;
+    next->cpu   = (int)c->index;
+    c->current  = next;
+    c->switches++;
     proc_activate_stack(next);
     if (!next->is_kthread) {
         syscall_set_user_rsp(next->saved_user_rsp);
     }
 
-    /* prev is NULL-checked: pick_next can hand back a runnable process when
-     * there is no current one at all, and reading prev->space to decide
-     * whether CR3 needs to move faulted on exactly that path. */
     if (next->space != NULL && (prev == NULL || next->space != prev->space)) {
         vmm_switch_to(next->space);
     }
 
     /* The FPU is context too. switch_context saves the callee-saved integer
-     * registers and nothing else, so without this the outgoing thread's x87
-     * stack, XMM registers, rounding mode and exception mask simply become
-     * the incoming thread's - and the failure is not a fault but a wrong
-     * number, appearing in a process that did nothing wrong.
-     *
-     * Safe to do here rather than lazily on first use because the kernel
-     * builds with -mno-sse: nothing between these two instructions and the
-     * return to ring 3 touches the registers being moved. */
+     * registers and nothing else. Safe here rather than lazily because the
+     * kernel builds with -mno-sse. */
     if (prev != NULL) {
         fpu_save(prev->thread.fpu_state);
     }
     fpu_restore(next->thread.fpu_state);
 
-    /* Everything above is bookkeeping; this is the switch. When it returns,
-     * `prev` is running again and every local above is stale - which is why
-     * nothing is read after it. */
     {
-        /* prev is checked here for the same reason it is checked three times
-         * above: pick_next can hand back a runnable process when there is no
-         * current one at all. &prev->thread.saved_rsp would then be an
-         * address computed off a null pointer, and switch_context WRITES
-         * through it - a silent corruption at a fixed low address rather than
-         * a fault you could read. There is no outgoing thread to park, so it
-         * goes somewhere nobody reads. */
-        static uint64 no_outgoing_thread;
+        static uint64 no_outgoing_thread[SMP_MAX_CPUS];
         uint64 *park = (prev != NULL) ? &prev->thread.saved_rsp
-                                      : &no_outgoing_thread;
+                                      : &no_outgoing_thread[c->index];
 
         switch_context(park, next->thread.saved_rsp);
     }
 }
 
 /* The single place the kernel decides what to do on its way back to user
- * mode.
- *
- * Both entry paths - SYSCALL and an IDT gate - end here before returning, so
- * anything that must happen "just before user code resumes" has exactly one
- * home. Preemption is the only tenant today. Signal delivery is the next one,
- * and it belongs here for the same reason: a pending signal must be delivered
- * on the way out regardless of which way the kernel was entered, and two
- * copies of that check would drift.
- *
- * `to_user` is false when an interrupt landed while the kernel was already
- * running. Switching then would abandon whatever the interrupted kernel code
- * had live on its stack, so the flag stays set and the switch happens on the
- * outermost return instead. */
+ * mode. Both entry paths end here before returning. `to_user` is false when
+ * an interrupt landed while the kernel was already running; switching then
+ * would abandon whatever the interrupted kernel code had live on its stack. */
 void return_to_user(int to_user) {
     process_t *me;
 
@@ -320,23 +305,15 @@ void return_to_user(int to_user) {
         return;
     }
 
-    /* A process that died while inside the kernel must not be returned to.
-     *
-     * This is the convergence point for both entry paths, which is the only
-     * reason one check is enough. Every way a process can die without
-     * unwinding ends up here: a signal whose default action is to terminate,
-     * a corrupt signal frame caught by rt_sigreturn, a fault that could not
-     * be resolved. Each of those used to mark the process a zombie and then
-     * let the syscall or interrupt return anyway, and a zombie returning to
-     * ring 3 resumes at whatever the unrestored frame happens to say - which
-     * is a second, unrelated-looking fault a few instructions later.
-     *
-     * A zombie is not runnable, so schedule() never comes back for it. */
+    /* A process that died while inside the kernel - or was killed while it
+     * ran on this CPU, by a thread on another - must not be returned to. A
+     * zombie is not runnable, so schedule() never comes back for it. */
     me = proc_current();
     if (me != NULL && me->state == PROC_ZOMBIE) {
         schedule();
 
-        /* Returned, so nothing else was runnable. */
+        /* Returned, so nothing else was runnable and there is no idle
+         * thread - only possible before the scheduler is fully up. */
         print_string("\n[nothing left to run]\n", 0x4F);
         __asm__ volatile ("cli");
         for (;;) {
@@ -344,6 +321,7 @@ void return_to_user(int to_user) {
         }
     }
 
+    smp_run_deferred();
     if (sched_needs_resched()) {
         schedule();
     }
@@ -356,11 +334,10 @@ void sched_block(process_t *p) {
     p->state = PROC_BLOCKED;
     policy->dequeue(p);
     schedule();
-    /* Returns when something called sched_wake and the scheduler came back
-     * around. If schedule() found nothing else runnable, this returns
-     * immediately with the process still blocked - which is a deadlock, and
-     * the caller has to be written so it cannot happen. kbd_wait handles it
-     * by leaving interrupts on and halting instead. */
+    /* Returns when something called sched_wake and a CPU picked this thread
+     * again. Only before smp_start_scheduling (no idle thread yet) can it
+     * return with the thread still blocked; every caller is written to
+     * re-test its condition, so that is a spurious wakeup and not a hang. */
 }
 
 void sched_sleep_until(process_t *p, uint64 tick) {
@@ -369,9 +346,6 @@ void sched_sleep_until(process_t *p, uint64 tick) {
     }
     p->wake_tick = tick;
     sched_block(p);
-    /* Cleared on the way out whatever woke it - a deadline that is still set
-     * on a running process is a wakeup waiting to be delivered to something
-     * that is not asleep. */
     p->wake_tick = 0;
 }
 
@@ -388,6 +362,59 @@ void sched_wake_sleepers(uint64 now) {
     }
 }
 
+/* Is this CPU idle - running its idle thread - and allowed to take `p`? */
+static int cpu_idle_for(int cpu, const process_t *p) {
+    struct cpu_local *c = smp_cpu(cpu);
+
+    return c != NULL && c->online && c->scheduling && c->idle != NULL &&
+           c->current == c->idle && (p->affinity & (1ULL << cpu)) != 0;
+}
+
+/* Make sure SOME CPU notices that `p` is runnable.
+ *
+ * An idle CPU that may run it is best, and it is kicked out of its halt: its
+ * last run of `p` first (warm cache), then NT's ideal processor, then any.
+ * With none idle, this CPU reschedules at its next return to ring 3 if `p`
+ * may run here - which is what preempting the current thread in favour of a
+ * woken, interactive one always did on one CPU - and otherwise the CPU `p`
+ * last ran on is asked to. */
+static void wake_some_cpu(process_t *p) {
+    struct cpu_local *me = smp_this_cpu();
+    int n = smp_cpu_count();
+    int i;
+
+    if (p->cpu >= 0 && p->cpu < n && cpu_idle_for(p->cpu, p)) {
+        if (p->cpu == (int)me->index) {
+            me->resched = 1;
+        } else {
+            smp_kick(p->cpu);
+        }
+        return;
+    }
+    if (p->ideal_cpu >= 0 && p->ideal_cpu < n && cpu_idle_for(p->ideal_cpu, p)) {
+        smp_kick(p->ideal_cpu);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (i != (int)me->index && cpu_idle_for(i, p)) {
+            smp_kick(i);
+            return;
+        }
+    }
+    if (p->affinity & (1ULL << me->index)) {
+        me->resched = 1;
+    } else if (p->cpu >= 0 && p->cpu < n && p->cpu != (int)me->index) {
+        smp_kick(p->cpu);
+    } else {
+        for (i = 0; i < n; i++) {
+            if (p->affinity & (1ULL << i)) {
+                smp_kick(i);
+                return;
+            }
+        }
+    }
+}
+
 void sched_wake(process_t *p) {
     if (p == NULL || p->state != PROC_BLOCKED) {
         return;
@@ -395,5 +422,109 @@ void sched_wake(process_t *p) {
     p->wake_tick = 0;
     p->state = PROC_READY;
     policy->enqueue(p);
-    resched = 1;
+    wake_some_cpu(p);
+}
+
+/* Somewhere to run `p` changed - its affinity was narrowed, or it was
+ * killed while running elsewhere. If it is on a CPU that must give it up,
+ * that CPU is made to enter the kernel and reschedule. */
+void sched_poke(process_t *p) {
+    struct cpu_local *me = smp_this_cpu();
+
+    if (p == NULL || !p->oncpu) {
+        return;
+    }
+    if (p->cpu == (int)me->index) {
+        me->resched = 1;
+    } else {
+        smp_kick(p->cpu);
+    }
+}
+
+/* Leave this CPU now if the current thread may no longer run on it - the
+ * second half of narrowing its own affinity, which KeSetSystemAffinityThread
+ * and sched_bind promise has taken effect by the time they return. The
+ * thread is made visible to a CPU that may run it, and this one switches
+ * away; it resumes, still inside this call, on an allowed CPU. Before
+ * smp_start_scheduling there is nowhere to go, and it returns in place. */
+void sched_migrate_self(void) {
+    struct cpu_local *c = smp_this_cpu();
+    process_t *me = c->current;
+
+    if (me == NULL || me->is_idle || c->idle == NULL) {
+        return;
+    }
+    while ((me->affinity & (1ULL << smp_cpu_index())) == 0) {
+        wake_some_cpu(me);
+        smp_this_cpu()->resched = 0;
+        schedule();
+    }
+}
+
+int sched_set_affinity(process_t *p, uint64 mask) {
+    mask &= smp_online_mask();
+    if (p == NULL || mask == 0) {
+        return -22;                         /* -EINVAL: no CPU left */
+    }
+    p->affinity = mask;
+    if (p->oncpu && (mask & (1ULL << p->cpu)) == 0) {
+        sched_poke(p);
+    }
+    return 0;
+}
+
+/* Any thread this CPU could run, other than the one it is running? */
+static int cpu_has_work(int cpu) {
+    process_t *cur = smp_cpu(cpu)->current;
+    int i;
+
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = proc_at(i);
+
+        if (p != NULL && p != cur && sched_eligible(p, cpu)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* --- the idle thread ---------------------------------------------------------
+ *
+ * Entered with the big kernel lock held (it arrived by a context switch, and
+ * the lock travels with those). Loops: under the lock, look for work and
+ * switch to it if there is any; otherwise release the lock, halt until an
+ * interrupt, and take the lock back.
+ *
+ * The check and the halt are ordered so a wakeup cannot fall between them:
+ * the check runs with interrupts off, the lock is released with them still
+ * off, and `sti; hlt` enables them as one pair - so a wake IPI sent after
+ * the check is pending at the sti and wakes the hlt rather than being lost. */
+void sched_idle_loop(void *arg) {
+    struct cpu_local *c = smp_this_cpu();
+
+    (void)arg;
+    for (;;) {
+        __asm__ volatile ("cli");
+        smp_run_deferred();
+        if (c->resched || cpu_has_work((int)c->index)) {
+            schedule();
+            continue;
+        }
+        bkl_release_all();
+        smp_idle_poll_work();
+        if (!c->resched) {
+            __asm__ volatile ("sti; hlt; cli" : : : "memory");
+        }
+        /* And again after the wake, before queueing for the lock: work
+         * posted by smp_run_on_aps comes from a CPU that is HOLDING the lock
+         * and waiting for this one to finish it. */
+        smp_idle_poll_work();
+        bkl_acquire();
+    }
+}
+
+int sched_cpu_is_idle(int cpu) {
+    struct cpu_local *c = smp_cpu(cpu);
+
+    return c != NULL && c->current != NULL && c->current == c->idle;
 }

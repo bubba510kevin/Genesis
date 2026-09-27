@@ -461,7 +461,11 @@ static __inline uint64 rdtsc_now(void) {
 
 void udelay(unsigned long usecs) {
     uint64 start = rdtsc_now();
-    uint64 want  = (uint64)usecs * UDELAY_ASSUMED_TSC_PER_US;
+    uint64 hz    = timer_tsc_hz();
+    /* The measured rate once there is one (smp_start_scheduling calibrates
+     * it); the deliberately high assumption above before that. */
+    uint64 want  = hz != 0 ? ((uint64)usecs * hz) / 1000000ULL + 1
+                           : (uint64)usecs * UDELAY_ASSUMED_TSC_PER_US;
 
     while (rdtsc_now() - start < want) {
         __asm__ __volatile__("pause" ::: "memory");
@@ -549,6 +553,11 @@ char *strcpy(char *dst, const char *src) {
     while ((dst[i] = src[i]) != '\0') {
         i++;
     }
+    return dst;
+}
+
+char *strcat(char *dst, const char *src) {
+    strcpy(dst + strlen(dst), src);
     return dst;
 }
 

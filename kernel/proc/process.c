@@ -15,6 +15,8 @@
 #include "teb.h"
 #include "tty.h"
 #include "typesk.h"
+#include "ksmp.h"
+#include "kthread.h"
 
 /* A fixed table rather than a linked list off the heap.
  *
@@ -36,7 +38,12 @@ typedef char process_is_aligned[
     (__alignof__(process_t) % 16 == 0) ? 1 : -1];
 
 static process_t table[MAX_PROCESSES];
-static process_t *current;
+
+/* "The current process" is a property of a CPU, not of the kernel: with
+ * several CPUs each is running its own thread. The name is kept - every use
+ * below reads and writes it the way it did when it was one global - and it
+ * now resolves to the executing CPU's slot in its per-CPU block. */
+#define current (smp_this_cpu()->current)
 static int next_pid = 1;
 
 /* Which kstack slot each table entry owns. Tied to the table index rather
@@ -162,6 +169,11 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->kentry      = NULL;
     current->karg        = NULL;
     current->kname       = NULL;
+    current->cpu         = 0;
+    current->oncpu       = 1;      /* it is running: this is the boot CPU */
+    current->affinity    = ~0ULL;
+    current->ideal_cpu   = -1;
+    current->is_idle     = 0;
 
     /* Process 1 keeps the boot stack rather than being given a fresh one.
      * It is already executing on that stack - switching underneath itself
@@ -199,8 +211,20 @@ process_t *proc_current(void) {
 
 void proc_set_current(process_t *p) {
     if (p != NULL) {
-        current = p;
+        process_t *old = current;
+
+        /* An in-place switch - vfork hands the CPU from parent to child and
+         * back on one kernel stack, without schedule() - is still a switch,
+         * and "which thread is on this CPU" has to follow it. Missing it
+         * left a vfork child that exec'd and exited marked oncpu forever,
+         * which no reaper will touch: the shell's wait4 hung on it. */
+        if (old != NULL && old != p) {
+            old->oncpu = 0;
+        }
+        current  = p;
         p->state = PROC_RUNNING;
+        p->oncpu = 1;
+        p->cpu   = smp_cpu_index();
         proc_activate_stack(p);
     }
 }
@@ -265,8 +289,13 @@ static int group_has_live_threads(const process_t *leader) {
     for (i = 0; i < MAX_PROCESSES; i++) {
         const process_t *t = &table[i];
 
-        if (t == leader || t->state == PROC_UNUSED ||
-            t->state == PROC_ZOMBIE || is_kernel_thread(t)) {
+        if (t == leader || t->state == PROC_UNUSED || is_kernel_thread(t)) {
+            continue;
+        }
+        /* A zombie that another CPU is still executing - killed while it ran
+         * in ring 3 there - counts as live until that CPU switches away: it
+         * is still using the address space the leader owns. */
+        if (t->state == PROC_ZOMBIE && !t->oncpu) {
             continue;
         }
         if (t->tgid == leader->pid) {
@@ -281,6 +310,7 @@ process_t *proc_reap_child(process_t *p) {
 
     for (i = 0; i < MAX_PROCESSES; i++) {
         if (table[i].state == PROC_ZOMBIE && table[i].ppid == p->pid &&
+            !table[i].oncpu &&
             !is_kernel_thread(&table[i]) && !is_thread_of(&table[i], p) &&
             !group_has_live_threads(&table[i])) {
             return &table[i];
@@ -300,7 +330,7 @@ void proc_reap_threads(void) {
          * slot for. `current` is skipped for the reason kthread_reap skips
          * it: the dying thread may still be the one standing on its own
          * kernel stack, and proc_free would pull it out from under it. */
-        if (t == current || t->state != PROC_ZOMBIE ||
+        if (t == current || t->state != PROC_ZOMBIE || t->oncpu ||
             is_kernel_thread(t) || t->tgid == t->pid) {
             continue;
         }
@@ -420,6 +450,17 @@ process_t *proc_alloc(int ppid) {
             p->kentry             = NULL;
             p->karg               = NULL;
             p->kname              = NULL;
+            /* Affinity is inherited from the creator, as fork(2) and NT's
+             * thread creation both specify - a program pinned to CPU 1 whose
+             * children quietly run anywhere has not been pinned. A kernel
+             * thread creating one (kthread_create) gets "anywhere". */
+            p->affinity           = (current != NULL && !current->is_kthread &&
+                                     current->affinity != 0)
+                                    ? current->affinity : ~0ULL;
+            p->ideal_cpu          = -1;
+            p->is_idle            = 0;
+            p->oncpu              = 0;
+            p->cpu                = smp_cpu_index();
             p->thread.tid         = p->pid;
             /* Allocate the stack here rather than at first use: a thread
              * that cannot get one is a thread that cannot take a syscall, and
@@ -459,6 +500,14 @@ void proc_retire(process_t *p, int exit_status) {
     }
     p->exit_status = exit_status;
     p->state       = PROC_ZOMBIE;
+
+    /* Killed while running on ANOTHER CPU - a sibling thread's exit_group,
+     * a fatal signal. It keeps executing there until that CPU enters the
+     * kernel; make it do so now, so its return path sees the zombie and
+     * switches away (and oncpu drops, which is what lets it be reaped). */
+    if (p->oncpu && p != current) {
+        sched_poke(p);
+    }
 
     /* An NT thread retired from outside - its process exiting, or a fault
      * it could not survive - still has waiters on its Thread object, and
@@ -564,6 +613,13 @@ void proc_free(process_t *p) {
     if (p == NULL || p == current) {
         return;
     }
+    /* Still executing on another CPU - a thread killed while it ran there,
+     * which carries on until that CPU enters the kernel and switches away.
+     * Freeing its kernel stack or address space now would pull them out from
+     * under a running CPU. The reapers skip such a slot and come back. */
+    if (p->oncpu) {
+        return;
+    }
     /* proc_retire already did this for anything that died normally. Repeated
      * here because this is the function that hands the slot back for reuse,
      * and it is reachable for a process that never went through retire at
@@ -614,6 +670,7 @@ void proc_free(process_t *p) {
     p->kentry     = NULL;
     p->karg       = NULL;
     p->kname      = NULL;
+    p->is_idle    = 0;
 
     p->state = PROC_UNUSED;
     p->pid   = 0;
@@ -675,4 +732,78 @@ process_t *proc_find(int pid) {
         }
     }
     return NULL;
+}
+
+/* --- idle threads -----------------------------------------------------------
+ *
+ * One per CPU, and the reason is the scheduler's contract rather than
+ * power: with an idle thread always runnable, schedule() ALWAYS has
+ * somewhere to go, so a thread that blocks really leaves the CPU. Before
+ * there were idle threads a blocking call whose CPU had nothing else to run
+ * came straight back out of schedule() and halted IN the blocked thread's
+ * context - which on several CPUs would halt holding the big kernel lock and
+ * stop every other CPU at the kernel's door.
+ *
+ * It is a kernel thread (kthread_bootstrap_stack's shape) bound to its CPU by
+ * affinity, and is_idle keeps it out of every "is there work" question. */
+extern void sched_idle_loop(void *arg);
+uint64 kthread_boot_stack(uint64 kstack_top);
+
+process_t *proc_create_idle(int cpu) {
+    process_t *p = proc_alloc(0);
+
+    if (p == NULL) {
+        return NULL;
+    }
+    p->is_kthread     = 1;
+    p->is_idle        = 1;
+    p->kentry         = sched_idle_loop;
+    p->karg           = (void *)(uintptr)cpu;
+    p->kname          = "idle";
+    p->space          = vmm_kernel_space();
+    p->affinity       = 1ULL << cpu;
+    p->cpu            = cpu;
+    p->thread.saved_rsp = kthread_boot_stack(p->thread.kstack_top);
+    p->state          = PROC_READY;
+    return p;
+}
+
+/* The per-CPU struct field is also named current; the shorthand has to go
+ * before code that names the field. */
+#undef current
+
+/* Ctrl-T on the console: one line per task and one per CPU. The question it
+ * answers is "what is everything waiting for", which is the only question
+ * that matters about a hung machine and the one a hung machine cannot be
+ * asked any other way. BSD's SIGINFO and Linux's SysRq-t, in one keystroke. */
+void proc_dump(void) {
+    static const char *const st[] = {"unused", "ready", "RUN", "blocked",
+                                     "zombie"};
+    int i;
+
+    kprintf_c(0x0E, "\n--- tasks ---\n");
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *t = &table[i];
+
+        if (t->state == PROC_UNUSED) {
+            continue;
+        }
+        kprintf_c(0x0E, "  pid %d tgid %d ppid %d %s cpu %d%s%s%s%s aff %lx %s\n",
+                  t->pid, t->tgid, t->ppid, st[t->state], t->cpu,
+                  t->oncpu ? " oncpu" : "",
+                  t->waiting_for_child ? " wait4" : "",
+                  t->blocked_on != NULL ? " waitq" : "",
+                  t->wake_tick != 0 ? " sleep" : "",
+                  t->affinity,
+                  t->is_kthread ? (t->kname != NULL ? t->kname : "kthread")
+                                : "user");
+    }
+    for (i = 0; i < smp_cpu_count(); i++) {
+        struct cpu_local *c = smp_cpu(i);
+
+        kprintf_c(0x0E, "  cpu%d current pid %d%s resched %d bkl %d irq %d\n",
+                  i, c->current != NULL ? c->current->pid : -1,
+                  (c->current != NULL && c->current == c->idle) ? " (idle)" : "",
+                  c->resched, c->bkl_depth, c->irq_depth);
+    }
 }

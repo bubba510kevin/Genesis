@@ -387,4 +387,146 @@ void  WDM_ABI ExFreePool(void *P);
  * fixed-format-then-va_list callee like this one needs. */
 void WDM_ABI DbgPrint(const char *fmt, ...);
 
+/* --- the multiprocessor interface (kernel/driver/wdm_smp.c) ------------------
+ *
+ * Layouts are NT's own for x64, so a driver built against the WDK reads and
+ * writes these structures at the offsets it was compiled with. */
+typedef uint64 KAFFINITY, *PKAFFINITY;
+
+typedef struct _PROCESSOR_NUMBER {
+    uint16 Group;
+    uint8  Number;
+    uint8  Reserved;
+} PROCESSOR_NUMBER, *PPROCESSOR_NUMBER;
+
+typedef struct _GROUP_AFFINITY {
+    KAFFINITY Mask;
+    uint16    Group;
+    uint16    Reserved[3];
+} GROUP_AFFINITY, *PGROUP_AFFINITY;
+
+typedef struct _LIST_ENTRY {
+    struct _LIST_ENTRY *Flink;
+    struct _LIST_ENTRY *Blink;
+} LIST_ENTRY, *PLIST_ENTRY;
+
+struct _KDPC;
+typedef void (WDM_ABI *PKDEFERRED_ROUTINE)(struct _KDPC *Dpc, void *DeferredContext,
+                                            void *SystemArgument1,
+                                            void *SystemArgument2);
+
+/* KDPC, 0x40 bytes: the target processor rides in Number (see wdm_smp.c
+ * for its encoding), DpcData is non-NULL while queued. */
+typedef struct _KDPC {
+    union {
+        uint32 TargetInfoAsUlong;
+        struct {
+            uint8           Type;
+            uint8           Importance;
+            volatile uint16 Number;
+        };
+    };
+    uint32              Pad0;
+    void               *DpcListEntry;
+    KAFFINITY           ProcessorHistory;
+    PKDEFERRED_ROUTINE  DeferredRoutine;
+    void               *DeferredContext;
+    void               *SystemArgument1;
+    void               *SystemArgument2;
+    void *volatile      DpcData;
+} KDPC, *PKDPC;
+
+typedef uint64 (WDM_ABI *PKIPI_BROADCAST_WORKER)(uint64 Argument);
+
+typedef struct _KSPIN_LOCK_QUEUE {
+    struct _KSPIN_LOCK_QUEUE *volatile Next;
+    PKSPIN_LOCK volatile              Lock;
+} KSPIN_LOCK_QUEUE;
+
+typedef struct _KLOCK_QUEUE_HANDLE {
+    KSPIN_LOCK_QUEUE LockQueue;
+    KIRQL            OldIrql;
+} KLOCK_QUEUE_HANDLE, *PKLOCK_QUEUE_HANDLE;
+
+extern int8 KeNumberProcessors;
+
+uint32    WDM_ABI KeGetCurrentProcessorNumber(void);
+uint32    WDM_ABI KeGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER ProcNumber);
+uint32    WDM_ABI KeQueryActiveProcessorCount(PKAFFINITY ActiveProcessors);
+uint32    WDM_ABI KeQueryActiveProcessorCountEx(uint16 GroupNumber);
+KAFFINITY WDM_ABI KeQueryActiveProcessors(void);
+uint32    WDM_ABI KeQueryMaximumProcessorCount(void);
+uint32    WDM_ABI KeQueryMaximumProcessorCountEx(uint16 GroupNumber);
+uint16    WDM_ABI KeQueryActiveGroupCount(void);
+uint16    WDM_ABI KeQueryMaximumGroupCount(void);
+uint32    WDM_ABI KeGetProcessorIndexFromNumber(PPROCESSOR_NUMBER ProcNumber);
+NTSTATUS  WDM_ABI KeGetProcessorNumberFromIndex(uint32 ProcIndex,
+                                                PPROCESSOR_NUMBER ProcNumber);
+
+uint64    WDM_ABI KeIpiGenericCall(PKIPI_BROADCAST_WORKER BroadcastFunction,
+                                   uint64 Context);
+void      WDM_ABI KeGenericCallDpc(PKDEFERRED_ROUTINE Routine, void *Context);
+uint8     WDM_ABI KeSignalCallDpcSynchronize(void *SystemArgument2);
+void      WDM_ABI KeSignalCallDpcDone(void *SystemArgument1);
+
+void      WDM_ABI KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
+                                  void *DeferredContext);
+void      WDM_ABI KeInitializeThreadedDpc(PKDPC Dpc,
+                                          PKDEFERRED_ROUTINE DeferredRoutine,
+                                          void *DeferredContext);
+void      WDM_ABI KeSetTargetProcessorDpc(PKDPC Dpc, int8 Number);
+NTSTATUS  WDM_ABI KeSetTargetProcessorDpcEx(PKDPC Dpc, PPROCESSOR_NUMBER ProcNumber);
+void      WDM_ABI KeSetImportanceDpc(PKDPC Dpc, int Importance);
+uint8     WDM_ABI KeInsertQueueDpc(PKDPC Dpc, void *SystemArgument1,
+                                   void *SystemArgument2);
+uint8     WDM_ABI KeRemoveQueueDpc(PKDPC Dpc);
+void      WDM_ABI KeFlushQueuedDpcs(void);
+
+KAFFINITY WDM_ABI KeSetSystemAffinityThreadEx(KAFFINITY Affinity);
+void      WDM_ABI KeSetSystemAffinityThread(KAFFINITY Affinity);
+void      WDM_ABI KeRevertToUserAffinityThreadEx(KAFFINITY Affinity);
+void      WDM_ABI KeRevertToUserAffinityThread(void);
+void      WDM_ABI KeSetSystemGroupAffinityThread(PGROUP_AFFINITY Affinity,
+                                                 PGROUP_AFFINITY PreviousAffinity);
+void      WDM_ABI KeRevertToUserGroupAffinityThread(PGROUP_AFFINITY PreviousAffinity);
+
+void      WDM_ABI KeInitializeSpinLock(PKSPIN_LOCK SpinLock);
+void      WDM_ABI KeAcquireSpinLockAtDpcLevel(PKSPIN_LOCK SpinLock);
+void      WDM_ABI KeReleaseSpinLockFromDpcLevel(PKSPIN_LOCK SpinLock);
+uint8     WDM_ABI KeTryToAcquireSpinLockAtDpcLevel(PKSPIN_LOCK SpinLock);
+KIRQL     WDM_ABI KeAcquireSpinLockRaiseToDpc(PKSPIN_LOCK SpinLock);
+uint8     WDM_ABI KeTestSpinLock(PKSPIN_LOCK SpinLock);
+void      WDM_ABI KeAcquireInStackQueuedSpinLock(PKSPIN_LOCK SpinLock,
+                                                 PKLOCK_QUEUE_HANDLE LockHandle);
+void      WDM_ABI KeReleaseInStackQueuedSpinLock(PKLOCK_QUEUE_HANDLE LockHandle);
+void      WDM_ABI KeAcquireInStackQueuedSpinLockAtDpcLevel(PKSPIN_LOCK SpinLock,
+                                                           PKLOCK_QUEUE_HANDLE LockHandle);
+void      WDM_ABI KeReleaseInStackQueuedSpinLockFromDpcLevel(PKLOCK_QUEUE_HANDLE LockHandle);
+
+PLIST_ENTRY WDM_ABI ExInterlockedInsertHeadList(PLIST_ENTRY ListHead,
+                                                PLIST_ENTRY ListEntry,
+                                                PKSPIN_LOCK Lock);
+PLIST_ENTRY WDM_ABI ExInterlockedInsertTailList(PLIST_ENTRY ListHead,
+                                                PLIST_ENTRY ListEntry,
+                                                PKSPIN_LOCK Lock);
+PLIST_ENTRY WDM_ABI ExInterlockedRemoveHeadList(PLIST_ENTRY ListHead,
+                                                PKSPIN_LOCK Lock);
+
+void      WDM_ABI KeStallExecutionProcessor(uint32 MicroSeconds);
+int64     WDM_ABI KeQueryPerformanceCounter(int64 *PerformanceFrequency);
+void      WDM_ABI KeQueryTickCount(int64 *CurrentCount);
+uint32    WDM_ABI KeQueryTimeIncrement(void);
+
+/* Kernel-side hooks: whether this CPU has DPCs queued, run them (big kernel
+ * lock held, at a safe point), how many have run on a CPU, and the moment
+ * the scheduler has started on every CPU. */
+int    wdm_dpc_pending(void);
+void   wdm_dpc_drain(void);
+uint64 wdm_dpc_count(int cpu);
+void   wdm_smp_started(void);
+
+/* Exercise the multiprocessor interface on the running machine. Returns the
+ * number of failures. After smp_start_scheduling. */
+int wdm_smp_selftest(void);
+
 #endif

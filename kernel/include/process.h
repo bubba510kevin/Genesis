@@ -22,7 +22,9 @@
  * when address space and execution context need separate lifetimes, and
  * nothing here needs that yet. */
 
-#define MAX_PROCESSES  16
+/* 64: each CPU also needs an idle thread, and a machine with several CPUs
+ * runs several threads of one program at once, which is the point of it. */
+#define MAX_PROCESSES  64
 #define PROC_ARG_MAX   32
 
 /* Which ABI a process speaks.
@@ -401,6 +403,29 @@ typedef struct process {
      * the old address space before it can leave the kernel. */
     uint64          entry;
     uint64          user_rsp;
+
+    /* --- which CPU ---------------------------------------------------------
+     *
+     * `cpu` is where this thread last ran (the CPU it is running on, while
+     * RUNNING). `oncpu` is non-zero from the moment a CPU switches to it
+     * until that CPU switches AWAY - which is later than the thread turning
+     * into a zombie, because a thread killed while running on another CPU
+     * goes on executing there until that CPU next enters the kernel. Nothing
+     * may free a slot, a kernel stack or an address space while its thread is
+     * oncpu; proc_free and the reapers check.
+     *
+     * `affinity` is the set of CPUs it may run on, one bit each; all ones by
+     * default and inherited across fork and thread creation, as Linux and NT
+     * both do. `ideal_cpu` is NT's hint (SetThreadIdealProcessor): preferred
+     * when free, never required. -1 for none.
+     *
+     * `is_idle` marks a CPU's idle thread: bound to that CPU, never counted
+     * as work, picked only when nothing else is runnable there. */
+    int             cpu;
+    volatile int    oncpu;
+    uint64          affinity;
+    int             ideal_cpu;
+    int             is_idle;
 } process_t;
 
 /* Set up the table and build the first process, which inherits the boot
@@ -508,8 +533,17 @@ process_t *proc_at(int index);
 int proc_index(const process_t *p);
 
 /* Make `p` current without touching stacks or CR3 - the scheduler does those
- * itself, in an order it controls. */
+ * itself, in an order it controls. Current is PER CPU: this sets it for the
+ * CPU executing the call. */
 void proc_set_current_raw(process_t *p);
+
+/* A CPU's idle thread: a kernel thread bound to `cpu` that runs
+ * sched_idle_loop. NULL if the table is full. */
+process_t *proc_create_idle(int cpu);
+
+/* Print every task and every CPU's current thread - bound to Ctrl-T on the
+ * console (see kbd_inject). */
+void proc_dump(void);
 
 /* Non-zero if `p` has any child at all, reaped or not. wait4 needs the
  * distinction: no children is -ECHILD, children that have not exited is a

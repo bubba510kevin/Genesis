@@ -67,9 +67,17 @@ typedef struct krwlock {
     volatile int32 readers;     /* -1 = a writer holds it */
     uint64         saved_flags;
     const char    *name;
+    /* The CPU holding it for WRITING, or 0xFFFFFFFF. Recorded because
+     * FreeBSD asks "do I hold this for writing" (rw_wowned - in_pcb.h's
+     * INP_WLOCKED, all through TCP), and a writer holds a spinlock with
+     * interrupts off, so "this CPU" and "this thread" are the same answer. */
+    volatile uint32 wcpu;
 } rwlock_t;
 
 void krw_init(rwlock_t *rw, const char *name);
+
+/* Non-zero if the calling CPU holds `rw` for writing. */
+int  krw_wowned(rwlock_t *rw);
 void krw_rlock(rwlock_t *rw);
 void krw_runlock(rwlock_t *rw);
 void krw_wlock(rwlock_t *rw);

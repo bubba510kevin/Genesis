@@ -4,6 +4,8 @@
 #include "paging.h"
 #include "pmm.h"
 #include "ksmp.h"
+#include "kprintf.h"
+#include "timer.h"
 #include "typesk.h"
 
 #if !defined(__x86_64__)
@@ -81,7 +83,10 @@ __attribute__((aligned(4096))) static uint64 kernel_pd[PT_ENTRIES];
 __attribute__((aligned(4096))) static uint64 kernel_pt[KERNEL_PT_COUNT][PT_ENTRIES];
 
 static address_space_t kernel_space;
-static address_space_t *current_space = &kernel_space;
+/* The space loaded in CR3 is a property of a CPU: each runs its own thread,
+ * in its own process's space. Kept under the old name - every use below
+ * means "the one loaded HERE" - and resolved through the per-CPU block. */
+#define current_space (smp_this_cpu()->cur_space)
 
 static int physmap_ready;
 
@@ -96,23 +101,34 @@ static inline int is_canonical(virt_addr_t v) {
     return top == 0ULL || top == 0x1FFFFULL;
 }
 
-static void invlpg(virt_addr_t virt_addr) {
+static void invlpg_local(virt_addr_t virt_addr) {
     __asm__ volatile ("invlpg (%0)" : : "r"(virt_addr) : "memory");
+}
 
-    /* And on every OTHER CPU, synchronously.
-     *
-     * invlpg is a per-CPU instruction: it drops the translation from THIS
-     * core's TLB and says nothing to any other. The moment two CPUs can
-     * share an address space, a caller that unmaps a page and then frees the
-     * physical frame has handed that frame back to the allocator while
-     * another core still has a cached translation to it - which is silent
-     * memory corruption, not a fault.
-     *
-     * Put inside invlpg rather than at each call site on purpose: there are
-     * five, they are all correct today, and the one added next year would be
-     * the one that forgot. smp_tlb_shootdown returns immediately when only
-     * one CPU is online, so this costs nothing on a uniprocessor boot. */
-    smp_tlb_shootdown(virt_addr);
+/* Drop the translation for `virt_addr` in `as` from every TLB that can hold
+ * it, and return only when they all have.
+ *
+ * invlpg is a per-CPU instruction: it drops the translation from THIS core's
+ * TLB and says nothing to any other. With several CPUs running threads of one
+ * process, a caller that unmaps a page and frees the frame has otherwise
+ * handed that frame back while another core still translates to it - silent
+ * memory corruption, not a fault.
+ *
+ * WHICH CPUs is the whole question. The kernel half is shared by every
+ * space, so a change there can be cached on every CPU. A user address in
+ * `as` can be cached only where `as` is LOADED - without PCIDs, a CR3 load
+ * flushes every non-global entry, so a CPU that switched away holds nothing
+ * for it - and those are the CPUs asked. */
+static void tlb_invalidate(address_space_t *as, virt_addr_t virt_addr) {
+    if (virt_addr >= 0xFFFF800000000000ULL) {
+        invlpg_local(virt_addr);
+        smp_tlb_shootdown(virt_addr);
+        return;
+    }
+    if (as == current_space) {
+        invlpg_local(virt_addr);
+    }
+    smp_tlb_shootdown_space(as, virt_addr);
 }
 
 static void flush_tlb(void) {
@@ -380,6 +396,22 @@ void vmm_space_destroy(address_space_t *as) {
     if (as == current_space) {
         return;   /* would pull the tables out from under the running code */
     }
+    /* ...on ANY CPU. Every thread of the space has left its CPU before its
+     * slot can be freed (process.h's oncpu), and switching away loads the
+     * next thread's space, so this should never trip - which is exactly why
+     * it is checked rather than assumed: the alternative is a CPU walking
+     * freed page tables. */
+    {
+        int c;
+
+        for (c = 0; c < smp_cpu_count(); c++) {
+            if (smp_cpu(c)->cur_space == as) {
+                kprintf_c(0x0C, "vmm: refusing to destroy a space cpu%d has "
+                                "loaded\n", c);
+                return;
+            }
+        }
+    }
 
     pml4v = table_at(as->root);
 
@@ -559,7 +591,30 @@ address_space_t *vmm_space_clone(address_space_t *src) {
     if (src == current_space) {
         flush_tlb();
     }
+    /* And everywhere else it is loaded: a sibling THREAD of the forking one,
+     * running on another CPU, holds writable translations for pages that
+     * are copy-on-write as of now - a write through one would land in the
+     * frame the child shares. */
+    smp_tlb_shootdown_space(src, SMP_TLB_ALL);
     return dst;
+}
+
+/* "This CPU just handled a write fault on this page" - within the same
+ * tick. A retry after a stale-TLB flush comes back in microseconds; a
+ * genuine protection fault on a page resolved long ago must not be mistaken
+ * for one, and the tick bound is what separates them. */
+static void cow_fault_note(virt_addr_t addr) {
+    struct cpu_local *c = smp_this_cpu();
+
+    c->cow_last_addr = addr & ~0xFFFULL;
+    c->cow_last_tick = timer_ticks_now();
+}
+
+static int cow_fault_repeats(virt_addr_t addr) {
+    struct cpu_local *c = smp_this_cpu();
+
+    return c->cow_last_addr == (addr & ~0xFFFULL) &&
+           timer_ticks_now() - c->cow_last_tick <= 1;
 }
 
 int vmm_handle_write_fault(virt_addr_t addr, uint64 error_code) {
@@ -594,7 +649,25 @@ int vmm_handle_write_fault(virt_addr_t addr, uint64 error_code) {
     i1    = pt_index(addr);
     entry = ptv[i1];
 
+    if ((entry & PAGE_PRESENT) && (entry & PAGE_RW) && !(entry & PAGE_COW) &&
+        !(error_code & 0x8) &&
+        (!(error_code & 0x4) || (entry & PAGE_USER)) &&
+        !cow_fault_repeats(addr)) {
+        /* Already writable: another thread of this process, on another CPU,
+         * took the same copy-on-write fault first and resolved it, and this
+         * CPU's TLB still held the read-only entry (the resolver's shootdown
+         * crossed with this fault). Not a protection fault - drop the stale
+         * entry and let the write retry. */
+        /* Once. If this CPU faults on the same page again, the flush did not
+         * help and the fault is real - the guard is what keeps a genuine
+         * protection fault from becoming an endless fault-and-retry. */
+        cow_fault_note(addr);
+        invlpg_local(addr);
+        return 1;
+    }
+    cow_fault_note(addr);
     if (!(entry & PAGE_PRESENT) || !(entry & PAGE_COW) || (entry & PAGE_RW)) {
+        smp_this_cpu()->cow_last_addr = 0;
         return 0;   /* not a shared page - a real protection fault */
     }
 
@@ -606,7 +679,7 @@ int vmm_handle_write_fault(virt_addr_t addr, uint64 error_code) {
      */
     if (pmm_frame_refs(old_frame) <= 1) {
         ptv[i1] = (entry | PAGE_RW) & ~(uint64)PAGE_COW;
-        invlpg(addr);
+        tlb_invalidate(as, addr);
         return 1;
     }
 
@@ -631,7 +704,7 @@ int vmm_handle_write_fault(virt_addr_t addr, uint64 error_code) {
     ptv[i1] = (new_frame & ADDR_MASK)
             | ((entry & (0xFFFULL | PAGE_NX)) & ~(uint64)PAGE_COW)
             | PAGE_RW | PAGE_PRESENT;
-    invlpg(addr);
+    tlb_invalidate(as, addr);
 
     /* One fewer sharer of the original. This never frees it - the refcount
      * was above one to get here - but it is what lets the LAST sharer take
@@ -733,15 +806,8 @@ static int ensure_table(uint64 *table, uint64 index, uint64 flags, uint64 **out_
  * be reaped, and the parent to vfork again reusing the same slot - which is
  * ordinary shell behaviour and is why it eventually showed up.
  */
-static int needs_local_flush(address_space_t *as, virt_addr_t virt_addr) {
-    if (as == current_space) {
-        return 1;
-    }
-    /* The kernel half. Canonical-high addresses are shared by construction -
-     * see the PML4 slot comments in paging.h. */
-    return virt_addr >= 0xFFFF800000000000ULL;
-}
-
+/* (needs_local_flush answered "does THIS CPU need to flush" and is
+ * subsumed by tlb_invalidate, which answers "which CPUs do", above.) */
 int vmm_map_page_in(address_space_t *as, virt_addr_t virt_addr,
                     phys_addr_t phys_addr, uint64 flags) {
     uint64 *pml4v, *pdptv, *pdv, *ptv;
@@ -769,9 +835,7 @@ int vmm_map_page_in(address_space_t *as, virt_addr_t virt_addr,
     /* invlpg acts on whatever is loaded, so flushing for a user space that
      * is NOT loaded would evict an unrelated translation - but the kernel
      * half is shared and must always be flushed. See needs_local_flush. */
-    if (needs_local_flush(as, virt_addr)) {
-        invlpg(virt_addr);
-    }
+    tlb_invalidate(as, virt_addr);
     return 1;
 }
 
@@ -809,9 +873,7 @@ void vmm_unmap_page_in(address_space_t *as, virt_addr_t virt_addr, int free_fram
 
     frame = ptv[i1] & ADDR_MASK;
     ptv[i1] = 0;
-    if (needs_local_flush(as, virt_addr)) {
-        invlpg(virt_addr);
-    }
+    tlb_invalidate(as, virt_addr);
     if (free_frame) {
         pmm_free_frame(frame);
     }
