@@ -17,13 +17,6 @@ HANDLE WINAPI CreateThread(LPVOID security, SIZE_T stack_size,
 
     (void)security;                 /* no inheritable handles yet */
 
-    /* CREATE_SUSPENDED is refused rather than ignored: a program that asks
-     * for it is about to fill something in before ResumeThread, and a thread
-     * that is already running would race it. There is no ResumeThread. */
-    if (flags & CREATE_SUSPENDED) {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-        return NULL_PTR;
-    }
     if (start == NULL_PTR) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL_PTR;
@@ -32,9 +25,12 @@ HANDLE WINAPI CreateThread(LPVOID security, SIZE_T stack_size,
     /* STACK_SIZE_PARAM_IS_A_RESERVATION changes what the number means on
      * Windows (reserve vs commit). Here every stack is committed up front,
      * so both readings ask for the same thing. */
+    /* CREATE_SUSPENDED is Win32's 0x4; the native flag is 0x1. */
     st = NtCreateThreadEx(&h, THREAD_ALL_ACCESS, NULL_PTR, NtCurrentProcess(),
-                          (PVOID)start, parameter, 0, 0, stack_size, 0,
-                          NULL_PTR);
+                          (PVOID)start, parameter,
+                          (flags & CREATE_SUSPENDED)
+                              ? THREAD_CREATE_FLAGS_CREATE_SUSPENDED : 0,
+                          0, stack_size, 0, NULL_PTR);
     if (!NT_SUCCESS(st)) {
         k32_set_error_from_status(st);
         return NULL_PTR;
@@ -102,6 +98,41 @@ BOOL WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code) {
     return 1;
 }
 
+/* Wherever the thread is, it stops for good, with `code` as its exit code.
+ * Whatever it was halfway through changing stays half-changed - which is
+ * why this is a last resort on Windows too. Mutexes it held are abandoned. */
+BOOL WINAPI TerminateThread(HANDLE thread, DWORD code) {
+    NTSTATUS st = NtTerminateThread(thread, (NTSTATUS)code);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
+}
+
+DWORD WINAPI SuspendThread(HANDLE thread) {
+    DWORD prev = 0;
+    NTSTATUS st = NtSuspendThread(thread, &prev);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return (DWORD)-1;
+    }
+    return prev;
+}
+
+DWORD WINAPI ResumeThread(HANDLE thread) {
+    DWORD prev = 0;
+    NTSTATUS st = NtResumeThread(thread, &prev);
+
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return (DWORD)-1;
+    }
+    return prev;
+}
+
 DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
     LARGE_INTEGER timeout;
     NTSTATUS st;
@@ -116,9 +147,53 @@ DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
     if (st == STATUS_SUCCESS) {
         return WAIT_OBJECT_0;
     }
+    if (st == STATUS_ABANDONED_WAIT_0) {
+        /* The caller owns the mutex now - the previous owner died with it. */
+        return WAIT_ABANDONED;
+    }
     if (st == STATUS_TIMEOUT) {
         return WAIT_TIMEOUT;
     }
     k32_set_error_from_status(st);
     return WAIT_FAILED;
+}
+
+/* --- mutexes ----------------------------------------------------------- */
+
+HANDLE WINAPI CreateMutexW(LPVOID security, BOOL initial_owner, LPCWSTR name) {
+    HANDLE h = NULL_PTR;
+    NTSTATUS st;
+
+    (void)security;                 /* no inheritable handles yet */
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    st = NtCreateMutant(&h, MUTANT_ALL_ACCESS, NULL_PTR,
+                        initial_owner ? 1 : 0);
+    if (!NT_SUCCESS(st)) {
+        k32_set_error_from_status(st);
+        return NULL_PTR;
+    }
+    SetLastError(ERROR_SUCCESS);    /* not ERROR_ALREADY_EXISTS: it is new */
+    return h;
+}
+
+HANDLE WINAPI CreateMutexA(LPVOID security, BOOL initial_owner, LPCSTR name) {
+    if (name != NULL_PTR) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return NULL_PTR;
+    }
+    return CreateMutexW(security, initial_owner, NULL_PTR);
+}
+
+BOOL WINAPI ReleaseMutex(HANDLE mutex) {
+    NTSTATUS st = NtReleaseMutant(mutex, NULL_PTR);
+
+    if (!NT_SUCCESS(st)) {
+        /* STATUS_MUTANT_NOT_OWNED - the caller does not hold it. */
+        k32_set_error_from_status(st);
+        return 0;
+    }
+    return 1;
 }

@@ -82,9 +82,9 @@ struct syscall_frame;
  *
  * Eleven arguments, seven of them on the stack. ProcessHandle must be
  * NtCurrentProcess() - another process's threads need NtCreateProcess, which
- * does not exist - and CreateFlags may not ask for THREAD_CREATE_FLAGS_
- * CREATE_SUSPENDED, since there is no NtResumeThread to undo it; both are
- * STATUS_NOT_IMPLEMENTED, not silently ignored.
+ * does not exist - and that is STATUS_NOT_IMPLEMENTED, not silently ignored.
+ * THREAD_CREATE_FLAGS_CREATE_SUSPENDED makes a thread with a suspend count
+ * of 1 that is not put on any run queue until NtResumeThread.
  *
  * The new thread starts in ntdll!RtlUserThreadStart, as on NT, with a
  * private TEB (GS:0 is its own, so GetCurrentThreadId and GetLastError are
@@ -95,11 +95,16 @@ struct syscall_frame;
  * RDX and Argument in R8 instead. */
 #define NT_SYS_CREATE_THREAD      0x12
 
-/* NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus). Only the calling
- * thread (NtCurrentThread(), or a handle to itself) - terminating ANOTHER
- * thread asynchronously is the one thread operation even Microsoft's own
- * documentation says never to use, and doing it safely here would need the
- * APC machinery (14(b)). STATUS_NOT_IMPLEMENTED for anything else. */
+/* NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus). The calling
+ * thread (NtCurrentThread(), or a handle to itself) exits the ordinary way.
+ * ANOTHER thread of this process is retired from outside, like a thread
+ * killed by exit_group: wherever it is - ring 3 on another CPU, blocked in a
+ * wait, suspended, not yet started - it never runs another instruction, its
+ * handle is signalled with the full 32-bit ExitStatus, and mutants it held
+ * are abandoned. That is what TerminateThread does on Windows too, and is
+ * why Microsoft's documentation says never to use it: whatever user-mode
+ * state the thread was halfway through changing stays half-changed. A thread
+ * that has already exited is STATUS_THREAD_IS_TERMINATING. */
 #define NT_SYS_TERMINATE_THREAD   0x13
 
 /* NtQueryInformationThread(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG)
@@ -156,6 +161,20 @@ struct syscall_frame;
  * address-keyed waiting itself is ntdll's (RtlWaitOnAddress). */
 #define NT_SYS_WAIT_ALERT_BY_TID     0x20
 #define NT_SYS_ALERT_BY_TID          0x21
+
+/* NtSuspendThread(HANDLE Thread, PULONG PreviousSuspendCount)
+ * NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
+ *
+ * A counted suspension, in the calling process. Suspend raises the count
+ * (STATUS_SUSPEND_COUNT_EXCEEDED past 127) and the thread stops before its
+ * next instruction in ring 3: at once if it is in the kernel or blocked,
+ * after a kick if it is running on another CPU, and on the way out of this
+ * very call for NtCurrentThread(). Resume lowers it and lets the thread go
+ * at 0. Both report the count as it was BEFORE the call - which is how
+ * ResumeThread tells "resumed" (1) from "was not suspended" (0). */
+#define NT_SYS_SUSPEND_THREAD        0x22
+#define NT_SYS_RESUME_THREAD         0x23
+#define NT_MAXIMUM_SUSPEND_COUNT     127
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -260,6 +279,9 @@ struct syscall_frame;
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035u
 #define STATUS_OBJECT_TYPE_MISMATCH  0xC0000024u
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
+#define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
+#define STATUS_THREAD_IS_TERMINATING  0xC000004Bu
+#define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 
 /* EVENT_TYPE. Upstream's spelling and upstream's values: the difference is
  * visible to a waiter, so a program that passes the wrong one gets a

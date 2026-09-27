@@ -323,7 +323,8 @@ static int wants_kernel(struct cpu_local *c) {
 
     return c->resched || smp_deferred_pending() ||
            (me != NULL && !me->is_kthread &&
-            (me->state == PROC_ZOMBIE || signal_pending(me)));
+            (me->state == PROC_ZOMBIE || signal_pending(me) ||
+             me->nt_suspend_count > 0));
 }
 
 /* A signal that arrives while its target is in ring 3 on another CPU used

@@ -34,20 +34,20 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
 - **Win32 synchronisation**: critical sections, SRW locks, condition
   variables, `WaitOnAddress` — all block in the kernel
   (`NtWaitForAlertByThreadId`, NT syscalls 0x20/0x21).
+- **Win32 thread control** (item 14(a), all but the table size): mutexes
+  (`CreateMutexW`, `ReleaseMutex`) with **abandonment** (`WAIT_ABANDONED` when
+  the owner dies), `CREATE_SUSPENDED` / `SuspendThread` / `ResumeThread`
+  (NT syscalls 0x22/0x23), and `TerminateThread` on another thread.
 - **Networking** (item 6): TCP + lo0, Linux-ABI sockets, **DHCP** with renewal.
 - **gnfs v2**: big files, rename, snapshots; ZFS removed.
 
 ## What needs to be done now, in order
 
 ### 1. Finish item 14(a) — threads (small, self-contained)
-- **Mutant abandonment**: a mutex held by a thread that dies must be released
-  with `WAIT_ABANDONED` for the next waiter. The hook is `proc_nt_thread_exit`
-  (`kernel/proc/process.c`); mutant state is in `kernel/obj/dispatch.c`.
-- **`CREATE_SUSPENDED` / `ResumeThread` / `SuspendThread`**: `NtCreateThreadEx`
-  (`kernel/exec/nt.c`) ignores the flag today.
-- **`NtTerminateThread` on another thread** returns `STATUS_NOT_IMPLEMENTED`
-  (`kernel/exec/nt.c`); the killing-a-thread-on-another-CPU machinery already
-  exists for signals — reuse it.
+- **Named mutexes**: `CreateMutexW` refuses a name today, because the other
+  half of the named form (opening the existing one, `ERROR_ALREADY_EXISTS`,
+  `OpenMutexW`) has no kernel path. `NtOpenEvent` in `kernel/exec/nt.c` is
+  the pattern for an `NtOpenMutant`.
 - **MAX_PROCESSES = 64** (`kernel/include/process.h`) is shared by processes,
   threads, kthreads and idle threads. Real Win32 programs with thread pools
   will hit it; the table is scanned linearly by the scheduler, so raising it
@@ -80,6 +80,25 @@ Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
 (PS/2 first; USB later), user32, COM, comctl32, a shell. See item 14.
 
 ### Side work, smaller, any time
+- **An intermittent boot selftest failure, not yet explained**:
+  `irqbalance: selftest FAILED (1)` with "irq 11 placed on cpu1 but nothing
+  arrived there", about 1 boot in 4 under QEMU **TCG** (no KVM - seen in a
+  Linux cloud container; not seen on the WSL machine). Evidence from one
+  instrumented failure: `net_ping` returned 0, line 11 took **no** interrupt
+  on any CPU within 100 ticks (`irq_delivered` 9 -> 9), its IOAPIC
+  destination was unchanged and the balancer had not moved anything. So
+  it is not a race with the rebalancing thread. Two leads: `if_re`'s filter
+  masks the NIC's IMR and leaves unmasking to a taskqueue task, so if that
+  task has not run yet the NIC raises nothing; or a level-triggered
+  interrupt was lost when `smp_irq_selftest` and then `irq_balance_start`
+  re-routed line 11 in quick succession. Do NOT fix it by re-pinging in the
+  test. Find where the interrupt went.
+- **Hardening done alongside 14(a), not covered by a test** (each is a race
+  ring 3 cannot reliably provoke): `signal_send` does not wake a parked
+  (suspended) thread; NtSuspendThread dequeues a READY thread directly; a
+  thread killed while waiting for the big kernel lock no longer runs the
+  syscall it was entering (`syscall_dispatch`); `proc_nt_thread_exit` leaves
+  the unmap of a thread still running on another CPU to `proc_free`.
 - **SMP**: split the big kernel lock **only when something measures it** (the
   `bkl waited` counter and lock_report show contention). No NUMA/hotplug/SMT.
 - **Networking**: IPv6; `SCM_RIGHTS`; a DNS resolver in userland (the DHCP
@@ -107,7 +126,14 @@ Registry (advapi32), framebuffer display (VESA), gdi32, a mouse driver
 
 ## How to build and verify
 
-Everything builds and runs in WSL (Debian) against this working copy:
+Everything builds and runs in WSL (Debian) against this working copy
+(`build/b.sh` is a local wrapper and is not in git - `python3 build.py all`
+does the same). On a bare Linux box - a cloud container, say - the tools are
+`apt-get install nasm qemu-system-x86 gcc-mingw-w64-x86-64 musl-tools
+dosfstools mtools`, and each line below is the part in quotes, run from the
+repository root. Rebuilding changes the committed binaries under `root/`
+and `src/` whenever the toolchain version differs; commit only those whose
+source changed.
 ```
 wsl bash build/b.sh                                   # kernel -> build/kernel.elf
 wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && sh tools/build_user.sh"   # all user programs and DLLs
@@ -125,7 +151,7 @@ subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
 | `systest` | 510 passed | 507 passed |
-| `thr` (`thr.exe`) | 16 passed | 16 passed |
+| `thr` (`thr.exe`) | 45 passed | 45 passed |
 | `smp` (`smp.exe`) | 61 passed | 57 passed |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
 | boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, no `FAILED` | same |

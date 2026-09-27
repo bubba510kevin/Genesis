@@ -30,6 +30,8 @@ EXPORTS
     NtCreateThreadEx
     NtTerminateThread
     NtQueryInformationThread
+    NtSuspendThread
+    NtResumeThread
 ; --- the machine, processes and scheduling ---
     NtQuerySystemInformation
     NtQuerySystemInformationEx

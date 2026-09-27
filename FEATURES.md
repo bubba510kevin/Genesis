@@ -296,8 +296,19 @@ initialised template, plus TLS callbacks for `DLL_PROCESS_ATTACH`,
 `DLL_THREAD_ATTACH/DETACH` and `DLL_PROCESS_DETACH`. `TlsFree` clears the slot
 in every thread, as Windows does.
 
-**Not yet:** `CREATE_SUSPENDED`/`ResumeThread`, terminating *another* thread,
-and marking a mutex *abandoned* when its owner thread dies.
+**Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
+`ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
+released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.
+
+**Suspension ✅** (2026-09-27): `CREATE_SUSPENDED`, `SuspendThread` and
+`ResumeThread` (counted, up to 127), including a thread suspending itself
+and one spinning in ring 3 on another CPU.
+
+**`TerminateThread` ✅** (2026-09-27) on another thread of the process,
+wherever it is: running on another CPU, blocked in a wait, or suspended.
+Mutexes it held are abandoned.
+
+**Not yet:** named mutexes (`OpenMutex`).
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used
@@ -507,7 +518,7 @@ Every structure offset is checked at build time against the documented ABI.
 | Area | Calls |
 |---|---|
 | Process | `NtTerminateProcess`, `NtQueryInformationProcess` (basic info, affinity, times, priority class), `NtSetInformationProcess` (affinity, priority class) |
-| Threads | `NtCreateThreadEx`, `NtTerminateThread`, `NtQueryInformationThread` (basic, times, priorities, group affinity, ideal processor), `NtSetInformationThread` (affinity, group affinity, ideal processor, priorities) |
+| Threads | `NtCreateThreadEx`, `NtTerminateThread` (self or another thread), `NtSuspendThread`, `NtResumeThread`, `NtQueryInformationThread` (basic, times, priorities, group affinity, ideal processor), `NtSetInformationThread` (affinity, group affinity, ideal processor, priorities) |
 | System | `NtQuerySystemInformation(Ex)` (basic info, processor info, per-CPU performance, logical-processor information in both forms) |
 | Scheduling & time | `NtYieldExecution`, `NtDelayExecution`, `NtGetCurrentProcessorNumber(Ex)`, `NtQueryPerformanceCounter` (the calibrated TSC), `NtQuerySystemTime` |
 | Files | `NtOpenFile`, `NtReadFile`, `NtWriteFile`, `NtClose` |

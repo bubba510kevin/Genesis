@@ -312,7 +312,12 @@ int ob_poll(object_t *obj, int events);
  * it can do something sensible. Blocking forever instead would be the same
  * answer delivered as a hang.
  *
- * `deadline` is absolute ticks; 0 waits indefinitely. */
+ * `deadline` is absolute ticks; 0 waits indefinitely.
+ *
+ * 0 on success. 1 is ALSO success, and means the object was a mutant whose
+ * previous owner died holding it - it is now the caller's, but whatever it
+ * guards may be half-updated. NT's WAIT_ABANDONED; see
+ * dispatch_owner_exited. */
 int ob_wait(object_t *obj, uint64 deadline);
 
 /* Signal `obj`. `op` is an ob_signal_op_t; `count` is a semaphore's release

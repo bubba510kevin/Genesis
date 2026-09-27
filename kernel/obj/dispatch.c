@@ -44,9 +44,12 @@ typedef struct dispatcher {
     int64        limit;
 
     /* Mutant. `owner` is a pid, 0 for unowned; `depth` is the recursion
-     * count, which is what makes this not a semaphore of one. */
+     * count, which is what makes this not a semaphore of one. `abandoned`
+     * is set when the owner died holding it (dispatch_owner_exited) and is
+     * cleared by the next take, which is told so - WAIT_ABANDONED. */
     int          owner;
     int          depth;
+    int          abandoned;
 
     /* Thread. `signalled` (shared with Event) is "has exited"; these two
      * are what NtQueryInformationThread reports - the tid, and the full
@@ -78,6 +81,7 @@ static dispatcher_t *disp_alloc(disp_kind_t kind) {
             d->limit     = 0;
             d->owner     = 0;
             d->depth     = 0;
+            d->abandoned = 0;
             d->tid       = 0;
             d->exit_code = 0;
             waitq_init(&d->q);
@@ -123,8 +127,12 @@ static int disp_ready(const dispatcher_t *d, int who) {
  * Called only when disp_ready said yes AND with interrupts disabled, so that
  * nothing can slip between the test and the take. That pairing is the whole
  * reason wait cannot be built out of poll: the gap between asking and taking
- * is exactly where another waiter gets there first. */
-static void disp_consume(dispatcher_t *d, int who) {
+ * is exactly where another waiter gets there first.
+ *
+ * Returns 1 when the take was of an ABANDONED mutant, 0 otherwise. */
+static int disp_consume(dispatcher_t *d, int who) {
+    int abandoned = 0;
+
     switch (d->kind) {
     case D_EVENT:
         /* A notification event stays set - that is what "notification" means,
@@ -139,6 +147,12 @@ static void disp_consume(dispatcher_t *d, int who) {
         d->count--;
         break;
     case D_MUTANT:
+        /* Told once. The thread that inherits an abandoned mutant is the one
+         * that has to decide whether what it protects is still consistent;
+         * the one after that inherits it from a live owner and is told
+         * nothing, because nothing happened to it. */
+        abandoned = d->abandoned;
+        d->abandoned = 0;
         d->owner = who;
         d->depth++;
         break;
@@ -148,6 +162,7 @@ static void disp_consume(dispatcher_t *d, int who) {
          * one. */
         break;
     }
+    return abandoned;
 }
 
 /* --- the wait ------------------------------------------------------------ */
@@ -201,9 +216,9 @@ static int disp_wait(object_t *obj, uint64 deadline) {
          * same permit. Testing here instead means the object is consumed
          * before anything else runs. */
         if (disp_ready(d, ctx.who)) {
-            disp_consume(d, ctx.who);
+            rc = disp_consume(d, ctx.who);
             intr_restore(flags);
-            return 0;
+            return rc;                      /* 0, or 1 for WAIT_ABANDONED */
         }
 
         rc = waitq_wait_until(&d->q, wait_ready, &ctx, deadline);
@@ -443,6 +458,35 @@ object_t *mutant_create(int owned) {
         d->in_use = 0;
     }
     return obj;
+}
+
+/* --- an owner that dies ------------------------------------------------- */
+
+void dispatch_owner_exited(int pid) {
+    uint64 flags;
+    int i;
+
+    if (pid == 0) {
+        return;                             /* 0 is "unowned", not a pid */
+    }
+    flags = intr_disable();
+    for (i = 0; i < DISPATCH_MAX; i++) {
+        dispatcher_t *d = &disp_pool[i];
+
+        if (!d->in_use || d->kind != D_MUTANT || d->owner != pid) {
+            continue;
+        }
+        /* Released whatever the depth: nobody is left to make the other
+         * releases. Not released SILENTLY - a lock whose holder died
+         * mid-update guards data in whatever state it was left, and handing
+         * it on as though it had been released properly is how that data
+         * gets trusted. So it is marked, and the next owner is told. */
+        d->owner     = 0;
+        d->depth     = 0;
+        d->abandoned = 1;
+        waitq_wake_all(&d->q);
+    }
+    intr_restore(flags);
 }
 
 /* --- threads ------------------------------------------------------------- */

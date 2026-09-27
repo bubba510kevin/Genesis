@@ -1088,6 +1088,51 @@ static uint64 nt_alert_by_tid(uint64 tid) {
     return STATUS_SUCCESS;
 }
 
+/* --- suspend and resume ------------------------------------------------------------ */
+
+static uint64 nt_suspend_resume(uint64 handle, uint64 prev_ptr, int suspend) {
+    process_t *t = thread_of_handle(handle);
+    int prev;
+
+    if (t == NULL || t->is_kthread) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (prev_ptr != 0 && !range_ok(prev_ptr, 4)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    prev = t->nt_suspend_count;
+    if (suspend) {
+        if (prev >= NT_MAXIMUM_SUSPEND_COUNT) {
+            return STATUS_SUSPEND_COUNT_EXCEEDED;
+        }
+        t->nt_suspend_count = prev + 1;
+        if (t != proc_current() && t->state == PROC_READY && !t->oncpu) {
+            /* Waiting for a CPU: taken off the run queue here and now. Not
+             * left to return_to_user, because a thread that has never run
+             * does not pass through it - its first switch lands straight in
+             * syscall_return and ring 3. */
+            sched_dequeue(t);
+            t->state     = PROC_BLOCKED;
+            t->nt_parked = 1;
+        } else {
+            /* Running in ring 3 on another CPU: make that CPU enter the
+             * kernel, where return_to_user parks it. Blocked, or this thread
+             * itself: it parks the next time it heads for ring 3. */
+            sched_poke(t);
+        }
+    } else if (prev > 0) {
+        t->nt_suspend_count = prev - 1;
+        if (prev == 1 && t->nt_parked) {
+            t->nt_parked = 0;
+            sched_wake(t);
+        }
+    }
+    if (prev_ptr != 0) {
+        *(uint32 *)prev_ptr = (uint32)prev;
+    }
+    return STATUS_SUCCESS;
+}
+
 /* --- dispatch ----------------------------------------------------------------------- */
 
 uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
@@ -1129,6 +1174,10 @@ uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
         return nt_wait_for_alert(frame->r10, frame->rdx);
     case NT_SYS_ALERT_BY_TID:
         return nt_alert_by_tid(frame->r10);
+    case NT_SYS_SUSPEND_THREAD:
+        return nt_suspend_resume(frame->r10, frame->rdx, 1);
+    case NT_SYS_RESUME_THREAD:
+        return nt_suspend_resume(frame->r10, frame->rdx, 0);
     default:
         *handled = 0;
         return 0;

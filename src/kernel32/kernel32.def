@@ -51,7 +51,13 @@ EXPORTS
     GetCurrentThreadId
     GetThreadId
     GetExitCodeThread
+    SuspendThread
+    TerminateThread
+    ResumeThread
     WaitForSingleObject
+    CreateMutexW
+    CreateMutexA
+    ReleaseMutex
 ; --- processors, affinity, priorities, time (sysinfo.c) ---
     GetSystemInfo
     GetNativeSystemInfo

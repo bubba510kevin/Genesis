@@ -5836,6 +5836,16 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
     bkl_acquire();
     smp_this_cpu()->user_entries++;
 
+    /* Killed while it waited for the lock - by exit_group, a fatal signal or
+     * NtTerminateThread on another CPU. The call it was making must not run:
+     * a terminated thread's last WriteFile going out anyway is exactly what
+     * "terminated" rules out. return_to_user switches away from a zombie
+     * for good. */
+    if (proc_current() != NULL && proc_current()->state == PROC_ZOMBIE) {
+        return_to_user(1);
+        return 0;                       /* not reached */
+    }
+
     /* The fork in the road, taken once per syscall. Everything below this
      * line is personality-independent: signals, preemption and the return to
      * user mode work the same whichever ABI made the call. */

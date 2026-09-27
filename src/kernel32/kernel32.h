@@ -107,6 +107,8 @@ typedef DWORD *LPDWORD;
 #define ERROR_GEN_FAILURE          31u
 #define ERROR_TIMEOUT            1460u
 #define ERROR_NO_MORE_ITEMS       259u
+#define ERROR_NOT_OWNER           288u
+#define ERROR_SIGNAL_REFUSED      156u
 
 /* CreateFile dispositions. Only OPEN_EXISTING is honoured; the rest are
  * declared so a caller's constant means what it says when it is refused. */
@@ -129,6 +131,7 @@ typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID parameter);
 #define STILL_ACTIVE         0x00000103u
 #define INFINITE             0xFFFFFFFFu
 #define WAIT_OBJECT_0        0x00000000u
+#define WAIT_ABANDONED       0x00000080u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
 
@@ -187,7 +190,19 @@ HANDLE WINAPI GetCurrentThread(void);
 DWORD  WINAPI GetCurrentThreadId(void);
 DWORD  WINAPI GetThreadId(HANDLE thread);
 BOOL   WINAPI GetExitCodeThread(HANDLE thread, LPDWORD code);
+/* The previous suspend count, or (DWORD)-1 on failure. */
+DWORD  WINAPI SuspendThread(HANDLE thread);
+BOOL   WINAPI TerminateThread(HANDLE thread, DWORD code);
+DWORD  WINAPI ResumeThread(HANDLE thread);
 DWORD  WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
+
+/* Mutexes (thread.c). Unnamed only for now: a name is refused with
+ * ERROR_CALL_NOT_IMPLEMENTED rather than half-supported, because the named
+ * form's other half - opening the existing one, ERROR_ALREADY_EXISTS - has
+ * no kernel path yet. */
+HANDLE WINAPI CreateMutexW(LPVOID security, BOOL initial_owner, LPCWSTR name);
+HANDLE WINAPI CreateMutexA(LPVOID security, BOOL initial_owner, LPCSTR name);
+BOOL   WINAPI ReleaseMutex(HANDLE mutex);
 
 /* --- shared internals ---------------------------------------------------- */
 

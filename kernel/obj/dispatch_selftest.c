@@ -59,6 +59,20 @@ static int check(int cond, const char *what, int *failures) {
         }                                                           \
 } while (0)
 
+/* --- a thread that dies holding a mutant --------------------------------- */
+
+static object_t     *abandon_mutant;
+static volatile int  abandon_taken;
+
+static void abandoner_thread(void *arg) {
+    (void)arg;
+    /* Taken twice, so the abandonment has a recursion depth to discard. */
+    (void)ob_wait(abandon_mutant, 0);
+    (void)ob_wait(abandon_mutant, 0);
+    abandon_taken = 1;
+    /* ...and returns without releasing either: kthread_exit. */
+}
+
 /* --- the second context -------------------------------------------------- */
 
 static volatile int  opener_stage;      /* 0 -> 1 (about to wait) -> 2 (woke) */
@@ -203,6 +217,41 @@ int dispatch_selftest(void) {
             check(ob_signal(m, OB_SIG_SET, 1, NULL) == -1,
                   "a third release is -EPERM - it is not held any more",
                   &failures);
+        }
+    }
+
+    /* --- 4b. mutant abandoned by a thread that died holding it --------- */
+    {
+        object_t *m = mutant_create(0);
+
+        if (check(m != NULL, "a mutant for the abandonment case", &failures)) {
+            process_t *t;
+
+            abandon_mutant = m;
+            abandon_taken  = 0;
+            t = kthread_create(abandoner_thread, NULL, "disp-abandon");
+            check(t != NULL, "a thread to abandon it can be started",
+                  &failures);
+            WAIT_UNTIL(abandon_taken);
+            check(abandon_taken, "which takes it twice", &failures);
+            /* Blocking, not a poll: the owner may still be between its
+             * second take and its exit. The exit is what releases this. */
+            /* Every wait from here on is bounded. If abandonment is broken
+             * the dead thread owns this mutant forever, and an unbounded
+             * wait would turn a failed check into a boot that never ends. */
+            if (check(ob_wait(m, timer_ticks_now() + WAIT_TICKS) == 1,
+                      "its death hands the mutant on as ABANDONED (1, not 0)",
+                      &failures)) {
+                check(ob_wait(m, timer_ticks_now() + SHORT_TICKS) == 0,
+                      "and the new owner's recursive take is an ordinary one "
+                      "- the mark is reported once", &failures);
+                check(ob_signal(m, OB_SIG_SET, 1, NULL) == 0 &&
+                      ob_signal(m, OB_SIG_SET, 1, NULL) == 0 &&
+                      ob_signal(m, OB_SIG_SET, 1, NULL) == -1,
+                      "released twice by the new owner, and no more - the "
+                      "dead owner's depth of two went with it", &failures);
+            }
+            ob_deref(m);
         }
     }
 

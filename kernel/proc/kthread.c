@@ -1,3 +1,4 @@
+#include "dispatch.h"
 #include "kprintf.h"
 #include "ksleep.h"
 #include "kstack.h"
@@ -245,6 +246,9 @@ void kthread_exit(void) {
          * below can schedule, and the window where a dead thread is still on
          * a queue is exactly the window something can wake it. */
         waitq_leave(me);
+        /* Mutants it still holds are abandoned now; the reaper's
+         * proc_free would get there too, but only when it next runs. */
+        dispatch_owner_exited(me->pid);
         if (me->owns_files) {
             handle_close_all(me->handles);
         }

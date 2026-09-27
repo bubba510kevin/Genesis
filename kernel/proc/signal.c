@@ -43,7 +43,10 @@ void signal_send(struct process *p, int signo) {
     /* Waking a blocked process is what makes a signal interrupt a read.
      * Delivery does not happen here - this may be an interrupt handler, and
      * there is no user context to rewrite from one. */
-    if (p->state == PROC_BLOCKED) {
+    if (p->state == PROC_BLOCKED && !p->nt_parked) {
+        /* Not a SUSPENDED thread: return_to_user would only park it again,
+         * and one created suspended has not run yet - waking it would start
+         * it, which only NtResumeThread may do. */
         sched_wake(p);
     } else if (p->state == PROC_RUNNING && p->oncpu) {
         /* Running in ring 3 on another CPU: it would not look at its pending

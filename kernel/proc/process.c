@@ -444,6 +444,8 @@ process_t *proc_alloc(int ppid) {
             p->nt_tls_va       = 0;
             p->nt_tls_pages    = 0;
             p->nt_alerted      = 0;
+            p->nt_suspend_count = 0;
+            p->nt_parked       = 0;
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
@@ -592,6 +594,10 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
     if (p == NULL) {
         return;
     }
+    /* Mutexes it still holds are abandoned now, not when the slot is
+     * reaped: a thread blocked on one must not wait for a reaper. Any
+     * thread, not only NT ones - kernel code takes mutants too. */
+    dispatch_owner_exited(p->pid);
     if (p->nt_thread_obj != NULL) {
         thread_object_record_cpu(p->nt_thread_obj, p->cpu_ticks);
         thread_object_exited(p->nt_thread_obj, exit_code);
@@ -604,6 +610,14 @@ void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
      * has gone has nothing left to unmap. The thread itself is either not
      * running or running on its KERNEL stack, so nothing is still standing
      * on the user stack being taken away. */
+    /* Not while it is still RUNNING on another CPU - killed from outside
+     * (NtTerminateThread, exit_group) and not yet kicked off it. Its user
+     * code would fault on the pages going away and print a crash report for
+     * a thread that was simply terminated. Left for proc_free, which runs
+     * this again once the thread is off every CPU. */
+    if (p->oncpu && p != proc_current()) {
+        return;
+    }
     if (p->space != NULL && p->space != vmm_kernel_space()) {
         for (i = 0; i < p->nt_stack_pages; i++) {
             vmm_unmap_page_in(p->space, p->nt_stack_lo + i * 0x1000ULL,
