@@ -902,7 +902,7 @@ WHERE THIS STANDS RELATIVE TO EVERYTHING ELSE IN THIS FILE: every other item her
 
 The target: GNU bash (current upstream release), built by this tree and staged as /bin/bash, is the login shell - interactive, with readline line editing and history, job control (^Z, fg, bg, jobs), and its own test suite passing in the guest except for tests that are recorded as not applicable. What runs today is BusyBox's shell with no applets.
 
-HOW IT IS BUILT: from the upstream source tarball, unmodified in this phase, cross-compiled against musl the way BusyBox already is (tools/build_user.sh, musl-gcc) - static first, so nothing depends on the dynamic loader while the shell is being brought up; dynamic against the staged musl once that works (phase 4). readline and the termcap fallback are bash's own bundled copies (--with-installed-readline=no, --without-curses or a vendored ncurses), so no terminfo database is needed to start. The source is fetched and checksum-pinned by the build script, not committed, the same as vendsrc/.
+HOW IT IS BUILT: from the GNTbash repository (item 17), whose `upstream` branch is the unmodified release and whose genesis/build.sh does exactly this: cross-compiled against musl the way BusyBox already is (tools/build_user.sh, musl-gcc) - static first, so nothing depends on the dynamic loader while the shell is being brought up; dynamic against the staged musl once that works (phase 4). readline and the termcap fallback are bash's own bundled copies (--with-installed-readline=no, --without-curses or a vendored ncurses), so no terminfo database is needed to start. GNTbash's README records the tarball's SHA-256.
 
 WHAT IS MISSING UNDERNEATH, found by reading what bash and musl call - the list is the starting point, and the musl ptrace-trace method item 9 describes is how it is finished:
   (a) select and pselect6 - readline's input loop and `read -t` use them; there is poll/ppoll but no select at all.
@@ -951,9 +951,27 @@ NT 10.0 SIDE
 (s) SYSTEM INFORMATION. NtQuerySystemInformation's commonly used classes (process list, performance, processor, time of day, modules), NtQueryInformationProcess's, the KUSER_SHARED_DATA page (time, tick count, NT version fields that user mode reads directly - Windows 10 binaries check them), ETW's user-mode registration calls answered (succeed and discard is acceptable to start).
 
 
-17. BASH UNDERSTANDS WINDOWS - PHASE 3. NOT STARTED.
+17. BASH UNDERSTANDS WINDOWS - PHASE 3. STARTED 2026-09-27: GNTbash.
 
-Genesis's bash is upstream bash plus a patch series (src/bash/patches/, applied by the build), never a fork - so moving to a new bash release is re-applying patches, not merging. MSYS2's and Cygwin's bash patches solve the mirror-image problem (a POSIX shell on the Windows kernel) and are read first, borrowed where they apply. Everything below is switchable (a `shopt -s winmode`-style option, on by default for an interactive login), because a script written for Linux must see none of it.
+THE SHELL IS GNTbash, its own repository (github.com/bubba510kevin/GNTbash). It is not a patch directory inside this tree. It holds GNU bash 5.3 patch level 9 on branch `upstream` (tagged upstream/bash-5.3 and upstream/bash-5.3.9) and the Genesis commits on top of it on `main`, so moving to a new bash release is a rebase of those commits, not a merge. `git diff upstream main` is the whole change, and its README.md documents every rule below.
+
+DONE IN GNTbash (winmode and igncr, both shopt options; with both off it is upstream bash):
+  - (a) Drive-letter words: C:\x, "C:\Program Files\x" and name=C:\x, through the drive map GNTBASH_DRIVES (default C=/, which matches ntproc.c's /x -> C:\x); pwd -W.
+  - (b) PATHEXT and case-insensitive command search as a second pass after the exact one, so a Linux command is never shadowed.
+  - (c) The half that is the shell's: PE arguments that are POSIX paths are converted, with GNTBASH_NOCONV as the escape hatch.
+  - (d) The PE environment, filled in, de-duplicated case-insensitively and sorted.
+  - (e) CRLF scripts and sourced files (igncr), and .bat/.cmd handed to cmd.exe /c.
+  - (i) winpath, unixpath and where.
+Tested on a Linux host by tests/gntbash.tests, and each hook was mutation-checked. bash's own suite shows the same differences as unmodified bash. Built for Genesis by its genesis/build.sh: a static musl binary, 1.4MB stripped. SMOKE-TESTED ON GENESIS under QEMU. `bash -O winmode -c ...` ran: $BASH_VERSION, Genesis detected (igncr on by default), winpath /etc/motd -> C:\etc\motd, pwd -W -> C:\, command substitution, loops. Only one unimplemented syscall was hit: 0x61, getrlimit (item 15(b)). The binary is not staged yet; that waits on item 15.
+
+STILL OPEN, and not all of it is the shell's:
+  - (c) Exact command-line quoting belongs in the KERNEL (kernel/exec/ntproc.c joins argv and does not escape embedded quotes or backslashes the way CommandLineToArgvW undoes). Every launcher depends on it, not just bash.
+  - (f) The full exit code needs a kernel interface first.
+  - (g) Console control events need one too.
+  - (h) Completion of C:\ paths.
+  - (e) A cmd.exe for .bat files to run under.
+
+The original plan follows. MSYS2's and Cygwin's bash patches solve the mirror-image problem (a POSIX shell on the Windows kernel) and are read first, borrowed where they apply. Everything below is switchable (a `shopt -s winmode`-style option, on by default for an interactive login), because a script written for Linux must see none of it.
 
 (a) PATHS. C:\Windows\System32 and C:/Windows/System32 resolve: a drive letter maps to a volume through the object manager's \??\C: links (the namespace already has \??\; drive letters are assigned to volumes by volume.c), and /wsr is the system drive's tree per the /wsr layout decided earlier in this file. A backslash stays bash's escape character everywhere EXCEPT inside a word that starts with a drive-letter prefix or \\server\share, where it is a separator - the one rule that lets both kinds of script work. `cd C:\Users` works; `pwd -W` prints the Windows form.
 (b) RUNNING WINDOWS PROGRAMS BY BARE NAME. Command lookup tries PATHEXT (.COM;.EXE;.BAT;.CMD) after the bare name fails, and compares case-insensitively inside /wsr and on FAT/NTFS volumes (case-insensitive filesystems). `notepad` finds /wsr/Windows/System32/notepad.exe.

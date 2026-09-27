@@ -957,7 +957,7 @@ The work is organized into **four phases** (THE PLAN in `ROADMAP.md`):
 |---|---|---|---|
 | 1 | **Run GNU bash** as the login shell (readline, job control, its own test suite) | item 15 | ❌ BusyBox's shell runs today |
 | 2 | **A modern kernel**: the feature set of current Linux and of NT 10.0 (Windows 10/11) — syscalls, demand paging and a page cache, namespaces/cgroups, tmpfs/procfs/ext4, UEFI/ACPI/NVMe/USB, IPv6; NT's I/O manager, registry, tokens, ALPC, completion ports, and the ntoskrnl surface precompiled drivers import | item 16 (+ 4, 6, 9, 12b, 13, 14 kernel halves) | 🟡 a large base exists; the inventory is open |
-| 3 | **bash understands Windows**: drive-letter paths, `.exe`/`.bat` by bare name, Windows command lines and environment for PE children, CRLF scripts, NT exit codes, ^C as a console event | item 17 | ❌ |
+| 3 | **bash understands Windows**: drive-letter paths, `.exe`/`.bat` by bare name, Windows command lines and environment for PE children, CRLF scripts, NT exit codes, ^C as a console event | item 17 | 🟡 [GNTbash](https://github.com/bubba510kevin/GNTbash): paths, PATHEXT, PE argv/env, CRLF done; exit codes, console events and quoting need kernel work |
 | 4 | **The libraries**: non-GUI DLLs written by Genesis (loader, kernel32/kernelbase, C runtimes, advapi32, ws2_32, rpcrt4, COM); GUI DLLs and Linux GUI stacks **taken**, never written; Linux `.so` files from upstream | item 18 (+ 14 (e)-(o)) | 🟡 ntdll and kernel32 subsets |
 
 ROADMAP item 14's dependency-ordered list (its letters now fall under phases 2

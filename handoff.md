@@ -112,11 +112,16 @@ events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
 
-### Phase 3 — bash understands Windows (item 17)
-A patch series on upstream bash (MSYS2/Cygwin patches read first): drive-
-letter paths, `.exe`/`.bat` by bare name via PATHEXT, Windows command-line
-quoting and environment for PE children, CRLF scripts, the full 32-bit exit
-code in a variable, ^C as `CTRL_C_EVENT`.
+### Phase 3 — bash understands Windows (item 17) — started: GNTbash
+The shell is its own repository, **GNTbash**
+(github.com/bubba510kevin/GNTbash): bash 5.3.9 on branch `upstream`,
+Genesis commits on `main`. Done there: drive-letter paths, `pwd -W`, PATHEXT
+lookup, the PE argument vector and environment, `.bat` via `cmd.exe`, CRLF
+scripts (`igncr`), and `winpath`/`unixpath`/`where`. Its `genesis/build.sh`
+builds the static musl binary; it already runs under Genesis (only
+`getrlimit` is missing). Left: exact PE command-line quoting (a kernel fix
+in `kernel/exec/ntproc.c`), the full 32-bit exit code and console control
+events (both need kernel interfaces), completion, and a `cmd.exe`.
 
 ### Phase 4 — the libraries: major .so and DLLs (item 18; 14(e)-(o))
 Written (non-GUI): the loader (14(e): `LdrLoadDll`, search path, API sets,
