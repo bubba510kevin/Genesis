@@ -47,7 +47,7 @@ mkdir -p root/bin
 # function with no return statement. Nothing included it and it would not have
 # compiled if anything had. musl works; the stub was a placeholder for a
 # decision that has now been made the other way.
-for src in src/hello.c src/systest.c src/verif.c src/mkprobe.c; do
+for src in src/hello.c src/systest.c src/verif.c src/mkprobe.c src/fbtest.c; do
     [ -f "$src" ] || continue
     name=$(basename "$src" .c)
     # 8.3 on the FAT volume: names longer than eight characters are not

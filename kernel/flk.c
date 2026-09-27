@@ -17,7 +17,11 @@
 #include "gdt.h"
 #include "idt.h"
 #include "irq.h"
+#include "atkbdc.h"
+#include "fb.h"
 #include "keyboard.h"
+#include "mouse.h"
+#include "psm.h"
 #include "kheap.h"
 #include "kstack.h"
 #include "kthread.h"
@@ -507,6 +511,10 @@ void flk(void) {
     kbd_init();
     print_string("Keyboard ready\n", 0x0F);
 
+    /* The pointer event queue, for the same reason: empty before the first
+     * mouse interrupt can land in it. */
+    mouse_init();
+
     memory_map = e820_load();
     print_string("e820 memory map:\n", 0x0F);
     e820_report(memory_map, 0x07);
@@ -544,6 +552,12 @@ void flk(void) {
      * trusting its own hand-picked base constant not to collide with the
      * others by comment alone. Must run before any of those three. */
     kvm_init();
+
+    /* The framebuffer (ROADMAP item 14(h)), as soon as there is kernel VA to
+     * map it into - the bootloader already switched the screen to graphics,
+     * so until this runs the only visible log is serial. It moves the
+     * console onto the framebuffer and repaints what was printed so far. */
+    fb_init();
 
     /* No-execute, before anything maps a page that asks for it. Nothing here
      * depends on the answer - PAGE_NX is stripped rather than refused when
@@ -853,6 +867,18 @@ void flk(void) {
     dispatch_init();
     storage_init();
 
+    /* /dev/fb0 and /dev/mouse0 (ROADMAP items 14(h) and (j)), once there is
+     * a \Device\ to put them in. Then the PS/2 mouse: psm registers on
+     * the atkbdc devclass FIRST and atkbdc_init adds psm0 after, so the
+     * child is probed by the ordinary attach pass rather than by
+     * bus_driver_added. Before sti: configuring the mouse is polled I/O on
+     * the controller, and its interrupt is only switched on at the end of
+     * psm_attach. */
+    fb_register_device();
+    mouse_register_device();
+    psm_atkbdc_newbus_module_init();
+    atkbdc_init();
+
     dev_report();
     ns_report();
 
@@ -1084,6 +1110,13 @@ void flk(void) {
 
     idt_selftest();
     interrupt_report(0x0F);
+
+    /* The framebuffer and the mouse. After sti: the mouse test injects
+     * packets through the controller and waits for IRQ 12 to deliver them. */
+    fb_selftest();
+    fb_report(0x0F);
+    psm_selftest();
+    psm_report(0x0F);
 
     /* Last, and it does not return.
      *

@@ -3583,6 +3583,20 @@ static uint64 sys_ioctl(uint64 fd, uint64 request, uint64 arg) {
     if (f == NULL || f->obj == NULL) {
         return (uint64)-9;    /* -EBADF */
     }
+
+    /* KDSETMODE takes its argument BY VALUE (KD_TEXT is 0, KD_GRAPHICS 1),
+     * so it is answered before the pointer check below, which would call
+     * KD_GRAPHICS a bad address. Console only, like every terminal ioctl
+     * here. The owner is recorded so that a program which exits holding the
+     * display loses it - see screen_set_graphics. */
+    if (request == KDSETMODE && f->obj == tty_console()) {
+        if (arg != KD_TEXT && arg != KD_GRAPHICS) {
+            return (uint64)-22;
+        }
+        screen_set_graphics(arg == KD_GRAPHICS, proc->tgid);
+        return 0;
+    }
+
     if (arg != 0 && (arg < 0x1000ULL || arg >= 0x0000800000000000ULL)) {
         return (uint64)-14;   /* -EFAULT */
     }
@@ -3645,12 +3659,21 @@ static uint64 sys_ioctl(uint64 fd, uint64 request, uint64 arg) {
             tty_set_foreground_pgid(*(const int *)p);
             return 0;
 
+        case KDGETMODE:
+            if (arg == 0) {
+                return (uint64)-14;
+            }
+            *(int *)p = screen_graphics_owner() != 0 ? KD_GRAPHICS : KD_TEXT;
+            return 0;
+
         case TIOCGWINSZ:
             if (arg == 0) {
                 return (uint64)-14;
             }
-            *(uint16 *)(p + 0) = 25;   /* ws_row    */
-            *(uint16 *)(p + 2) = 80;   /* ws_col    */
+            /* The console's real grid: 80x25 in text mode, larger once it
+             * draws into a framebuffer. */
+            *(uint16 *)(p + 0) = (uint16)screen_height_chars();  /* ws_row */
+            *(uint16 *)(p + 2) = (uint16)screen_width_chars();   /* ws_col */
             *(uint16 *)(p + 4) = 0;    /* ws_xpixel */
             *(uint16 *)(p + 6) = 0;    /* ws_ypixel */
             return 0;
@@ -4212,15 +4235,102 @@ static uint64 sys_brk(uint64 addr) {
  * each personality's own file. */
 uint64 syscall_map_anonymous(uint64 addr, uint64 length, int fixed);
 
+/* --- mapping a device --------------------------------------------------
+ *
+ * mmap of a descriptor that names a DEVICE whose driver has an mmap slot -
+ * today /dev/fb0, the linear framebuffer (ROADMAP item 14(h)). Each page is
+ * the driver's own physical page, mapped straight into the caller, so the
+ * program writes video memory with no copy and no syscall per pixel. Regular
+ * files are still -ENODEV: there is no page cache to map them from.
+ *
+ * MAP_SHARED only. A private mapping of a device is copy-on-write of video
+ * memory - Linux allows it and it is never what a program drawing to a
+ * screen means - so it is refused rather than half-honoured. PROT_WRITE
+ * needs a descriptor opened for writing, as it does on Linux.
+ *
+ * The pages carry PAGE_DEVICE (paging.h): munmap and exit leave the frames
+ * alone, and fork shares them writable instead of copy-on-write. The whole
+ * range is validated with the driver BEFORE anything is mapped, so a request
+ * running past the end of the device fails cleanly instead of leaving half a
+ * mapping behind; dev_mmap is also what refuses an offset that is not page
+ * aligned. */
+static uint64 mmap_device(uint64 addr, uint64 length, uint64 prot,
+                          uint64 flags, uint64 fd, uint64 offset) {
+    process_t   *proc = proc_current();
+    open_file_t *f = handle_get(proc->handles, (int)fd);
+    device_t    *dev;
+    uint64 start, off, phys, cache, page_flags;
+    int rc;
+
+    if (f == NULL || f->obj == NULL) {
+        return (uint64)-9;                         /* -EBADF */
+    }
+    dev = dev_from_object(f->obj);
+    if (dev == NULL) {
+        return (uint64)-19;                        /* -ENODEV */
+    }
+    if ((flags & MAP_SHARED) == 0 || (flags & MAP_PRIVATE) != 0) {
+        return (uint64)-22;
+    }
+    if ((prot & PROT_WRITE) && !(f->access & ACCESS_WRITE)) {
+        return (uint64)-13;                        /* -EACCES */
+    }
+    if (prot & PROT_EXEC) {
+        return (uint64)-13;       /* executing video memory: no */
+    }
+
+    length = (length + 0xFFFULL) & ~0xFFFULL;
+    for (off = 0; off < length; off += PMM_PAGE_SIZE) {
+        rc = dev_mmap(dev, offset + off, &phys, &cache);
+        if (rc != 0) {
+            return (uint64)(int64)rc;
+        }
+    }
+
+    if ((flags & MAP_FIXED) && addr != 0) {
+        start = addr & ~0xFFFULL;
+    } else {
+        if (proc->mmap_next == 0) {
+            proc->mmap_next = USER_MMAP_BASE;
+        }
+        start = proc->mmap_next;
+        proc->mmap_next += length;
+    }
+    if (start < USER_MMAP_BASE || start + length > USER_MMAP_LIMIT) {
+        return (uint64)-12;
+    }
+
+    for (off = 0; off < length; off += PMM_PAGE_SIZE) {
+        (void)dev_mmap(dev, offset + off, &phys, &cache);
+        /* MAP_FIXED over something already there replaces it, which is
+         * what MAP_FIXED means; for an ordinary page the frame goes back. */
+        if (vmm_get_phys(start + off) != 0) {
+            vmm_unmap_page_free(start + off);
+        }
+        page_flags = PAGE_PRESENT | PAGE_USER | PAGE_NX | PAGE_DEVICE |
+                     (cache & (PAGE_PCD | PAGE_PWT));
+        if (prot & PROT_WRITE) {
+            page_flags |= PAGE_RW;
+        }
+        if (!vmm_map_page(start + off, phys, page_flags)) {
+            return (uint64)-12;
+        }
+    }
+    return start;
+}
+
 static uint64 sys_mmap(uint64 addr, uint64 length, uint64 prot,
-                       uint64 flags, uint64 fd) {
+                       uint64 flags, uint64 fd, uint64 offset) {
     uint64 start, page, end, page_flags;
 
     if (length == 0) {
         return (uint64)-22;   /* -EINVAL */
     }
-    if (!(flags & MAP_ANONYMOUS) || (int64)fd >= 0) {
-        return (uint64)-19;   /* -ENODEV: no file-backed mappings */
+    if (!(flags & MAP_ANONYMOUS)) {
+        return mmap_device(addr, length, prot, flags, fd, offset);
+    }
+    if ((int64)fd >= 0) {
+        return (uint64)-19;   /* -ENODEV: an anonymous mapping names no file */
     }
 
     length = (length + 0xFFFULL) & ~0xFFFULL;
@@ -4492,7 +4602,7 @@ static uint64 sys_mremap(uint64 old_addr, uint64 old_size, uint64 new_size,
         if (clear) {
             uint64 got = sys_mmap(old_end, new_size - old_size,
                                   PROT_READ | PROT_WRITE,
-                                  MAP_ANONYMOUS | MAP_FIXED, (uint64)-1);
+                                  MAP_ANONYMOUS | MAP_FIXED, (uint64)-1, 0);
 
             if (got == old_end) {
                 /* Keep the bump pointer above the mapping if the extension
@@ -4519,7 +4629,7 @@ static uint64 sys_mremap(uint64 old_addr, uint64 old_size, uint64 new_size,
 
     /* --- move ------------------------------------------------------------- */
     dest = sys_mmap(0, new_size, PROT_READ | PROT_WRITE,
-                    MAP_ANONYMOUS, (uint64)-1);
+                    MAP_ANONYMOUS, (uint64)-1, 0);
     if ((int64)dest < 0) {
         return dest;
     }
@@ -4538,7 +4648,7 @@ static uint64 sys_mremap(uint64 old_addr, uint64 old_size, uint64 new_size,
 
 uint64 syscall_map_anonymous(uint64 addr, uint64 length, int fixed) {
     return sys_mmap(addr, length, PROT_READ | PROT_WRITE,
-                    MAP_ANONYMOUS | (fixed ? MAP_FIXED : 0), (uint64)-1);
+                    MAP_ANONYMOUS | (fixed ? MAP_FIXED : 0), (uint64)-1, 0);
 }
 
 
@@ -6011,9 +6121,10 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
 
         case SYS_mmap:
             /* mmap takes six arguments; the sixth (offset) is in r9 and is
-             * meaningless for an anonymous mapping. */
+             * meaningless for an anonymous mapping, but names the first page
+             * of a device mapping. */
             return sys_mmap(frame->rdi, frame->rsi, frame->rdx,
-                            frame->r10, frame->r8);
+                            frame->r10, frame->r8, frame->r9);
 
         case SYS_munmap:
             return sys_munmap(frame->rdi, frame->rsi);

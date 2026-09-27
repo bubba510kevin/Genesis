@@ -28,9 +28,68 @@ mistyped the command. That whole class of failure is gone.
 
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
+
+
+# --- mouse input, through the QEMU monitor ---------------------------------
+#
+# /bin/fbtest (ROADMAP items 14(h) and (j)) reads /dev/mouse0 and needs
+# somebody to move the mouse. The monitor's mouse_move / mouse_button commands
+# are exactly that: QEMU's emulated PS/2 mouse turns them into real packets on
+# IRQ 12, so the whole path - controller, driver, decoder, queue, read(2) - is
+# exercised with nothing faked in the guest. fbtest prints a marker line when
+# it is ready for each step; each marker maps to the input it asks for.
+#
+# mouse_move dx dy [dz]: dy positive is DOWN, and dz positive is the wheel
+# turned UP (away from the user). mouse_button takes a state bitmask: 1 left,
+# 2 right, 4 middle, 0 all released.
+MOUSE_SCRIPTS = {
+    "MOUSE-WAIT-1": (0.2, ["mouse_move 4 2", "mouse_move 3 3",
+                           "mouse_button 1", "mouse_button 0",
+                           "mouse_move 0 0 1"]),
+    # The delay is the point here: fbtest is about to BLOCK in read(2), and
+    # input that arrives before it gets there would test the queue rather
+    # than the wakeup.
+    "MOUSE-WAIT-2": (1.5, ["mouse_button 2", "mouse_button 0"]),
+}
+
+
+class Monitor:
+    """A human-monitor (HMP) connection over TCP. Lazily connected: most runs
+    never type a monitor command."""
+
+    def __init__(self, port):
+        self.port = port
+        self.sock = None
+
+    def _read_prompt(self, timeout=10):
+        buf = b""
+        self.sock.settimeout(timeout)
+        while not buf.endswith(b"(qemu) "):
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def command(self, line):
+        if self.sock is None:
+            self.sock = socket.create_connection(("127.0.0.1", self.port),
+                                                 timeout=10)
+            self._read_prompt()
+        self.sock.sendall(line.encode() + b"\n")
+        return self._read_prompt()
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def wait_for(path, pattern, timeout, since=0):
@@ -91,6 +150,36 @@ def wait_quiet(path, settle=2.0, timeout=60):
     return False
 
 
+def wait_for_tally(log, since, monitor, timeout=600):
+    """wait_for on a suite's tally line, answering fbtest's MOUSE-WAIT
+    markers on the way. Returns the new offset, or -1 on timeout."""
+    tally = re.compile(r"^[A-Za-z0-9_.-]+: \d+ passed, \d+ failed", re.M)
+    marker = re.compile(r"(MOUSE-WAIT-\d+)")
+    done = set()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(log, "r", errors="replace") as f:
+                f.seek(since)
+                chunk = f.read()
+        except OSError:
+            chunk = ""
+        for m in marker.finditer(chunk):
+            name = m.group(1)
+            if name in done or name not in MOUSE_SCRIPTS:
+                continue
+            done.add(name)
+            delay, cmds = MOUSE_SCRIPTS[name]
+            time.sleep(delay)
+            for c in cmds:
+                monitor.command(c)
+                time.sleep(0.1)
+        if tally.search(chunk):
+            return since + len(chunk)
+        time.sleep(0.25)
+    return -1
+
+
 def main():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(here)
@@ -102,7 +191,7 @@ def main():
     spec.loader.exec_module(build)
 
     commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
-                                "/bin/smp.exe", "/bin/tls.exe"]
+                                "/bin/smp.exe", "/bin/tls.exe", "/bin/fbtest"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)
@@ -112,6 +201,9 @@ def main():
     # drives, the NIC and the AHCI controller stay whatever it decided.
     args = build.qemu_args()
     args += ["-display", "none"]
+    mon_port = free_port()
+    args += ["-monitor", f"tcp:127.0.0.1:{mon_port},server,nowait"]
+    monitor = Monitor(mon_port)
 
     logf = open(log, "w")
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=logf,
@@ -136,9 +228,7 @@ def main():
             # goes, so the driver decided the run was over a third of the way
             # through and quit QEMU under it - reporting fewer passes and no
             # failures, which is the worst thing a test runner can do.
-            pos = wait_for(log,
-                           r"^[A-Za-z0-9_.-]+: \d+ passed, \d+ failed",
-                           600, since=pos)
+            pos = wait_for_tally(log, pos, monitor)
             if pos < 0:
                 print(f"guest_run: {cmd} produced no tally", file=sys.stderr)
                 rc = 1
