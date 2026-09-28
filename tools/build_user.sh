@@ -291,8 +291,40 @@ fi
 if [ -f src/winwait/build.sh ]; then
     sh src/winwait/build.sh
 fi
+# libc.so (GNTlibc): musl built as a Genesis shared library, so a Linux .so
+# that uses libc can run inside a Windows process (item 19, the GNTlibc step).
+# Built from a GNTlibc checkout - github.com/bubba510kevin/GNTlibc - if one is
+# found; skipped with a message otherwise, so this script still works without
+# it (libmixc.so below is skipped too, and mix.exe drops those checks).
+#
+# The build produces libc.so and a musl header tree; libc.so is staged to
+# /lib, and GNTLIBC_OUT is exported so src/somix/build.sh can compile
+# libmixc.so against them.
+if [ -z "$GNTLIBC_SRC" ]; then
+    for d in /home/user/gntlibc ../GNTlibc ../gntlibc third_party/gntlibc; do
+        if [ -f "$d/genesis/build.sh" ]; then
+            GNTLIBC_SRC="$d"
+            break
+        fi
+    done
+fi
+if [ -n "$GNTLIBC_SRC" ] && [ -f "$GNTLIBC_SRC/genesis/build.sh" ]; then
+    if sh "$GNTLIBC_SRC/genesis/build.sh"; then
+        GNTLIBC_OUT="$GNTLIBC_SRC/genesis/out"
+        mkdir -p root/lib
+        cp "$GNTLIBC_OUT/libc.so" root/lib/libc.so
+        export GNTLIBC_OUT
+        echo "staged root/lib/libc.so (GNTlibc, musl)"
+    else
+        echo "gntlibc: build failed - see above; libc.so not staged" >&2
+    fi
+else
+    echo "gntlibc: no GNTlibc checkout (set GNTLIBC_SRC) - skipping libc.so" >&2
+fi
+
 # libmixa.so/libmixb.so: Linux shared objects mix.exe loads (item 19, stage 3).
 # Built by the host gcc - they are freestanding - before mix.exe needs them.
+# libmixc.so, the libc-using object, is built here too when GNTLIBC_OUT is set.
 if [ -f src/somix/build.sh ]; then
     sh src/somix/build.sh
 fi

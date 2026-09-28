@@ -183,6 +183,8 @@ typedef double    (WINAPI *w_dd_t)(double, double);
 typedef const char *(WINAPI *w_name_t)(int);
 typedef long long (WINAPI *w_str_t)(const char *);
 typedef long long (WINAPI *w_l_t)(void);
+typedef int       (WINAPI *w_si_t)(const char *);
+typedef int       (WINAPI *w_fmt_t)(char *, int, int, int);
 
 /* The raw System V symbol, for a signature the adapter cannot translate
  * (an int then a double) and for a callback the .so calls back into. */
@@ -307,6 +309,49 @@ static void so_tests(void) {
           "and its write(2) to fd 1 reaches the console");
 }
 
+/* --- a Linux .so that USES libc, in a Windows process (GNTlibc) ------------
+ *
+ * src/somix/libmixc.so is an ordinary musl-linked shared object: it calls
+ * malloc, snprintf, strtol, the string functions and libm, and it reads
+ * errno. Its DT_NEEDED is libc.so - GNTlibc, musl built as a Genesis shared
+ * object. libc.so's constructor installs a thread pointer before any of this
+ * runs, which is the whole point: none of these functions work in a PE
+ * process without it. Each returns a value we check, so the test does not
+ * depend on where fd 1 is wired. */
+
+static void libc_tests(void) {
+    HMODULE c;
+    char buf[32];
+    FARPROC f;
+
+    say("-- a Linux .so that uses libc, in a Windows program (GNTlibc)\r\n");
+
+    c = LoadLibraryA("C:\\lib\\libmixc.so");
+    if (c == NULL_PTR) {
+        /* Not a failure: libmixc.so (and libc.so) are built only when a
+         * GNTlibc checkout was present at build time. Where it is absent,
+         * skip these checks rather than fail the suite. */
+        say("   (skipped: libmixc.so not present - GNTlibc not built)\r\n");
+        return;
+    }
+    check(1, "LoadLibraryA(\"C:\\lib\\libmixc.so\"): libc.so came with it");
+
+    check(((w_v_t)GetProcAddress(c, "c_ctor_val"))() == 1234,
+          "its constructor called malloc, after libc.so's set up the TCB");
+    check(((w_si_t)GetProcAddress(c, "c_dup_len"))("genesis") == 7,
+          "malloc + memcpy + strlen: c_dup_len(\"genesis\") = 7");
+    check(((w_str_t)GetProcAddress(c, "c_csv_sum"))("10,20,3,9") == 42,
+          "strtol over a malloc'd copy: c_csv_sum(\"10,20,3,9\") = 42");
+    f = GetProcAddress(c, "c_format");
+    check(f != NULL_PTR && ((w_fmt_t)f)(buf, (int)sizeof buf, 40, 2) == 7 &&
+          str_is(buf, "40+2=42"),
+          "snprintf into our buffer: \"40+2=42\", length 7");
+    check(((w_dd_t)GetProcAddress(c, "c_hypot"))(3.0, 4.0) == 5.0,
+          "libm through the adapter: c_hypot(3, 4) = 5");
+    check(((w_v_t)GetProcAddress(c, "c_errno_ok"))() == 1,
+          "errno is in the thread pointer: a failed fopen sets ENOENT");
+}
+
 /* --- LoadLibrary for an ordinary DLL (ROADMAP item 14(e)) ------------------ */
 
 static void dll_tests(void) {
@@ -346,6 +391,7 @@ void start(void) {
     routing_tests();
     dll_tests();
     so_tests();
+    libc_tests();
 
     say("mix: ");
     say_u((DWORD)passes);

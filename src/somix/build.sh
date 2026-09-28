@@ -36,3 +36,34 @@ fi
 mkdir -p "$ROOT/root/lib"
 cp libmixa.so libmixb.so "$ROOT/root/lib/"
 echo "built root/lib/libmixa.so, root/lib/libmixb.so"
+
+# libmixc.so: a .so that USES libc (malloc, snprintf, strtol, libm, errno),
+# loaded into a Windows process (item 19, the GNTlibc step). Unlike libmixa/b
+# it is NOT freestanding - it is linked against GNTlibc's libc.so, and its
+# DT_NEEDED of "libc.so" is what makes the kernel's .so loader pull libc in.
+#
+# Built only when build_user.sh found a GNTlibc checkout and exported
+# GNTLIBC_OUT (its libc.so and headers). Skipped otherwise, and mix.exe's
+# libc_tests notice the absence and drop those checks.
+if [ -n "$GNTLIBC_OUT" ] && [ -f "$GNTLIBC_OUT/libc.so" ]; then
+    # -nostdinc + the musl headers, and link against libc.so by -l:libc.so so
+    # the NEEDED is the bare "libc.so" the loader resolves in /lib (libc.so
+    # carries no SONAME of its own beyond what GNTlibc's build gives it).
+    # -fno-stack-protector: the canary is read through %fs, which is not set up
+    # until libc.so's constructor runs - the .so's own code must not assume it.
+    $CC -O2 -fPIC -nostdinc -isystem "$GNTLIBC_OUT/include" \
+        -fno-stack-protector -Wall -Wextra \
+        -shared -Wl,-soname,libmixc.so -Wl,--no-undefined \
+        -o libmixc.so libmixc.c -L"$GNTLIBC_OUT" -l:libc.so
+
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -d libmixc.so | grep -q "NEEDED.*libc.so" || {
+            echo "somix: libmixc.so does not name libc.so" >&2
+            exit 1
+        }
+    fi
+    cp libmixc.so "$ROOT/root/lib/"
+    echo "built root/lib/libmixc.so (uses libc, needs GNTlibc's libc.so)"
+else
+    echo "somix: no GNTLIBC_OUT - skipping libmixc.so (the libc-using object)" >&2
+fi

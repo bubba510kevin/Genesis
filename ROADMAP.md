@@ -1014,9 +1014,9 @@ LINUX .SO FILES, taken from upstream (they are not GUI, but they already exist a
 THE CHECK, per DLL: a real program that imports it - one MinGW-built and, from the point ucrtbase exists, one MSVC-built - run in the guest with its output compared to the same program run on Windows. For the taken GUI binaries: the program starts, a window appears on the framebuffer, and a mouse click reaches its window procedure.
 
 
-19. MIXED IMAGES: WINDOWS PROGRAMS LOAD LINUX .SO FILES, LINUX PROGRAMS LOAD DLLS - DONE 2026-09-28 (first version).
+19. MIXED IMAGES: WINDOWS PROGRAMS LOAD LINUX .SO FILES, LINUX PROGRAMS LOAD DLLS - DONE 2026-09-28 (first version); libc-using .so files added the same day (GNTlibc).
 
-One process, both kinds of code. It cuts across phases 2 and 4 and was built in three stages, each committed separately and tested from ring 3. The per-stage details are in the commits and in the files named.
+One process, both kinds of code. It cuts across phases 2 and 4 and was built in four stages, each committed separately and tested from ring 3. The per-stage details are in the commits and in the files named.
 
 STAGE 1 - THE KERNEL PICKS THE SYSCALL TABLE PER CALL, NOT PER PROCESS. Every NT call now carries NT_SYSCALL_TAG (0x4E54, "NT") in bits 16-31 of EAX. src/ntdll/mknums.py adds the tag when it generates ntsyscalls.h, so the stubs and hand.S did not change. personality_route (kernel/exec/personality.c) sends a tagged call to the NT table and anything else to the Linux table, in every process.
   - A tagged call from a process with no NT environment is STATUS_INVALID_SYSTEM_SERVICE.
@@ -1046,9 +1046,17 @@ kernel32 (src/kernel32/loader.c) gains LoadLibraryA/W/ExA/ExW, GetProcAddress, F
   - GenesisGetElfProcAddress returns the raw address, for __attribute__((sysv_abi)) calls with any signature.
   - Checked by mix.exe loading libmixa.so and libmixb.so (src/somix, freestanding). The load, the dependency and the constructor run; each relocation type is exercised; fourteen-argument, double and mixed-signature calls work; there is a callback into the PE; register preservation is probed; the .so's own raw Linux getpid/write work. mix.exe also covers LoadLibrary/GetProcAddress on DLLs: forwarders, an ordinal, DllMain running once. 40 checks in all.
 
+STAGE 4 - A .SO THAT USES LIBC (GNTlibc). The remaining gap in stage 3 was that only freestanding .so files worked; anything calling malloc, printf or errno needs a libc, and a PE process has none. GNTlibc (github.com/bubba510kevin/GNTlibc) is musl 1.2.6 built as a Genesis shared library, libc.so, staged to /lib.
+  - The one Genesis-specific file, src/genesis/gnt_start.c, is compiled into libc.so (musl's Makefile globs src/*/*.c). Its constructor lands in .init_array, which the loader runs FIRST in dependency order - libc.so before the .so that pulled it in - so the thread pointer exists before any other libc code runs. It sets libc.page_size and libc.auxv (a PE process gives libc neither; mallocng dereferences a NULL auxv otherwise) and installs a thread pointer for the loading thread. __gnt_thread_init does the same for a later thread.
+  - The thread pointer is installed by building a struct pthread and calling arch_prctl(ARCH_SET_FS) DIRECTLY, not through musl's __init_tls/__init_tp: in the shared libc those are the dynamic-linker variants and assume an ldso startup (_dlstart -> __dls3) that never ran, so they return success while %fs stays 0.
+  - NO kernel change was needed. The shared libc.so has no PT_TLS segment and only RELATIVE/GLOB_DAT/JUMP_SLOT relocations - what elfso already applies. musl's own syscalls (mmap, write, arch_prctl) are untagged, so from a PE process they route to the Linux table; the constructor sets up %fs from user space. arch_prctl's fs_base is restored per thread on context switch (proc_activate_stack), so it persists.
+  - Detecting an existing thread pointer must read the FS base register (arch_prctl ARCH_GET_FS), never %fs:0 - in a cold PE process %fs is 0 and %fs:0 would fault at address 0.
+  - Built by GNTlibc/genesis/build.sh, wired into tools/build_user.sh (finds a GNTlibc checkout via GNTLIBC_SRC) and src/somix/build.sh (builds libmixc.so, the libc-using object, against it).
+  - Checked by mix.exe loading libmixc.so: malloc + memcpy + strlen, strtol over a malloc'd copy, snprintf into a buffer, libm (sqrt) through the adapter, errno set by a failed fopen, and a constructor that itself calls malloc. 7 checks, 47 in all. Skipped cleanly where no GNTlibc checkout was present at build time.
+
 NOT YET, in rough order of need:
-  - A .so that uses libc. musl or glibc needs its own startup and a thread pointer in %fs inside a Windows process. A per-thread FS block set up by the loader, plus running libc's init, is the path; until then only freestanding and syscall-only code works.
-  - TLS in either direction: DLLs with __declspec(thread) at run time, and ELF PT_TLS.
+  - A thread created INSIDE a PE process (CreateThread) that then calls .so code: __gnt_thread_init exists and is exported, but is not yet wired to the Windows thread-creation path, so such a thread has no libc thread pointer until it calls __gnt_thread_init itself. (A Linux thread that loads a DLL already gets a TEB - that is stage 2's path, the other direction.)
+  - TLS in either direction: DLLs with __declspec(thread) at run time, and ELF PT_TLS (elfso and libmixc are TLS-free on purpose).
   - Unloading (FreeLibrary and gnt_pe_close only succeed).
   - SEH across the boundary: a fault in DLL code in a Linux process is a signal, and a fault in .so code in a Windows process is an exception that no .so frame has unwind info for.
   - Drive letters other than C: in LoadLibrary paths.

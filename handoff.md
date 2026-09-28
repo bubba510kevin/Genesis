@@ -4,7 +4,7 @@
 see `FEATURES.md`; for why each decision was made, `ROADMAP.md` (item numbers
 are never renumbered — source comments cite them).*
 
-Last updated 2026-09-27. Repository: https://github.com/bubba510kevin/Genesis
+Last updated 2026-09-28. Repository: https://github.com/bubba510kevin/Genesis
 (branch `main`).
 
 ## What Genesis is, in one paragraph
@@ -123,13 +123,26 @@ builds the static musl binary; it already runs under Genesis (only
 in `kernel/exec/ntproc.c`), the full 32-bit exit code and console control
 events (both need kernel interfaces), completion, and a `cmd.exe`.
 
-### Mixed images (item 19) — first version done
+### Mixed images (item 19) — first version done; libc-using .so added (GNTlibc)
+A `.so` that uses libc now runs inside a Windows process. **GNTlibc**
+(github.com/bubba510kevin/GNTlibc) is musl 1.2.6 built as `libc.so` (pristine
+musl on `upstream`, one file `src/genesis/gnt_start.c` on `main`). Its
+constructor runs first in the loader's dependency order and installs a thread
+pointer via `arch_prctl(ARCH_SET_FS)` from user space (musl's own
+`__init_tls`/`__init_tp` are the ldso variants in the shared libc and do not
+set `%fs`), plus `libc.page_size` and `libc.auxv`. No kernel change was needed:
+`libc.so` has no `PT_TLS` and only relocations `elfso` already applies, and
+musl's untagged syscalls route to the Linux table from a PE process.
+`tools/build_user.sh` finds a GNTlibc checkout (`GNTLIBC_SRC`), stages
+`libc.so` to `/lib`, and `src/somix/build.sh` builds `libmixc.so` against it;
+`mix.exe` proves `malloc`/`printf`/`strtol`/`errno`/`libm` (47 checks). Next
+there: a `CreateThread` thread inside a PE process needs `__gnt_thread_init`
+wired to the Windows thread path; TLS both ways; unloading; SEH.
+
 Windows programs `LoadLibrary` Linux `.so` files (`kernel/exec/elfso.c`,
 `src/kernel32/loader.c`, adapters in `winelf.S`); Linux programs load DLLs
 with `src/libgnt` (`prctl(PR_GENESIS_PE_LOAD)`, `kernel/exec/ntmix.c`); the
 kernel routes each syscall by `NT_SYSCALL_TAG`. Tests: `mix.exe`, `elfmix`.
-Next there: a `.so` that uses libc (needs `%fs` and libc's startup inside a
-Windows process), TLS both ways, unloading, SEH across the boundary.
 
 ### Phase 4 — the libraries: major .so and DLLs (item 18; 14(e)-(o))
 Written (non-GUI): the loader (14(e): `LoadLibrary`/`GetProcAddress` exist
