@@ -1973,8 +1973,8 @@ static void thr_body(void) {
 
 static i64 raw_thread(void (*fn)(void)) {
     i64 ret;
-    register i64 r10 __asm__("r10") = 0;                      /* tls  */
-    register i64 r8  __asm__("r8")  = (i64)&thr_ctid;         /* ctid */
+    register i64 r10 __asm__("r10") = (i64)&thr_ctid;         /* ctid */
+    register i64 r8  __asm__("r8")  = 0;                      /* tls  */
 
     thr_ctid = 1;
     __asm__ volatile (
@@ -2073,8 +2073,8 @@ static void pong_body(void) {
 /* A thread that is NOT joined on the spot, unlike raw_thread's. */
 static i64 start_thread(void (*fn)(void)) {
     i64 ret;
-    register i64 r10 __asm__("r10") = 0;
-    register i64 r8  __asm__("r8")  = (i64)&smp_ctid;
+    register i64 r10 __asm__("r10") = (i64)&smp_ctid;         /* ctid */
+    register i64 r8  __asm__("r8")  = 0;                      /* tls  */
 
     smp_ctid = 1;
     __asm__ volatile (
@@ -2350,6 +2350,27 @@ static void test_declined(void) {
     check_eq(sc4(SYS_rseq, 0, 0, 0, 0), -ENOSYS,
              "rseq says no rather than pretending");
     check_eq(sc4(SYS_prlimit64, 0, 0, 0, 0), -ENOSYS, "prlimit64 likewise");
+}
+
+/* ROADMAP item 19: the kernel picks the syscall table per CALL. A number
+ * carrying NT_SYSCALL_TAG (0x4E54 in bits 16-31) is an NT call wherever it
+ * comes from; everything else is Linux. A Linux process has no NT
+ * environment (no PEB, no TEB), so an NT call from one is refused with an NT
+ * status - it must not run, and it must not be mistaken for Linux call 4. */
+#define NT_TAG                         0x4E540000LL
+#define STATUS_INVALID_SYSTEM_SERVICE  0xC000001CLL
+
+static void test_nt_routing(void) {
+    section("per-call routing: an NT call from a Linux process");
+
+    check_eq(sc1(NT_TAG | 0x04, 12345), STATUS_INVALID_SYSTEM_SERVICE,
+             "tagged NtClose: STATUS_INVALID_SYSTEM_SERVICE (no NT environment)");
+    check_eq(sc1(NT_TAG | 0x01, 0), STATUS_INVALID_SYSTEM_SERVICE,
+             "tagged NtDisplayString likewise - it did not run");
+    check_eq(sc1(3, 12345), -EBADF,
+             "and untagged 3 is still Linux close(2)");
+    check_eq(sc0(0x1000), -ENOSYS,
+             "win32k's range is only reserved in a Windows process");
 }
 
 static void test_getrandom(void) {
@@ -3059,6 +3080,7 @@ void _start(void) {
     test_dev();
     test_getrandom();
     test_declined();
+    test_nt_routing();
     test_signals();
     test_fork();
     test_pipes();

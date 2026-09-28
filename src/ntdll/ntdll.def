@@ -31,6 +31,7 @@ EXPORTS
     KiUserApcDispatcher
 ; --- structured exception handling ---
     NtRaiseException
+    NtGenesisLoadImage
     KiUserExceptionDispatcher
     RtlLookupFunctionEntry
     RtlVirtualUnwind

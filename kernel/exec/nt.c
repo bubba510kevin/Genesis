@@ -5,6 +5,7 @@
 #include "dispatch.h"
 #include "nt.h"
 #include "nt_context.h"
+#include "ntmix.h"
 #include "ntsec.h"
 #include "acl.h"
 #include "fileobj.h"
@@ -1438,6 +1439,10 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
 
         case NT_SYS_TEST_ALERT:
             return nt_test_alert(frame);
+
+        case NT_SYS_GENESIS_LOAD_IMAGE:
+            return nt_trace(frame->rax,
+                            nt_genesis_load_image(frame->r10, frame->rdx));
 
         case NT_SYS_RAISE_EXCEPTION:
             return nt_trace(frame->rax,

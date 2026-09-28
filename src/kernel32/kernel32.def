@@ -155,6 +155,14 @@ EXPORTS
     FlsFree
     FlsGetValue
     FlsSetValue
+; --- loading at run time: DLLs and Linux .so files (loader.c) ---
+    LoadLibraryA
+    LoadLibraryW
+    LoadLibraryExA
+    LoadLibraryExW
+    FreeLibrary
+    GetProcAddress
+    GenesisGetElfProcAddress
 ; --- memory ---
     GetProcessHeap
     HeapAlloc

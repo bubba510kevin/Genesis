@@ -465,6 +465,18 @@ static int apply_relocations(address_space_t *as, const void *image,
     return PE_OK;
 }
 
+/* Is every page of [base, base + size) unmapped in `as`? */
+static int range_free(address_space_t *as, uint64 base, uint64 size) {
+    uint64 va;
+
+    for (va = base & ~0xFFFULL; va < base + size; va += PMM_PAGE_SIZE) {
+        if (vmm_get_phys_in(as, va) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int load_image(address_space_t *as, const void *image, uint64 size,
                       pe_info_t *info, int allow_dll, int kernel_mode) {
     const pe_coff_header_t *coff;
@@ -509,8 +521,22 @@ static int load_image(address_space_t *as, const void *image, uint64 size,
         }
     } else {
         if (load_base < PMM_PAGE_SIZE || load_base + info->image_size > addr_limit ||
-            (load_base & (PMM_PAGE_SIZE - 1)) != 0) {
-            load_base = PE_FALLBACK_BASE;
+            (load_base & (PMM_PAGE_SIZE - 1)) != 0 ||
+            !range_free(as, load_base, info->image_size)) {
+            /* Not where it asked to be: somewhere free at or above the
+             * fallback base. "Free" is checked, not assumed. map_range skips
+             * a page that is already mapped, so an image placed over another
+             * would silently write its sections into the other's frames. At
+             * exec time the space is empty but two DLLs can still ask for the
+             * same base; at run time (pe_load_library) the process already
+             * has its heap, its stacks and other images. */
+            for (load_base = PE_FALLBACK_BASE;
+                 load_base + info->image_size <= addr_limit;
+                 load_base += PE_PLACEMENT_STEP) {
+                if (range_free(as, load_base, info->image_size)) {
+                    break;
+                }
+            }
             if (load_base + info->image_size > addr_limit) {
                 return PE_ERR_ADDRESS;
             }
@@ -620,6 +646,7 @@ struct module {
     char   name[32];
     uint64 base;
     uint64 size;
+    uint64 entry;        /* DllMain, absolute; 0 for one already loaded */
 };
 
 struct link_ctx {
@@ -963,28 +990,19 @@ static int find_export(struct link_ctx *ctx, uint64 dll_base,
 
 static int resolve_imports(struct link_ctx *ctx, uint64 base);
 
+static int load_file(struct link_ctx *ctx, const char *path, const char *name,
+                     uint64 *base_out);
+
 /* Load a DLL named by an import descriptor, once. */
 static int load_dependency(struct link_ctx *ctx, const char *name,
                            uint64 *base_out) {
     char path[128];
-    uint8 *file = NULL;
-    uint32 size = 0;
-    pe_info_t info;
     uint64 base;
-    int rc;
 
     base = module_lookup(ctx, name);
     if (base != 0) {
         *base_out = base;
         return PE_OK;                    /* already loaded */
-    }
-    if (ctx->count >= PE_MAX_MODULES) {
-        return PE_ERR_IMPORT;
-    }
-    if (ctx->depth >= 4) {
-        /* A dependency chain this deep is a cycle or a mistake. Bounded
-         * rather than trusted, because the depth comes from the files. */
-        return PE_ERR_IMPORT;
     }
 
     if (!str_copy_n(path, PE_SYSTEM_DIR, sizeof(path))) {
@@ -999,6 +1017,25 @@ static int load_dependency(struct link_ctx *ctx, const char *name,
         if (!str_copy_n(path + at, name, sizeof(path) - at)) {
             return PE_ERR_IMPORT;
         }
+    }
+    return load_file(ctx, path, name, base_out);
+}
+
+/* Map the DLL at `path`, record it under `name`, and link it. */
+static int load_file(struct link_ctx *ctx, const char *path, const char *name,
+                     uint64 *base_out) {
+    uint8 *file = NULL;
+    uint32 size = 0;
+    pe_info_t info;
+    int rc;
+
+    if (ctx->count >= PE_MAX_MODULES) {
+        return PE_ERR_IMPORT;
+    }
+    if (ctx->depth >= 4) {
+        /* A dependency chain this deep is a cycle or a mistake. Bounded
+         * rather than trusted, because the depth comes from the files. */
+        return PE_ERR_IMPORT;
     }
 
     if (ctx->reader == NULL || ctx->reader(path, &file, &size) != 0) {
@@ -1020,6 +1057,8 @@ static int load_dependency(struct link_ctx *ctx, const char *name,
                sizeof(ctx->modules[ctx->count].name));
     ctx->modules[ctx->count].base = info.image_base;
     ctx->modules[ctx->count].size = info.image_size;
+    ctx->modules[ctx->count].entry =
+        (info.entry != info.image_base) ? info.entry : 0;
     ctx->count++;
 
     /* A dependency may have dependencies. ntdll has none, but the loader
@@ -1399,6 +1438,163 @@ void pe_report(const void *image, uint64 size, uint8 color) {
         print_string((sec[i].characteristics & PE_SCN_MEM_EXECUTE) ? "x" : "-", 0x0B);
         print_string("\n", 0x07);
     }
+}
+
+/* --- loading into a running process (ROADMAP item 19) --------------------
+ *
+ * pe_load_executable builds a fresh space around one image. This adds an
+ * image to a space that is already in use: a Linux process loading a DLL,
+ * and later LoadLibrary. It is the same linker - the same load_image, the
+ * same import resolution and forwarders - seeded with the modules the
+ * process already has, so a DLL's imports bind to the ntdll and kernel32
+ * already there instead of mapping second copies.
+ *
+ * The seed is (base, size) pairs, as the PEB's module table holds them, and
+ * each one's NAME is read back from its own export directory. That keeps
+ * the table in user memory the one list of what is loaded - there is no
+ * second, kernel-side list to fall out of step with it. A module with no
+ * export directory (an executable) seeds with an empty name, which nothing
+ * imports by. */
+static int module_export_name(address_space_t *as, uint64 base, char *out,
+                              uint64 cap) {
+    uint8 hdr[0x400];
+    const pe_coff_header_t *coff;
+    const pe_opt_header64_t *opt;
+    pe_export_dir_t dir;
+
+    out[0] = '\0';
+    if (read_out(as, base, hdr, sizeof(hdr)) != PE_OK) {
+        return 0;
+    }
+    coff = coff_of(hdr, sizeof(hdr));
+    if (coff == NULL) {
+        return 0;
+    }
+    opt = opt_of(coff);
+    if (opt->number_of_rva_and_sizes <= PE_DIR_EXPORT ||
+        opt->directory[PE_DIR_EXPORT].virtual_address == 0) {
+        return 0;
+    }
+    if (read_out(as, base + opt->directory[PE_DIR_EXPORT].virtual_address,
+                 &dir, sizeof(dir)) != PE_OK || dir.name_rva == 0) {
+        return 0;
+    }
+    return read_str(as, base + dir.name_rva, out, cap);
+}
+
+static void unmap_image(address_space_t *as, uint64 base, uint64 size) {
+    uint64 va;
+
+    for (va = base; va < base + size; va += PMM_PAGE_SIZE) {
+        if (vmm_get_phys_in(as, va) != 0) {
+            vmm_unmap_page_in(as, va, VMM_FREE_FRAME);
+        }
+    }
+}
+
+int pe_load_library(address_space_t *as, const char *path,
+                    const pe_loaded_module_t *loaded, int loaded_count,
+                    pe_file_reader_t reader, pe_file_release_t release,
+                    pe_runtime_load_t *out) {
+    struct link_ctx ctx;
+    const char *name = path;
+    const char *c;
+    uint64 base = 0, at;
+    int i, seed, rc;
+
+    out->base = 0;
+    out->count = 0;
+    out->thread_start = out->apc_dispatcher = out->exception_dispatcher = 0;
+
+    for (c = path; *c != '\0'; c++) {
+        if (*c == '/') {
+            name = c + 1;
+        }
+    }
+    if (*name == '\0' || loaded_count > PE_MAX_MODULES) {
+        return PE_ERR_IMPORT;
+    }
+
+    ctx.as          = as;
+    ctx.reader      = reader;
+    ctx.release     = release;
+    ctx.count       = 0;
+    ctx.depth       = 0;
+    ctx.kernel_mode = 0;
+    for (i = 0; i < PE_MAX_MODULES; i++) {
+        ctx.modules[i].name[0] = '\0';
+        ctx.modules[i].base = ctx.modules[i].size = ctx.modules[i].entry = 0;
+    }
+    for (i = 0; i < loaded_count; i++) {
+        module_export_name(as, loaded[i].base, ctx.modules[i].name,
+                           sizeof(ctx.modules[i].name));
+        ctx.modules[i].base = loaded[i].base;
+        ctx.modules[i].size = loaded[i].size;
+    }
+    ctx.count = seed = loaded_count;
+
+    /* Already there: nothing to map, nothing new to initialise. */
+    base = module_lookup(&ctx, name);
+    if (base != 0) {
+        out->base = base;
+        return PE_OK;
+    }
+
+    rc = load_file(&ctx, path, name, &base);
+    if (rc == PE_OK) {
+        /* Implicit TLS in a DLL loaded at run time would need a new block in
+         * every existing thread's TLS area. Not done yet, and refused rather
+         * than half-done: a DLL whose __declspec(thread) variables all
+         * alias one address fails far from here. */
+        for (i = seed; i < ctx.count; i++) {
+            pe_info_t tmp;
+
+            tmp.tls_count = 0;
+            tmp.has_tls_callbacks = 0;
+            if (collect_tls(as, ctx.modules[i].base, &tmp) != PE_OK ||
+                tmp.tls_count != 0) {
+                rc = PE_ERR_TLS;
+                break;
+            }
+        }
+    }
+    if (rc != PE_OK) {
+        /* Whatever did get mapped goes again - it is referenced by nothing
+         * the process can see yet. */
+        for (i = seed; i < ctx.count; i++) {
+            unmap_image(as, ctx.modules[i].base, ctx.modules[i].size);
+        }
+        return rc;
+    }
+
+    /* Initialisation order is dependencies first. load_file records a
+     * module BEFORE resolving its imports, so each module's dependencies
+     * come after it in ctx.modules; walking the new ones backwards puts
+     * every dependency ahead of whatever imports it. */
+    for (i = ctx.count - 1; i >= seed; i--) {
+        out->mods[out->count].base  = ctx.modules[i].base;
+        out->mods[out->count].size  = ctx.modules[i].size;
+        out->mods[out->count].entry = ctx.modules[i].entry;
+        out->count++;
+    }
+    out->base = base;
+
+    /* ntdll arriving with this load: its dispatchers, which the kernel
+     * needs to start threads and deliver APCs and exceptions. */
+    for (i = seed; i < ctx.count; i++) {
+        if (name_eq_ci(ctx.modules[i].name, "ntdll.dll")) {
+            if (find_export(&ctx, ctx.modules[i].base, "RtlUserThreadStart", &at)) {
+                out->thread_start = at;
+            }
+            if (find_export(&ctx, ctx.modules[i].base, "KiUserApcDispatcher", &at)) {
+                out->apc_dispatcher = at;
+            }
+            if (find_export(&ctx, ctx.modules[i].base, "KiUserExceptionDispatcher", &at)) {
+                out->exception_dispatcher = at;
+            }
+        }
+    }
+    return PE_OK;
 }
 
 int pe_load_into(address_space_t *as, const void *image, uint64 size,

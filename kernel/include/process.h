@@ -198,6 +198,15 @@ typedef struct process {
      * same way its TEB and stack are. 0 pages: the process has no .tls. */
     uint64           nt_tls_va;
     uint64           nt_tls_pages;
+    /* A process started from an ELF image that has since been given an NT
+     * environment (PEB, parameters, a TEB per thread) so it can run Windows
+     * DLLs - ROADMAP item 19, kernel/exec/ntmix.c. Set on every thread of
+     * the group; inherited by clone and fork; cleared by exec. */
+    int              nt_attached;
+    /* thread.gs_base was changed while this thread was not the one running
+     * the change (nt_attach gave it a TEB); load it on the way back to ring
+     * 3 rather than waiting for the next context switch. */
+    int              gs_reload;
     /* An NtAlertThreadByThreadId that has not been consumed by a wait yet. */
     volatile int     nt_alerted;
     /* NtSuspendThread's count; the thread runs only while it is 0. A thread

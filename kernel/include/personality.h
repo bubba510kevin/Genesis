@@ -66,4 +66,20 @@ const syscall_personality_t *personality_for(personality_t id);
  * current process there is nothing but the kernel's own ELF world. */
 const syscall_personality_t *personality_current(void);
 
+/* The table for THIS CALL, from the number in frame->rax (see NT_SYSCALL_TAG
+ * in nt.h): a tagged number goes to the NT table, with the tag stripped from
+ * frame->rax so nt.c sees the bare number; anything else goes to the Linux
+ * table. That holds in every process, whatever its personality, which is
+ * what lets one process run both kinds of code (ROADMAP item 19).
+ *
+ * Returns NULL when the call must not run at all, with the status for RAX in
+ * *refused: a tagged call from a process with no NT environment, or a win32k
+ * number (reserved, not yet served). */
+const syscall_personality_t *personality_route(struct syscall_frame *frame,
+                                               uint64 *refused);
+
+/* Does the process have what NT calls assume - a PEB, a TEB per thread,
+ * ntdll's dispatchers? True for a process exec'd from a PE image. */
+int personality_has_nt(const process_t *p);
+
 #endif

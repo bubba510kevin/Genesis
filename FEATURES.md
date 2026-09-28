@@ -100,6 +100,7 @@ them. See §17.
 | gnfs (native COW FS) | ✅ | Read, write, ACLs, rename, ~1GB files, growing directories, snapshots; crash-safe commits |
 | Permissions | ✅ | One NFSv4/NT ACL model with POSIX and Windows views; chmod, chown, umask, setgid, sticky |
 | Windows programs | 🟡 | PE loading, ntdll + kernel32 subset, 31 NT syscalls; no GUI |
+| Mixed images | ✅ | Windows programs `LoadLibrary` Linux `.so` files; Linux programs load DLLs (`libgnt`); syscalls routed per call |
 | NT object manager | ✅ | Namespace, named events/semaphores/mutexes, \ObjectTypes |
 | Driver models | ✅ | Newbus, LinuxKPI and WDM, loadable from 4 directories, with unload; each with its multiprocessor API |
 | Networking | 🟡 | IPv4, ICMP, ARP, UDP, **TCP**, loopback (FreeBSD's own code); no DHCP, no IPv6 |
@@ -957,7 +958,7 @@ The work is organized into **four phases** (THE PLAN in `ROADMAP.md`):
 |---|---|---|---|
 | 1 | **Run GNU bash** as the login shell (readline, job control, its own test suite) | item 15 | ❌ BusyBox's shell runs today |
 | 2 | **A modern kernel**: the feature set of current Linux and of NT 10.0 (Windows 10/11) — syscalls, demand paging and a page cache, namespaces/cgroups, tmpfs/procfs/ext4, UEFI/ACPI/NVMe/USB, IPv6; NT's I/O manager, registry, tokens, ALPC, completion ports, and the ntoskrnl surface precompiled drivers import | item 16 (+ 4, 6, 9, 12b, 13, 14 kernel halves) | 🟡 a large base exists; the inventory is open |
-| 3 | **bash understands Windows**: drive-letter paths, `.exe`/`.bat` by bare name, Windows command lines and environment for PE children, CRLF scripts, NT exit codes, ^C as a console event | item 17 | ❌ |
+| 3 | **bash understands Windows**: drive-letter paths, `.exe`/`.bat` by bare name, Windows command lines and environment for PE children, CRLF scripts, NT exit codes, ^C as a console event | item 17 | 🟡 [GNTbash](https://github.com/bubba510kevin/GNTbash): paths, PATHEXT, PE argv/env, CRLF done; exit codes, console events and quoting need kernel work |
 | 4 | **The libraries**: non-GUI DLLs written by Genesis (loader, kernel32/kernelbase, C runtimes, advapi32, ws2_32, rpcrt4, COM); GUI DLLs and Linux GUI stacks **taken**, never written; Linux `.so` files from upstream | item 18 (+ 14 (e)-(o)) | 🟡 ntdll and kernel32 subsets |
 
 ROADMAP item 14's dependency-ordered list (its letters now fall under phases 2
@@ -969,7 +970,7 @@ and 4):
 | (b) | Dispatcher objects completed: waits blocking threads, APCs | ✅ |
 | (c) | Structured exception handling (x64 table-based) | ✅ C `__try`; C++ exceptions and stack overflow remain |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |
-| (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | ❌ |
+| (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | 🟡 `LoadLibrary`/`GetProcAddress` at run time (DLLs and .so files); no search path, API sets or SxS |
 | (f) | kernel32, completed | 🟡 |
 | (g) | advapi32 (registry, security APIs) | ❌ |
 | (h) | The display: a VESA/VBE framebuffer (console), then precompiled display drivers under win32k | 🟡 framebuffer set at boot, `/dev/fb0` with mmap, console drawn into it; the Windows display driver path doesn't exist |

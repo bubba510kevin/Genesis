@@ -123,6 +123,8 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->cwd[0] = '/';
     current->cwd[1] = '\0';
     current->personality   = PERSONALITY_LINUX;
+    current->nt_attached   = 0;
+    current->gs_reload     = 0;
     current->shares_space  = 0;
     current->vfork_waiter  = 0;
     current->waiting_for_child = 0;
@@ -451,6 +453,8 @@ process_t *proc_alloc(int ppid) {
             p->nt_alerted      = 0;
             p->nt_suspend_count = 0;
             p->nt_parked       = 0;
+            p->nt_attached     = 0;
+            p->gs_reload       = 0;
             p->nt_apc_head     = NULL;
             p->nt_apc_tail     = NULL;
             p->nt_apc_dispatcher = 0;

@@ -44,7 +44,9 @@ $CC $CFLAGS -c thread.c -o thread.o
 $CC $CFLAGS -c sysinfo.c -o sysinfo.o
 $CC $CFLAGS -c tls.c -o tls.o
 $CC $CFLAGS -c except.c -o except.o
-$CC $LDFLAGS -o kernel32.dll err.o file.o proc.o thread.o sysinfo.o tls.o except.o kernel32.def ../ntdll/libntdll.a
+$CC $CFLAGS -c loader.c -o loader.o
+$CC -c winelf.S -o winelf.o
+$CC $LDFLAGS -o kernel32.dll err.o file.o proc.o thread.o sysinfo.o tls.o except.o loader.o winelf.o kernel32.def ../ntdll/libntdll.a
 
 mkdir -p "$ROOT/root/wsr/System32"
 cp kernel32.dll "$ROOT/root/wsr/System32/kernel32.dll"

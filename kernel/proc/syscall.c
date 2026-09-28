@@ -33,6 +33,7 @@
 #include "bkl.h"
 #include "kprintf.h"
 #include "nt_context.h"
+#include "ntmix.h"
 #include "screen.h"
 #include "typesk.h"
 
@@ -2018,6 +2019,7 @@ static uint64 sys_vfork(struct syscall_frame *frame) {
     child->space        = parent->space;
     child->shares_space = 1;
     child->personality  = parent->personality;
+    child->nt_attached  = parent->nt_attached;
     /* Same memory, so the same thread pointer resolves to the same TLS, and
      * the same live FPU state for the same reason. */
     child->thread.fs_base = parent->thread.fs_base;
@@ -2131,6 +2133,7 @@ static uint64 sys_fork(struct syscall_frame *frame) {
     child->shares_space = 0;             /* it owns what it just got */
 
     child->personality  = parent->personality;
+    child->nt_attached  = parent->nt_attached;
     child->brk_base     = parent->brk_base;
     child->brk_current  = parent->brk_current;
     child->mmap_next    = parent->mmap_next;
@@ -2236,6 +2239,7 @@ static process_t *spawn_thread(process_t *parent,
      * later, somewhere that has no visible connection to threading. */
     child->tgid        = parent->tgid;
     child->personality = parent->personality;
+    child->nt_attached = parent->nt_attached;
     child->pgid        = parent->pgid;
     child->brk_base    = parent->brk_base;
     child->brk_current = parent->brk_current;
@@ -2314,8 +2318,14 @@ static uint64 sys_clone(struct syscall_frame *frame) {
     uint64 flags     = frame->rdi;
     uint64 child_sp  = frame->rsi;
     uint64 ptid_ptr  = frame->rdx;
-    uint64 tls       = frame->r10;
-    uint64 ctid_ptr  = frame->r8;
+    /* x86-64 Linux's order is (flags, stack, parent_tid, CHILD_TID, TLS) -
+     * RDI, RSI, RDX, R10, R8. Other architectures swap the last two, and
+     * this had them the other way round: every musl pthread_create handed
+     * the new thread its child_tid pointer as its thread pointer, and the
+     * thread died on its first %fs-relative read. systest's raw clones used
+     * the same swapped order, so nothing noticed (ROADMAP item 19 did). */
+    uint64 ctid_ptr  = frame->r10;
+    uint64 tls       = frame->r8;
     process_t *parent = proc_current();
     process_t *child;
 
@@ -2373,6 +2383,18 @@ static uint64 sys_clone(struct syscall_frame *frame) {
     }
     if (child == NULL) {
         return (uint64)-11;              /* -EAGAIN: the table is full */
+    }
+
+    /* In a process with NT - started from a PE image, or a Linux process
+     * that has loaded a DLL (ROADMAP item 19) - every thread needs a TEB of
+     * its own: any of them may call into Windows code, and a thread sharing
+     * its creator's would report the creator's id and last error. The stack
+     * bound it records is where the thread starts; its true extent belongs
+     * to whoever mapped it. */
+    if (personality_has_nt(parent) &&
+        nt_thread_teb_attach(child, child_sp, 0) != 0) {
+        proc_free(child);
+        return (uint64)-12;              /* -ENOMEM */
     }
 
     /* CLONE_PARENT_SETTID writes the new tid where the CREATOR can see it,
@@ -3333,6 +3355,7 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     /* Set from the branch that chose the loader, above, so the tag and the
      * image can never disagree about what was actually mapped. */
     p->personality = new_personality;
+    p->nt_attached = 0;                  /* the new image brings its own */
     /* Where NtCreateThreadEx will start this image's threads. Replaced on
      * every exec, ELF included (0), because it is an address in the image
      * being thrown away. */
@@ -4038,7 +4061,7 @@ static uint64 sys_setresuid(uint64 r, uint64 e, uint64 sv) {
 #define PR_GENESIS_REVOKE_SUPREME 0x47454e02u
 #define PR_GENESIS_QUERY_SUPREME  0x47454e03u
 
-static uint64 sys_prctl(uint64 op, uint64 arg1) {
+static uint64 sys_prctl(uint64 op, uint64 arg1, uint64 arg2) {
     process_t *p = proc_current();
 
     switch ((uint32)op) {
@@ -4056,6 +4079,10 @@ static uint64 sys_prctl(uint64 op, uint64 arg1) {
         return 0;
     case PR_GENESIS_QUERY_SUPREME:
         return (uint64)(int64)genesis_supreme_uid_get();
+    case PR_GENESIS_PE_LOAD:
+        /* Load a Windows DLL into this process (ROADMAP item 19) - see
+         * kernel/exec/ntmix.c. */
+        return nt_genesis_pe_load(arg1, arg2);
     default:
         return 0;
     }
@@ -5995,11 +6022,14 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
         return 0;                       /* not reached */
     }
 
-    /* The fork in the road, taken once per syscall. Everything below this
+    /* The fork in the road, taken once per syscall - by the CALL, not by the
+     * process (personality_route; ROADMAP item 19). Everything below this
      * line is personality-independent: signals, preemption and the return to
      * user mode work the same whichever ABI made the call. */
-    pers = personality_current();
-    rc = pers->dispatch(frame);
+    pers = personality_route(frame, &rc);
+    if (pers != NULL) {
+        rc = pers->dispatch(frame);
+    }
 
     /* Signal delivery goes here rather than in return_to_user, because it
      * needs a syscall_frame to rewrite and the interrupt path has a different
@@ -6010,7 +6040,7 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
      * rt_sigreturn is excluded: it has just finished restoring a context, and
      * delivering into it would nest a second handler on top of the frame it
      * was in the middle of unwinding. */
-    if (!pers->is_sigreturn(frame->rax)) {
+    if (pers == NULL || !pers->is_sigreturn(frame->rax)) {
         struct process *me = proc_current();
 
         if (signal_pending(me)) {
@@ -6437,7 +6467,7 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
              * which is what makes adding PR_GENESIS_* safe: no existing
              * caller's prctl(2) of some other op starts seeing a new
              * answer. */
-            return sys_prctl(frame->rdi, frame->rsi);
+            return sys_prctl(frame->rdi, frame->rsi, frame->rdx);
 
         case SYS_ioctl:
             return sys_ioctl(frame->rdi, frame->rsi, frame->rdx);
