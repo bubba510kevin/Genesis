@@ -5995,11 +5995,14 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
         return 0;                       /* not reached */
     }
 
-    /* The fork in the road, taken once per syscall. Everything below this
+    /* The fork in the road, taken once per syscall - by the CALL, not by the
+     * process (personality_route; ROADMAP item 19). Everything below this
      * line is personality-independent: signals, preemption and the return to
      * user mode work the same whichever ABI made the call. */
-    pers = personality_current();
-    rc = pers->dispatch(frame);
+    pers = personality_route(frame, &rc);
+    if (pers != NULL) {
+        rc = pers->dispatch(frame);
+    }
 
     /* Signal delivery goes here rather than in return_to_user, because it
      * needs a syscall_frame to rewrite and the interrupt path has a different
@@ -6010,7 +6013,7 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
      * rt_sigreturn is excluded: it has just finished restoring a context, and
      * delivering into it would nest a second handler on top of the frame it
      * was in the middle of unwinding. */
-    if (!pers->is_sigreturn(frame->rax)) {
+    if (pers == NULL || !pers->is_sigreturn(frame->rax)) {
         struct process *me = proc_current();
 
         if (signal_pending(me)) {

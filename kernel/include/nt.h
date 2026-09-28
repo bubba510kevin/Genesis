@@ -33,6 +33,35 @@ struct syscall_frame;
  * manager for exactly this, rather than a throwaway invented to make a demo
  * work. It takes one argument and will not need rewriting when the rest of
  * the surface arrives. */
+/* --- The tag: which table a call is for ---------------------------------
+ *
+ * The numbers below are small, and so are Linux's: 0x01 is NtDisplayString
+ * here and write(2) there. Deciding by the PROCESS (its personality) worked
+ * while a process ran one kind of code. It stops working the moment a Linux
+ * .so runs inside a Windows process or a DLL inside a Linux one (ROADMAP item
+ * 19): the same thread then makes both kinds of call.
+ *
+ * So each call says which kind it is. Genesis's ntdll puts NT_SYSCALL_TAG in
+ * bits 16-31 of EAX - 0x4E54, "NT" - and the number in bits 0-15. The kernel
+ * routes a tagged call to the NT table and anything else to the Linux one,
+ * in every process (personality_route). Nothing Linux can collide with it:
+ * the highest Linux x86-64 number is in the 400s.
+ *
+ * The tag is added in exactly one place, src/ntdll/mknums.py, which emits
+ * these numbers into ntsyscalls.h already tagged, so the stubs and hand.S
+ * did not change. The numbers here stay untagged because nt.c switches on
+ * them after the tag is stripped.
+ *
+ * One other range is reserved rather than used: 0x1000-0x1FFF untagged, in
+ * a Windows process, is win32k's service table - what a precompiled
+ * user32.dll/gdi32.dll issues directly (ROADMAP item 14, route one). Until
+ * win32k.sys is loaded those are STATUS_INVALID_SYSTEM_SERVICE, never Linux
+ * calls. */
+#define NT_SYSCALL_TAG            0x4E540000u
+#define NT_SYSCALL_NR_MASK        0x0000FFFFu
+#define NT_WIN32K_FIRST           0x1000u
+#define NT_WIN32K_LAST            0x1FFFu
+
 #define NT_SYS_DISPLAY_STRING     0x01
 #define NT_SYS_TERMINATE_PROCESS  0x02
 #define NT_SYS_OPEN_FILE          0x03
@@ -272,6 +301,9 @@ struct syscall_frame;
  * caller reading it as a status. */
 #define STATUS_SUCCESS            0x00000000u
 #define STATUS_NOT_IMPLEMENTED    0xC0000002u
+/* A tagged call from a process with no NT environment, or a win32k number
+ * with no win32k loaded - see NT_SYSCALL_TAG. */
+#define STATUS_INVALID_SYSTEM_SERVICE 0xC000001Cu
 #define STATUS_INVALID_HANDLE     0xC0000008u
 /* Not an error in the usual sense: it is the documented way a caller asks how
  * big a security descriptor is, by calling once with a zero length and

@@ -36,6 +36,31 @@ const syscall_personality_t *personality_for(personality_t id) {
     }
 }
 
+int personality_has_nt(const process_t *p) {
+    return p != NULL && p->personality == PERSONALITY_WINDOWS;
+}
+
+const syscall_personality_t *personality_route(struct syscall_frame *frame,
+                                               uint64 *refused) {
+    process_t *p = proc_current();
+    uint64 nr = frame->rax;
+
+    if ((nr & ~(uint64)NT_SYSCALL_NR_MASK) == NT_SYSCALL_TAG) {
+        if (!personality_has_nt(p)) {
+            *refused = STATUS_INVALID_SYSTEM_SERVICE;
+            return NULL;
+        }
+        frame->rax = nr & NT_SYSCALL_NR_MASK;
+        return &nt_personality;
+    }
+    if (p != NULL && p->personality == PERSONALITY_WINDOWS &&
+        nr >= NT_WIN32K_FIRST && nr <= NT_WIN32K_LAST) {
+        *refused = STATUS_INVALID_SYSTEM_SERVICE;
+        return NULL;
+    }
+    return &linux_personality;
+}
+
 const syscall_personality_t *personality_current(void) {
     process_t *p = proc_current();
 

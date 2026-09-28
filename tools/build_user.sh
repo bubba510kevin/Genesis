@@ -276,6 +276,10 @@ fi
 if [ -f src/winwait/build.sh ]; then
     sh src/winwait/build.sh
 fi
+# mix.exe: PE and ELF code in one process (item 19).
+if [ -f src/winmix/build.sh ]; then
+    sh src/winmix/build.sh
+fi
 # seh.exe: structured exception handling (item 14(c)), built with clang.
 if [ -f src/winseh/build.sh ]; then
     sh src/winseh/build.sh

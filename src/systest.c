@@ -2352,6 +2352,27 @@ static void test_declined(void) {
     check_eq(sc4(SYS_prlimit64, 0, 0, 0, 0), -ENOSYS, "prlimit64 likewise");
 }
 
+/* ROADMAP item 19: the kernel picks the syscall table per CALL. A number
+ * carrying NT_SYSCALL_TAG (0x4E54 in bits 16-31) is an NT call wherever it
+ * comes from; everything else is Linux. A Linux process has no NT
+ * environment (no PEB, no TEB), so an NT call from one is refused with an NT
+ * status - it must not run, and it must not be mistaken for Linux call 4. */
+#define NT_TAG                         0x4E540000LL
+#define STATUS_INVALID_SYSTEM_SERVICE  0xC000001CLL
+
+static void test_nt_routing(void) {
+    section("per-call routing: an NT call from a Linux process");
+
+    check_eq(sc1(NT_TAG | 0x04, 12345), STATUS_INVALID_SYSTEM_SERVICE,
+             "tagged NtClose: STATUS_INVALID_SYSTEM_SERVICE (no NT environment)");
+    check_eq(sc1(NT_TAG | 0x01, 0), STATUS_INVALID_SYSTEM_SERVICE,
+             "tagged NtDisplayString likewise - it did not run");
+    check_eq(sc1(3, 12345), -EBADF,
+             "and untagged 3 is still Linux close(2)");
+    check_eq(sc0(0x1000), -ENOSYS,
+             "win32k's range is only reserved in a Windows process");
+}
+
 static void test_getrandom(void) {
     u8 buf[16];
     int all_zero = 1;
@@ -3059,6 +3080,7 @@ void _start(void) {
     test_dev();
     test_getrandom();
     test_declined();
+    test_nt_routing();
     test_signals();
     test_fork();
     test_pipes();
