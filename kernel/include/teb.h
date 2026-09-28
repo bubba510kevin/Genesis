@@ -261,6 +261,9 @@ typedef struct {
 int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table);
 int nt_modules_publish(address_space_t *as, const nt_module_table_t *table);
 
+/* Read the table back - what pe_load_library is seeded with. 0 or -errno. */
+int nt_modules_read(address_space_t *as, nt_module_table_t *table);
+
 /* Build a thread's TLS area from the table in the PEB and point its TEB
  * (at teb_va) at it. `*pages_out` is 0 when the process has no implicit
  * TLS - nothing is mapped. 0 or a negative errno. */

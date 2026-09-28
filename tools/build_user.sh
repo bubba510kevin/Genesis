@@ -220,6 +220,21 @@ elif [ -f src/ls.c ]; then
     echo "ls: no musl toolchain - skipping (it needs a libc now)" >&2
 fi
 
+# --- elfmix: a Linux program that loads Windows DLLs (item 19) -------------
+#
+# Linked against libgnt (src/libgnt), which is libc-free and so needs no
+# build of its own beyond these two objects. The DLL it loads, mixdll.dll,
+# is built by src/winmix/build.sh with the rest of the MinGW side.
+if [ -f src/elfmix/elfmix.c ] && [ -n "$MUSL_CC_FOUND" ]; then
+    "$MUSL_CC_FOUND" -std=c11 -D_GNU_SOURCE \
+        -Wall -Wextra -Werror=implicit-function-declaration \
+        -O1 -static -no-pie \
+        -o root/bin/elfmix src/elfmix/elfmix.c src/libgnt/gnt.c src/libgnt/adapt.S
+    echo "built root/bin/elfmix (musl, static, with libgnt)"
+elif [ -f src/elfmix/elfmix.c ]; then
+    echo "elfmix: no musl toolchain - skipping" >&2
+fi
+
 # ntdll.dll, built with MinGW-w64 as a host tool and staged into
 # /wsr/System32. Skips itself with a message if MinGW is not installed, so
 # this script still works on a machine that only builds the Linux side.

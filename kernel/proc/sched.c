@@ -337,6 +337,12 @@ void return_to_user(int to_user) {
     if (me != NULL) {
         me->nt_parked = 0;
     }
+    /* A GS base changed from another thread (nt_attach giving this one a
+     * TEB): loaded now, so the next instruction in ring 3 sees it. */
+    if (me != NULL && me->gs_reload) {
+        me->gs_reload = 0;
+        syscall_set_user_gs_base(me->thread.gs_base);
+    }
 
     smp_run_deferred();
     if (sched_needs_resched()) {

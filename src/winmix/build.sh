@@ -50,3 +50,14 @@ fi
 
 cp mix.exe "$ROOT/root/bin/mix.exe"
 echo "built root/bin/mix.exe (imports kernel32.dll only)"
+
+# mixdll.dll: the DLL src/elfmix loads into a Linux process (stage 2). A DLL
+# importing kernel32, so the load brings kernel32 and ntdll with it. The
+# entry point is DllMainCRTStartup, as for kernel32 itself; no CRT.
+$CC $CFLAGS -shared -nostdlib -nostartfiles \
+    -Wl,--entry=DllMainCRTStartup \
+    -Wl,--image-base,0x190000000 \
+    -o mixdll.dll mixdll.c ../kernel32/libkernel32.a
+mkdir -p "$ROOT/root/wsr/System32"
+cp mixdll.dll "$ROOT/root/wsr/System32/mixdll.dll"
+echo "built root/wsr/System32/mixdll.dll (imports kernel32.dll)"

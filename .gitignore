@@ -17,6 +17,7 @@ src/winwait/*.o
 src/winwait/wait.exe
 src/winmix/*.o
 src/winmix/mix.exe
+src/winmix/mixdll.dll
 src/winseh/*.o
 src/winseh/seh.exe
 

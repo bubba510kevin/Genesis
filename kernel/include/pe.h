@@ -226,7 +226,12 @@ typedef struct __attribute__((packed)) {
  * decision, and neither should be made by accident this early. */
 #define PE_SYSTEM_DIR "/wsr/System32/"
 
-#define PE_MAX_MODULES 8
+/* Modules one link can hold: the image, its DLLs and, at run time, what the
+ * process already had (pe_load_library). The PEB's table holds 16 too. */
+#define PE_MAX_MODULES 16
+
+/* Where load_image looks next when the preferred base is taken. */
+#define PE_PLACEMENT_STEP 0x0000000001000000ULL
 
 /* Reads a whole file for the loader. Returns 0 and a buffer the loader will
  * release through the matching free, or a negative errno. Supplied by the
@@ -294,6 +299,45 @@ void pe_report(const void *image, uint64 size, uint8 color);
  * and apply base relocations if the image had to move. Writes through the
  * direct map rather than through the target addresses, so `as` need not be
  * the one in CR3 and a malformed image is still just an errno. */
+/* --- loading into a running process (ROADMAP item 19) ---------------------
+ *
+ * Map the DLL at `path` (and whatever it imports that is not already there)
+ * into `as`, a space the process is using. `loaded` is what the process
+ * already has, as the PEB's module table records it; each module's name is
+ * read from its own export directory, so imports bind to those rather than
+ * to second copies. A DLL that is already loaded maps nothing and returns
+ * its base.
+ *
+ * On success `out` has the requested image's base and every newly mapped
+ * module, dependencies first - the order their entry points must run in,
+ * which is ring 3's job - plus ntdll's dispatchers if ntdll came with this
+ * load. A new module with implicit TLS is refused (PE_ERR_TLS). On any
+ * failure every newly mapped page is unmapped again. */
+typedef struct {
+    uint64 base;
+    uint64 size;
+} pe_loaded_module_t;
+
+typedef struct {
+    uint64 base;
+    uint64 size;
+    uint64 entry;            /* absolute DllMain, or 0 if it has none */
+} pe_runtime_module_t;
+
+typedef struct {
+    uint64 base;                         /* the image that was asked for */
+    int    count;
+    pe_runtime_module_t mods[PE_MAX_MODULES];
+    uint64 thread_start;                 /* ntdll's, when ntdll is new   */
+    uint64 apc_dispatcher;
+    uint64 exception_dispatcher;
+} pe_runtime_load_t;
+
+int pe_load_library(address_space_t *as, const char *path,
+                    const pe_loaded_module_t *loaded, int loaded_count,
+                    pe_file_reader_t reader, pe_file_release_t release,
+                    pe_runtime_load_t *out);
+
 int pe_load_into(address_space_t *as, const void *image, uint64 size,
                  pe_info_t *info);
 

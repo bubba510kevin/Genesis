@@ -37,7 +37,7 @@ const syscall_personality_t *personality_for(personality_t id) {
 }
 
 int personality_has_nt(const process_t *p) {
-    return p != NULL && p->personality == PERSONALITY_WINDOWS;
+    return p != NULL && (p->personality == PERSONALITY_WINDOWS || p->nt_attached);
 }
 
 const syscall_personality_t *personality_route(struct syscall_frame *frame,

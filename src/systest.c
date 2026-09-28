@@ -1973,8 +1973,8 @@ static void thr_body(void) {
 
 static i64 raw_thread(void (*fn)(void)) {
     i64 ret;
-    register i64 r10 __asm__("r10") = 0;                      /* tls  */
-    register i64 r8  __asm__("r8")  = (i64)&thr_ctid;         /* ctid */
+    register i64 r10 __asm__("r10") = (i64)&thr_ctid;         /* ctid */
+    register i64 r8  __asm__("r8")  = 0;                      /* tls  */
 
     thr_ctid = 1;
     __asm__ volatile (
@@ -2073,8 +2073,8 @@ static void pong_body(void) {
 /* A thread that is NOT joined on the spot, unlike raw_thread's. */
 static i64 start_thread(void (*fn)(void)) {
     i64 ret;
-    register i64 r10 __asm__("r10") = 0;
-    register i64 r8  __asm__("r8")  = (i64)&smp_ctid;
+    register i64 r10 __asm__("r10") = (i64)&smp_ctid;         /* ctid */
+    register i64 r8  __asm__("r8")  = 0;                      /* tls  */
 
     smp_ctid = 1;
     __asm__ volatile (
