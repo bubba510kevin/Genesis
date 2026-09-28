@@ -163,6 +163,8 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->run_ticks       = 0;
     current->sleep_ticks     = 0;
     current->cpu_ticks       = 0;
+    current->child_cpu_ticks = 0;
+    rlimit_defaults(current);
     {
         int k;
         for (k = 0; k < SIG_COUNT; k++) {
@@ -353,6 +355,57 @@ void proc_reap_threads(void) {
     }
 }
 
+/* Does child c answer to wait's pid argument? Linux's four forms: a pid, 0
+ * for "my process group", -1 for any child, and -pgid. */
+static int wait_selects(const process_t *p, const process_t *c, int sel) {
+    if (sel > 0) {
+        return c->pid == sel;
+    }
+    if (sel == 0) {
+        return c->pgid == p->pgid;
+    }
+    if (sel == -1) {
+        return 1;
+    }
+    return c->pgid == -sel;
+}
+
+process_t *proc_wait_child(process_t *p, int sel, int want, int *kind,
+                           int *any_match) {
+    int i;
+
+    *any_match = 0;
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        process_t *c = &table[i];
+
+        if (c->state == PROC_UNUSED || c->ppid != p->pid ||
+            is_kernel_thread(c) || is_thread_of(c, p) ||
+            !wait_selects(p, c, sel)) {
+            continue;
+        }
+        *any_match = 1;
+        if ((want & PROC_WAIT_EXITED) && c->state == PROC_ZOMBIE &&
+            !c->oncpu && !group_has_live_threads(c)) {
+            *kind = PROC_WAIT_EXITED;
+            return c;
+        }
+        /* Stop and continue reports are the PROCESS's, held on its leader;
+         * a zombie has neither worth reporting. */
+        if (c->tgid != c->pid || c->state == PROC_ZOMBIE) {
+            continue;
+        }
+        if ((want & PROC_WAIT_STOPPED) && c->stop_report != 0) {
+            *kind = PROC_WAIT_STOPPED;
+            return c;
+        }
+        if ((want & PROC_WAIT_CONTINUED) && c->cont_report) {
+            *kind = PROC_WAIT_CONTINUED;
+            return c;
+        }
+    }
+    return NULL;
+}
+
 int proc_has_children(const process_t *p) {
     int i;
 
@@ -363,6 +416,72 @@ int proc_has_children(const process_t *p) {
         }
     }
     return 0;
+}
+
+/* The limits a process starts with. The two this kernel can enforce are set
+ * to what exists, soft equal to hard: RLIMIT_NOFILE is the descriptor table
+ * (MAX_HANDLES) and RLIMIT_STACK is the stack exec builds (USER_STACK_SIZE) -
+ * reporting "unlimited" for either would be a promise nothing keeps.
+ * RLIMIT_NPROC is the process table, which is shared by everything, so it is
+ * an upper bound rather than a per-user count. RLIMIT_CORE's soft limit is 0
+ * (there are no core dumps), and NICE/RTPRIO are 0 as on a stock Linux. The
+ * rest are unlimited because nothing here limits them. */
+void rlimit_defaults(process_t *p) {
+    int i;
+
+    for (i = 0; i < RLIMIT_COUNT; i++) {
+        p->rlim[i].cur = RLIM_INFINITY;
+        p->rlim[i].max = RLIM_INFINITY;
+    }
+    p->rlim[RLIMIT_NOFILE].cur = MAX_HANDLES;
+    p->rlim[RLIMIT_NOFILE].max = MAX_HANDLES;
+    p->rlim[RLIMIT_STACK].cur  = USER_STACK_SIZE;
+    p->rlim[RLIMIT_STACK].max  = USER_STACK_SIZE;
+    p->rlim[RLIMIT_NPROC].cur  = MAX_PROCESSES;
+    p->rlim[RLIMIT_NPROC].max  = MAX_PROCESSES;
+    p->rlim[RLIMIT_CORE].cur   = 0;
+    p->rlim[RLIMIT_NICE].cur   = 0;
+    p->rlim[RLIMIT_NICE].max   = 0;
+    p->rlim[RLIMIT_RTPRIO].cur = 0;
+    p->rlim[RLIMIT_RTPRIO].max = 0;
+}
+
+void rlimit_copy(process_t *child, const process_t *parent) {
+    int i;
+
+    for (i = 0; i < RLIMIT_COUNT; i++) {
+        child->rlim[i].cur = parent->rlim[i].cur;
+        child->rlim[i].max = parent->rlim[i].max;
+    }
+}
+
+void proc_account_reaped(process_t *parent, const process_t *child) {
+    parent->child_cpu_ticks += proc_group_cpu_ticks(child) +
+                               child->child_cpu_ticks;
+}
+
+uint64 proc_group_cpu_ticks(const process_t *p) {
+    uint64 sum = 0;
+    int i;
+
+    for (i = 0; i < MAX_PROCESSES; i++) {
+        if (table[i].state != PROC_UNUSED && !is_kernel_thread(&table[i]) &&
+            table[i].tgid == p->tgid) {
+            sum += table[i].cpu_ticks;
+        }
+    }
+    return sum;
+}
+
+int handle_table_limit(const handle_t *table) {
+    process_t *p = proc_current();
+    uint64 lim;
+
+    if (p == NULL || p->handles != table) {
+        return MAX_HANDLES;
+    }
+    lim = p->rlim[RLIMIT_NOFILE].cur;
+    return lim < MAX_HANDLES ? (int)lim : MAX_HANDLES;
 }
 
 process_t *proc_alloc(int ppid) {
@@ -388,10 +507,18 @@ process_t *proc_alloc(int ppid) {
             p->shares_space  = 0;
             p->vfork_waiter  = 0;
             p->waiting_for_child = 0;
+            p->trace         = 0;
             p->blocked_on    = NULL;
             p->wake_tick     = 0;
             p->sig_pending   = 0;
             p->sig_blocked   = 0;
+            p->sig_saved_mask   = 0;
+            p->job_stopped      = 0;
+            p->stop_report      = 0;
+            p->cont_report      = 0;
+            p->term_signal      = 0;
+            p->sig_restore_mask = 0;
+            rlimit_defaults(p);
             p->sigalt_sp     = 0;
             p->sigalt_size   = 0;
             p->sigalt_on     = 0;
@@ -462,6 +589,7 @@ process_t *proc_alloc(int ppid) {
             p->run_ticks       = 0;
             p->sleep_ticks     = 0;
             p->cpu_ticks       = 0;
+            p->child_cpu_ticks = 0;
             {
                 int k;
                 for (k = 0; k < SIG_COUNT; k++) {

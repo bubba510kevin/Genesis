@@ -378,6 +378,14 @@ int handle_alloc(handle_t *table, open_file_t *file, uint32 flags);
  * handle_alloc is this with min 0. Ownership rules are identical. */
 int handle_alloc_from(handle_t *table, int min, open_file_t *file, uint32 flags);
 
+/* How many indices of `table` may be allocated: the current process's
+ * RLIMIT_NOFILE soft limit, capped at MAX_HANDLES, when `table` is its own -
+ * and MAX_HANDLES for any other table (a kernel thread's, one being built
+ * for another process). handle_alloc_from answers -EMFILE and
+ * handle_install_at -EBADF at or past it, which is what Linux's descriptor
+ * allocator and dup2 do. Defined in process.c. */
+int handle_table_limit(const handle_t *table);
+
 /* The per-descriptor flags at one index. Returns -EBADF if it is closed.
  *
  * A getter rather than reaching into table[i].flags at the call site, because

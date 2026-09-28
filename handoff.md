@@ -4,7 +4,7 @@
 see `FEATURES.md`; for why each decision was made, `ROADMAP.md` (item numbers
 are never renumbered — source comments cite them).*
 
-Last updated 2026-09-28. Repository: https://github.com/bubba510kevin/Genesis
+Last updated 2026-09-28 (phase 1 started). Repository: https://github.com/bubba510kevin/Genesis
 (branch `main`).
 
 ## What Genesis is, in one paragraph
@@ -63,6 +63,9 @@ Done and verified in the latest sessions — details in `ROADMAP.md`:
 - **Mouse** (mouse half of item 14(j), same branch): PS/2 `psm` driver
   (FreeBSD Newbus idiom) on an `atkbdc` bus, wheel included; `/dev/mouse0`
   serves evdev `input_event` records. `/bin/fbtest` covers both from ring 3.
+- **Phase 1 started** (item 15): GNU bash 5.3 runs interactively; a real
+  termios terminal, select/pselect6, rlimits, getrusage, job control. See
+  "Phase 1" below.
 
 ## What needs to be done now, in order
 
@@ -72,16 +75,43 @@ it needs. **The GUI rule:** nothing that deals with a GUI is written from
 scratch — it is taken (precompiled Windows binaries on the real win32k.sys,
 or ported open source); Genesis writes the support underneath.
 
-### Phase 1 — run bash (ROADMAP item 15)
-GNU bash from upstream, built static against musl like BusyBox, as the login
-shell with readline and job control, then its own test suite in the guest.
-Missing underneath (item 15 (a)-(l)): `select`/`pselect6`, real rlimits
-(`prlimit64` is ENOSYS), `getrusage`, a writable `/tmp` (tmpfs), `/proc`
-(`/proc/self/fd` at least), FIFOs and `/dev/fd`, staged `/etc/passwd` etc.,
-symlinks, long filenames on the root (FAT is 8.3 — `.bashrc` can't exist),
-BusyBox applets or coreutils, terminal completeness (TIOCSCTTY, SIGTTOU/
-SIGTTIN, VMIN/VTIME, SIGWINCH), `#!` scripts and setuid exec. Find the rest
-with the musl ptrace-trace method (item 9).
+### Phase 1 — run bash (ROADMAP item 15) — IN PROGRESS
+**Done (2026-09-27):** GNU bash 5.3.20 is built from the pinned upstream
+tarball (`src/bash/build.sh`, called by `tools/build_user.sh`; source fetched
+into gitignored `vendsrc/bash/` and checked against SHA-256 pins) and runs
+interactively as `/bin/bash`: readline editing, history, tab completion,
+Ctrl-C of the prompt and of a running loop. Underneath it: `select`/`pselect6`,
+real rlimits (`RLIMIT_NOFILE` enforced), `getrusage`, **a real termios line
+discipline** (`kernel/dev/tty.c` — raw mode, VMIN/VTIME, signal characters at
+input time, TIOCSCTTY, SIGTTIN, SIGWINCH), **job control** (stop/continue,
+`wait4` WUNTRACED/WCONTINUED/pid forms/WIFSIGNALED), signal handlers delivered
+from the interrupt path (with FPU state), and the `rt_sigsuspend` mask bug
+fixed. ROADMAP item 15 has the detail and the three bugs found.
+
+**Tools for this work:** `/bin/gtrace CMD` traces CMD's syscalls (and its
+children's) on the console; `tools/guest_sh.py -f FILE` types FILE's lines
+into the guest shell (`@wait:REGEX` waits for output — bash takes ~25s to
+load under TCG, see below). `guest_run.py` runs `root/usr/tests/bashtest.sh`
+under bash as its last suite (non-interactive: fork/wait, signals, pipes,
+here-docs, rlimits, `read -t`); the interactive side is still checked by
+hand with `guest_sh.py`.
+
+A fourth bug came out of the wait4 rework: an **ignored** signal (SIGCHLD
+by default) used to be made pending, so another child's exit made a
+blocking `wait4(pid)` return -EINTR. `signal_send` now discards ignored,
+unblocked signals, as Linux does.
+
+**Next, in order:**
+1. (j) Something to run: BusyBox with its applets (needs links — see 2/h) or
+   coreutils built the way bash is. Without it `ls | head` fails.
+2. (i)/(h) Long names and symlinks: move `/` to gnfs (has neither yet) or add
+   VFAT long names to fatfs; `/bin/sh -> bash`.
+3. (d)/(g) A writable `/tmp` (tmpfs), staged `/etc/passwd`/`group`/`profile`,
+   then bash as the login shell.
+4. (e)/(f) `/proc/self/fd`, FIFOs, `/dev/fd` — process substitution.
+5. (l) `#!` scripts; then bash's own `tests/` in the guest.
+Open questions: `/bi<Tab>` beeps instead of completing (trace it with
+gtrace); exec of a 1.4MB binary takes ~25s (polled single-sector ATA PIO).
 
 ### Phase 2 — a modern kernel, Linux and NT 10.0 parity (item 16)
 A gap inventory, worked in the order phases 3-4 and real programs need it.
@@ -234,18 +264,19 @@ subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
 monitor on a free TCP port when the program prints `MOUSE-WAIT-n`, so run
 fbtest through guest_run (by hand it asks you to move and click).
 `GENESIS_VBE=WxH` or `GENESIS_VBE=off` at build time picks the graphics mode
-or keeps text mode. Expected as of 2026-09-27:
+or keeps text mode. Expected as of 2026-09-27 (after the phase 1 work):
 
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
-| `systest` | 510 passed | 507 passed |
+| `systest` | 557 passed | 554 passed |
 | `thr` (`thr.exe`) | 45 passed | 45 passed |
 | `smp` (`smp.exe`) | 61 passed | 57 passed |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
 | `wait` (`wait.exe`) | 46 passed | 46 passed |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
+| `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |
 | boot selftests | `dhcp: selftest passed`, `irqbalance: selftest passed`, `fb: selftest passed`, `psm: selftest passed (4-byte packets)`, no `FAILED` | same |
 | host (`tests/host/run.sh`) | exit 0 | |
 

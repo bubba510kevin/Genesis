@@ -190,11 +190,14 @@ def main():
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
 
+    # bashtest is GNU bash running a script (ROADMAP item 15); it is last
+    # because exec'ing bash takes ~25s under TCG (polled ATA PIO).
     commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
                                 "/bin/smp.exe", "/bin/tls.exe",
                                 "/bin/wait.exe", "/bin/seh.exe", "/bin/mix.exe",
                                 "/bin/elfmix",
-                                "/bin/fbtest"]
+                                "/bin/fbtest",
+                                "/bin/bash /usr/tests/bashtest.sh"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)

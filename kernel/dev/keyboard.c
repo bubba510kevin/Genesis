@@ -51,95 +51,12 @@ static const char keymap_shift[128] = {
     /* 0x38 */   0, ' ',   0,   0,   0,   0,   0,   0,
 };
 
-/* --- the ring ------------------------------------------------------------
- * Single producer (the IRQ), single consumer (the read syscall). head is
- * written only by the producer, tail only by the consumer, so neither can
- * observe a half-updated index and no lock is needed. Both are volatile
- * because the compiler cannot see that an interrupt modifies one of them.
- *
- * Full is dropped rather than overwritten: losing the newest keystroke is
- * confusing, but losing the oldest silently reorders what the user typed. */
-#define RING_SIZE 256
-
-static volatile uint8  ring[RING_SIZE];
-static volatile uint32 ring_head;
-static volatile uint32 ring_tail;
-
-/* Who is blocked on a keystroke.
- *
- * The list and the blocking loop moved to waitq.c - see waitq.h for why.
- * Nothing about the behaviour changed: same one-slot-per-process list, same
- * wake-everybody policy, same `sti; hlt` ordering and the same signal check.
- * What changed is that a pipe can now block correctly without a second copy
- * of any of it. */
-static wait_queue_t kbd_waiters;
-
 static int shift_down;
 static int ctrl_down;
 static int caps_lock;
 static int extended;
 
-static void ring_push(char c) {
-    uint32 next = (ring_head + 1) % RING_SIZE;
-
-    if (next == ring_tail) {
-        return;   /* full - drop it */
-    }
-    ring[ring_head] = (uint8)c;
-    ring_head = next;
-}
-
-static int ring_pop(void) {
-    int c;
-
-    if (ring_tail == ring_head) {
-        return -1;
-    }
-    c = ring[ring_tail];
-    ring_tail = (ring_tail + 1) % RING_SIZE;
-    return c;
-}
-
-/* Throw away everything queued. Ctrl-C discards type-ahead as well as the
- * line in progress: both were typed at the command being interrupted, and
- * handing them to whatever runs next is how a stray keystroke becomes a
- * command nobody meant to run. */
-static void ring_flush(void) {
-    ring_tail = ring_head;
-}
-
-int kbd_has_input(void) {
-    return ring_tail != ring_head;
-}
-
-int kbd_has_line(void) {
-    uint32 i = ring_tail;
-    uint32 head = ring_head;
-
-    /* Read once into a local. head is written by the IRQ and this is the
-     * consumer side, so it can grow underneath the scan; taking a snapshot
-     * means the loop terminates on a fixed bound rather than chasing a moving
-     * one. Characters that arrive during the scan are missed here and caught
-     * by the next wake, which the same interrupt sends. */
-    while (i != head) {
-        uint8 c = ring[i];
-
-        /* The four bytes kbd_read_line returns on. Ctrl-C is in the list
-         * because -EINTR is a return: a poller told "not readable" while a
-         * SIGINT is sitting in the ring waits for input that has already
-         * arrived and will never be re-sent. */
-        if (c == '\n' || c == '\r' || c == 4 || c == 3) {
-            return 1;
-        }
-        i = (i + 1) % RING_SIZE;
-    }
-    return 0;
-}
-
 void kbd_init(void) {
-    ring_head = 0;
-    ring_tail = 0;
-    waitq_init(&kbd_waiters);
     shift_down = 0;
     ctrl_down = 0;
     caps_lock = 0;
@@ -156,19 +73,52 @@ static int is_letter(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+static void send_seq(const char *s) {
+    while (*s != '\0') {
+        tty_input(*s++);
+    }
+}
+
+/* The 0xE0-prefixed keys, as the escape sequences a Linux console sends for
+ * them. Right Ctrl shares Left Ctrl's second byte and is a modifier; the
+ * rest of the extended set (right Alt, the Windows keys, keypad Enter and /)
+ * produces nothing yet. */
+static void extended_key(uint8 code) {
+    switch (code) {
+        case 0x1D: ctrl_down = 1;       return;   /* right Ctrl */
+        case 0x48: send_seq("\033[A");  return;   /* Up    */
+        case 0x50: send_seq("\033[B");  return;   /* Down  */
+        case 0x4D: send_seq("\033[C");  return;   /* Right */
+        case 0x4B: send_seq("\033[D");  return;   /* Left  */
+        case 0x47: send_seq("\033[1~"); return;   /* Home  */
+        case 0x4F: send_seq("\033[4~"); return;   /* End   */
+        case 0x52: send_seq("\033[2~"); return;   /* Insert */
+        case 0x53: send_seq("\033[3~"); return;   /* Delete */
+        case 0x49: send_seq("\033[5~"); return;   /* PgUp  */
+        case 0x51: send_seq("\033[6~"); return;   /* PgDn  */
+        case 0x1C: tty_input('\r');     return;   /* keypad Enter */
+        case 0x35: tty_input('/');      return;   /* keypad /     */
+        default:                        return;
+    }
+}
+
 void kbd_scancode(uint8 code) {
     char c;
 
     /* Extended keys announce themselves with a prefix byte and then a second
-     * scancode that collides with an ordinary one. Swallowing both is what
-     * keeps the arrow keys from typing letters. */
+     * scancode that collides with an ordinary one. */
     if (code == KEY_EXTENDED) {
         extended = 1;
         return;
     }
     if (extended) {
         extended = 0;
-        return;   /* nothing above the base layout produces a character yet */
+        if (code == (KEY_CTRL | KEY_RELEASE)) {
+            ctrl_down = 0;                  /* right Ctrl released */
+        } else if (!(code & KEY_RELEASE)) {
+            extended_key(code);
+        }
+        return;
     }
 
     if (code & KEY_RELEASE) {
@@ -205,154 +155,41 @@ void kbd_scancode(uint8 code) {
         c = shift_down ? (char)(c + 32) : (char)(c - 32);
     }
 
-    /* Ctrl folds a letter to its control code: Ctrl-D is 4, Ctrl-C is 3.
-     * The line reader below gives 4 its end-of-input meaning. */
-    if (ctrl_down && is_letter(c)) {
-        c = (char)(c & 0x1F);
+    /* Ctrl folds a letter to its control code (Ctrl-D is 4, Ctrl-C is 3),
+     * and the few punctuation keys that have one: Ctrl-\ is 28 (VQUIT),
+     * Ctrl-[ is ESC. */
+    if (ctrl_down) {
+        if (is_letter(c)) {
+            c = (char)(c & 0x1F);
+        } else if (c == '\\' || c == '[' || c == ']') {
+            c = (char)(c & 0x1F);
+        }
     }
 
-    ring_push(c);
+    /* Enter is CR, as on a real terminal; the terminal's ICRNL makes it a
+     * newline for canonical readers, and readline in raw mode takes either. */
+    if (c == '\n') {
+        c = '\r';
+    }
+    kbd_inject(c);
 }
 
-/* Push an already-decoded character into the input ring, from something that
- * is not the PS/2 keyboard.
- *
- * The serial console is the caller. It matters that this is the same ring
- * rather than a second one: the line discipline, the Ctrl-C handling, the
- * echo and every reader above sit on this ring, so a serial console behaves
- * identically to the keyboard instead of being a parallel input path that
- * drifts. A second ring would need all of that duplicated, and the copies
- * would disagree about something eventually - most likely about what ends a
- * line.
- *
- * Takes a CHARACTER, not a scancode. kbd_scancode is the PS/2 translation
- * layer and has no meaning for a byte that arrived over a wire already
- * decoded; routing serial input through it would try to interpret 'a' as a
- * make/break code.
- */
+/* An already-decoded character, from the PS/2 path above or from the serial
+ * console. One entry point for both, so the two keyboards cannot come to
+ * disagree about anything - they reach the same line discipline through the
+ * same door. */
 void kbd_inject(char c) {
     /* Ctrl-T: the task dump, consumed here rather than delivered - see
-     * proc_dump. Nothing reading the console expects the byte. */
+     * proc_dump. Nothing reading the console expects the byte (readline's
+     * transpose-chars is the one casualty, and a debugging key that works
+     * while the machine is wedged is worth more). */
     if (c == 0x14) {
         proc_dump();
         return;
     }
-    ring_push(c);
-    /* Woken here rather than left to the caller, because forgetting it is a
-     * character that sits in the ring until the next unrelated keystroke -
-     * which on a machine with no keyboard is forever. */
-    if (kbd_has_input()) {
-        waitq_wake_all(&kbd_waiters);
-    }
+    tty_input(c);
 }
 
 void kbd_irq(void) {
     kbd_scancode(inb(0x60));
-    /* Waking from the interrupt rather than switching in it: sched_wake only
-     * marks the process ready and sets the reschedule flag. The switch
-     * happens on the way back out to user mode. */
-    if (kbd_has_input()) {
-        waitq_wake_all(&kbd_waiters);
-    }
-}
-
-/* Block until the ring has something.
- *
- * The condition, and nothing else. Every subtlety that used to be written out
- * here - the `sti; hlt` ordering, the re-test after waking, the signal check
- * that makes the wait killable - is in waitq_wait now, in one copy that the
- * pipe code will use too. */
-static int kbd_ready(void *ctx) {
-    (void)ctx;
-    return kbd_has_input();
-}
-
-static int kbd_wait(void) {
-    return waitq_wait(&kbd_waiters, kbd_ready, NULL);
-}
-
-#define ERASE_COLOR 0x07
-#define ECHO_COLOR  0x0F
-
-int64 kbd_read_line(char *buf, uint64 max) {
-    uint64 len = 0;
-
-    if (max == 0) {
-        return 0;
-    }
-
-    for (;;) {
-        int c;
-
-        if (!kbd_wait()) {
-            /* A signal arrived instead of a keystroke. Return so the syscall
-             * can unwind and delivery can happen at the boundary; blocking
-             * again here would sit on a pending signal forever. */
-            return -4;                   /* -EINTR */
-        }
-        c = ring_pop();
-        if (c < 0) {
-            continue;
-        }
-
-        if (c == 4) {                    /* Ctrl-D */
-            /* Only end-of-input on an empty line. Mid-line it submits what
-             * has been typed without a newline, which is what a terminal
-             * does and what lets `read` see a partial last line. */
-            if (len == 0) {
-                return 0;
-            }
-            return (int64)len;
-        }
-
-        if (c == '\b' || c == 0x7F) {    /* backspace or delete */
-            if (len > 0) {
-                len--;
-                print_backspace(ERASE_COLOR);
-            }
-            continue;
-        }
-
-        if (c == 3) {                    /* Ctrl-C */
-            /* A real SIGINT, to the foreground process group only. The line
-             * in progress is discarded, which is what a terminal does:
-             * whatever was half-typed belonged to the command being
-             * interrupted.
-             *
-             * -EINTR, never 0. Zero means end of input, and a shell that
-             * reads it exits - which is exactly what made Ctrl-C on an empty
-             * line kill the shell, because with no signal actually posted
-             * sys_read had no reason to translate the zero into anything
-             * else. Whether the signal turns out to be deliverable is not
-             * this function's business: an interrupted read is interrupted
-             * even when the target has SIGINT blocked, ignored, or is a
-             * process group that no longer has members. */
-            print_string("^C\n", ECHO_COLOR);
-            ring_flush();
-            signal_send_group(tty_foreground_pgid(), SIGINT);
-            return -4;                   /* -EINTR */
-        }
-
-        if (c == '\n' || c == '\r') {
-            print_char('\n', ECHO_COLOR);
-            buf[len++] = '\n';
-            return (int64)len;
-        }
-
-        if (c < 0x20) {
-            continue;                    /* other control codes: ignore */
-        }
-
-        /* Reserve the last byte for the newline. A line that fills the buffer
-         * is delivered as-is and the rest arrives on the next read, which is
-         * how a real tty behaves - the alternative is silently discarding
-         * what the user typed. */
-        if (len + 1 >= max) {
-            buf[len++] = (char)c;
-            return (int64)len;
-        }
-
-        buf[len++] = (char)c;
-        print_char((char)c, ECHO_COLOR);
-    }
 }

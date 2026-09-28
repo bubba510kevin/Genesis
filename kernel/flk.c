@@ -509,6 +509,7 @@ void flk(void) {
     /* Before sti, so the first keystroke cannot arrive while the ring indices
      * are still whatever .bss held. */
     kbd_init();
+    tty_init();
     print_string("Keyboard ready\n", 0x0F);
 
     /* The pointer event queue, for the same reason: empty before the first

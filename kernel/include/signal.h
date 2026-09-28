@@ -48,6 +48,8 @@
 #define SIGTSTP   20
 #define SIGTTIN   21
 #define SIGTTOU   22
+#define SIGURG    23
+#define SIGWINCH  28
 
 #define SIG_COUNT 32
 
@@ -57,6 +59,7 @@
 #define SA_SIGINFO   0x00000004UL
 /* Run this handler on the alternate stack installed by sigaltstack(2).
  * See process.h's sigalt_sp for why that facility exists at all. */
+#define SA_NOCLDSTOP 0x00000001UL
 #define SA_ONSTACK   0x08000000UL
 #define SA_RESTORER  0x04000000UL
 #define SA_RESTART   0x10000000UL
@@ -105,5 +108,24 @@ int signal_deliver(struct process *p, struct syscall_frame *frame);
 
 /* Restore the context a delivery saved. Returns the value to leave in rax. */
 uint64 signal_return(struct process *p, struct syscall_frame *frame);
+
+/* Wait under a temporary mask (rt_sigsuspend, pselect6, ppoll). The caller's
+ * mask is remembered and put back on the way out of the system call - by the
+ * signal frame if a handler runs, by signal_restore_temp_mask otherwise - so
+ * the signal that ended the wait is delivered under the temporary mask. See
+ * sig_saved_mask in process.h. SIGKILL and SIGSTOP are never masked. */
+void signal_set_temp_mask(struct process *p, uint64 mask);
+void signal_restore_temp_mask(struct process *p);
+
+/* Deliver one pending HANDLED signal to a thread returning to ring 3 from an
+ * interrupt, by rewriting the interrupt frame (all sixteen registers are in
+ * it). Default actions and SIG_IGN are taken as signal_deliver takes them.
+ * Returns non-zero if the frame now enters a handler. Linux personality
+ * only. Called after return_to_user, so the thread is the one that returns. */
+struct interrupt_frame;
+int signal_deliver_irq(struct process *p, struct interrupt_frame *f);
+
+/* rt_sigreturn's exit for a frame delivered by signal_deliver_irq. */
+void signal_iret_exit(struct interrupt_frame *f) __attribute__((noreturn));
 
 #endif

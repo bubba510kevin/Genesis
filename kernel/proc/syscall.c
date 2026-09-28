@@ -1738,10 +1738,13 @@ static uint64 sys_faccessat(uint64 dirfd, uint64 path_ptr, uint64 mode,
  * waitq_wake_all pokes; see waitq.h for why that is one shared queue rather
  * than N registrations.
  *
- * select(2) is deliberately absent. musl implements it over poll wherever
- * poll exists, so adding it would be a second copy of this decision table
- * with a different bitmap on the front - two implementations of one question,
- * which is how the answers come apart. */
+ * select(2) and pselect6(2) are below it, and they are NOT a second copy of
+ * the decision: they ask ob_poll the same question and translate the answer
+ * into bitmaps. They exist because musl does NOT build select over poll on
+ * x86-64 - it issues SYS_select and SYS_pselect6 directly - and readline's
+ * input loop is pselect6. Without it bash printed its prompt, got -ENOSYS
+ * from the wait for the first keystroke, took that as end of input and
+ * exited. */
 
 /* One entry of the user's array. Not `packed`: this is an ABI structure, and
  * its bytes are whatever a compiler would have produced. The assertion below
@@ -1875,22 +1878,26 @@ static uint64 sys_poll(uint64 fds_ptr, uint64 nfds, uint64 timeout_ms) {
 /* ppoll is poll with a timespec instead of a millisecond count and a signal
  * mask applied for the duration.
  *
- * The mask is NOT implemented, and it is declined rather than ignored. The
- * whole reason ppoll exists is the race it closes: a program that unblocks a
- * signal and then calls poll can take the signal in the gap between the two
- * and wait forever for an event that already happened. Accepting a mask and
- * not applying it would leave that race open while telling the caller it had
- * been closed - which is worse than not having ppoll, because the program
- * would have written the safe version if it knew.
- *
- * A NULL mask has nothing to apply, so that case is exactly poll and is
- * served. musl's ppoll passes NULL unless the caller asked for a mask. */
+ * The whole reason ppoll exists is the race it closes: a program that
+ * unblocks a signal and then calls poll can take the signal in the gap
+ * between the two and wait forever for an event that already happened. So
+ * the mask is applied for the wait and the caller's comes back on the way
+ * out of the syscall, AFTER the signal that ended the wait has been
+ * delivered under the temporary one (see sig_saved_mask in process.h). Until
+ * that mechanism existed a mask was refused with -ENOSYS rather than
+ * accepted and ignored, which would have left the race open while claiming
+ * it closed. */
 static uint64 sys_ppoll(uint64 fds_ptr, uint64 nfds, uint64 ts_ptr,
-                        uint64 sigmask_ptr) {
+                        uint64 sigmask_ptr, uint64 sigsetsize) {
     int64 timeout_ms = -1;
 
     if (sigmask_ptr != 0) {
-        return (uint64)-38;                    /* -ENOSYS */
+        if (sigsetsize != 8) {
+            return (uint64)-22;
+        }
+        if (!user_range_ok(sigmask_ptr, 8)) {
+            return (uint64)-14;
+        }
     }
     if (ts_ptr != 0) {
         const uint64 *ts = (const uint64 *)ts_ptr;
@@ -1907,7 +1914,238 @@ static uint64 sys_ppoll(uint64 fds_ptr, uint64 nfds, uint64 ts_ptr,
          * turns a blocking ppoll into a spin. */
         timeout_ms = (int64)(ts[0] * 1000ULL + (ts[1] + 999999ULL) / 1000000ULL);
     }
+    if (sigmask_ptr != 0) {
+        signal_set_temp_mask(proc_current(), *(const uint64 *)sigmask_ptr);
+    }
     return do_poll(fds_ptr, nfds, timeout_ms);
+}
+
+/* --- select and pselect6 -------------------------------------------------
+ *
+ * Three bitmaps in, the same three out with only the ready bits left, and
+ * the count of bits set. Readiness is ob_poll's, mapped the way Linux maps
+ * it (fs/select.c): readable is POLLIN, POLLHUP or POLLERR; writable is
+ * POLLOUT or POLLERR; "exceptional" is POLLPRI. A closed descriptor in any
+ * set is -EBADF for the whole call, not a bit - the one place select and
+ * poll disagree (poll reports POLLNVAL per entry).
+ *
+ * Only the first ceil(nfds/8) bytes of each set are read or written. musl
+ * passes a whole fd_set, but a caller allocating exactly nfds bits is correct
+ * and must not have the bytes after its bitmap overwritten. */
+#define SELECT_MAX_FDS 1024
+
+struct select_ctx {
+    uint64 nfds;
+    uint8  in[3][SELECT_MAX_FDS / 8];
+    uint8  out[3][SELECT_MAX_FDS / 8];
+    int    hit;
+    int    badf;
+};
+
+static int select_scan(void *ctx) {
+    struct select_ctx *sc = (struct select_ctx *)ctx;
+    process_t *p = proc_current();
+    uint64 fd;
+
+    sc->hit = 0;
+    fill((uint8 *)sc->out, 0, sizeof(sc->out));
+    for (fd = 0; fd < sc->nfds; fd++) {
+        uint32 byte = (uint32)(fd >> 3);
+        uint8  bit  = (uint8)(1u << (fd & 7));
+        int want_r = (sc->in[0][byte] & bit) != 0;
+        int want_w = (sc->in[1][byte] & bit) != 0;
+        int want_x = (sc->in[2][byte] & bit) != 0;
+        open_file_t *f;
+        int rev;
+
+        if (!want_r && !want_w && !want_x) {
+            continue;
+        }
+        f = handle_get(p->handles, (int)fd);
+        if (f == NULL) {
+            /* Ends the wait: the caller gets -EBADF, and waiting on a
+             * descriptor that does not exist would be forever. */
+            sc->badf = 1;
+            return 1;
+        }
+        rev = ob_poll(f->obj, POLLIN | POLLOUT | POLLPRI);
+        if (want_r && (rev & (POLLIN | POLLHUP | POLLERR))) {
+            sc->out[0][byte] |= bit;
+            sc->hit++;
+        }
+        if (want_w && (rev & (POLLOUT | POLLERR))) {
+            sc->out[1][byte] |= bit;
+            sc->hit++;
+        }
+        if (want_x && (rev & POLLPRI)) {
+            sc->out[2][byte] |= bit;
+            sc->hit++;
+        }
+    }
+    return sc->hit;
+}
+
+/* timeout_ns < 0 waits forever. *left_ns, when asked for, gets the time that
+ * was left: Linux writes it back into the caller's timeval/timespec, and a
+ * program looping on select with one timeout relies on it shrinking. */
+static uint64 do_select(uint64 nfds, uint64 rp, uint64 wp, uint64 xp,
+                        int64 timeout_ns, int64 *left_ns) {
+    struct select_ctx *sc;
+    uint64 ptrs[3];
+    uint64 nbytes, i, j, deadline = 0, hz = timer_hz();
+    int rc;
+
+    if ((int64)nfds < 0) {
+        return (uint64)-22;
+    }
+    if (nfds > SELECT_MAX_FDS) {
+        nfds = SELECT_MAX_FDS;          /* Linux clamps to what can be open */
+    }
+    nbytes = (nfds + 7) / 8;
+    ptrs[0] = rp;
+    ptrs[1] = wp;
+    ptrs[2] = xp;
+    for (i = 0; i < 3; i++) {
+        if (ptrs[i] != 0 && nbytes != 0 && !user_range_ok(ptrs[i], nbytes)) {
+            return (uint64)-14;
+        }
+    }
+
+    /* 768 bytes of bitmaps: too much for a kernel stack frame. */
+    sc = (struct select_ctx *)kmalloc(sizeof(*sc));
+    if (sc == NULL) {
+        return (uint64)-12;
+    }
+    fill((uint8 *)sc, 0, sizeof(*sc));
+    sc->nfds = nfds;
+    for (i = 0; i < 3; i++) {
+        if (ptrs[i] != 0) {
+            for (j = 0; j < nbytes; j++) {
+                sc->in[i][j] = ((const uint8 *)ptrs[i])[j];
+            }
+        }
+    }
+
+    if (timeout_ns == 0) {
+        select_scan(sc);
+        rc = WAITQ_READY;
+    } else {
+        if (timeout_ns > 0) {
+            /* Rounded up plus one tick, for poll's reason. */
+            deadline = timer_ticks_now() +
+                       (((uint64)timeout_ns * hz + 999999999ULL) / 1000000000ULL) + 1;
+        }
+        rc = waitq_wait_until(waitq_readiness(), select_scan, sc, deadline);
+    }
+
+    if (left_ns != NULL) {
+        uint64 now = timer_ticks_now();
+
+        *left_ns = (deadline != 0 && now < deadline)
+                 ? (int64)((deadline - now) * 1000000000ULL / hz) : 0;
+        if (*left_ns > timeout_ns) {
+            *left_ns = timeout_ns;
+        }
+    }
+
+    if (sc->badf) {
+        kfree(sc);
+        return (uint64)-9;              /* -EBADF */
+    }
+    if (rc == WAITQ_SIGNAL) {
+        kfree(sc);
+        return (uint64)-4;              /* -EINTR; the sets are unspecified */
+    }
+    if (rc == WAITQ_TIMEOUT) {
+        sc->hit = 0;
+        fill((uint8 *)sc->out, 0, sizeof(sc->out));
+    }
+    for (i = 0; i < 3; i++) {
+        if (ptrs[i] != 0) {
+            for (j = 0; j < nbytes; j++) {
+                ((uint8 *)ptrs[i])[j] = sc->out[i][j];
+            }
+        }
+    }
+    rc = sc->hit;
+    kfree(sc);
+    return (uint64)(int64)rc;
+}
+
+static uint64 sys_select(uint64 nfds, uint64 rp, uint64 wp, uint64 xp,
+                         uint64 tv_ptr) {
+    int64 timeout_ns = -1, left = 0;
+    uint64 rc;
+
+    if (tv_ptr != 0) {
+        const int64 *tv = (const int64 *)tv_ptr;
+
+        if (!user_range_ok(tv_ptr, 16)) {
+            return (uint64)-14;
+        }
+        if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000) {
+            return (uint64)-22;
+        }
+        timeout_ns = tv[0] * 1000000000LL + tv[1] * 1000LL;
+    }
+    rc = do_select(nfds, rp, wp, xp, timeout_ns, tv_ptr != 0 ? &left : NULL);
+    if (tv_ptr != 0) {
+        int64 *tv = (int64 *)tv_ptr;
+
+        tv[0] = left / 1000000000LL;
+        tv[1] = (left % 1000000000LL) / 1000LL;
+    }
+    return rc;
+}
+
+/* The sixth argument points at { const sigset_t *ss; size_t ss_len; } - the
+ * ABI packs the mask and its size because there is no seventh register. The
+ * mask works exactly as ppoll's does. */
+static uint64 sys_pselect6(uint64 nfds, uint64 rp, uint64 wp, uint64 xp,
+                           uint64 ts_ptr, uint64 sig_ptr) {
+    int64 timeout_ns = -1, left = 0;
+    uint64 rc, mask = 0;
+    int have_mask = 0;
+
+    if (ts_ptr != 0) {
+        const int64 *ts = (const int64 *)ts_ptr;
+
+        if (!user_range_ok(ts_ptr, 16)) {
+            return (uint64)-14;
+        }
+        if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000LL) {
+            return (uint64)-22;
+        }
+        timeout_ns = ts[0] * 1000000000LL + ts[1];
+    }
+    if (sig_ptr != 0) {
+        const uint64 *sd = (const uint64 *)sig_ptr;
+
+        if (!user_range_ok(sig_ptr, 16)) {
+            return (uint64)-14;
+        }
+        if (sd[0] != 0) {
+            if (sd[1] != 8) {
+                return (uint64)-22;
+            }
+            if (!user_range_ok(sd[0], 8)) {
+                return (uint64)-14;
+            }
+            mask = *(const uint64 *)sd[0];
+            have_mask = 1;
+        }
+    }
+    if (have_mask) {
+        signal_set_temp_mask(proc_current(), mask);
+    }
+    rc = do_select(nfds, rp, wp, xp, timeout_ns, ts_ptr != 0 ? &left : NULL);
+    if (ts_ptr != 0) {
+        int64 *ts = (int64 *)ts_ptr;
+
+        ts[0] = left / 1000000000LL;
+        ts[1] = left % 1000000000LL;
+    }
+    return rc;
 }
 
 /* --- futex ---------------------------------------------------------------
@@ -2040,6 +2278,8 @@ static uint64 sys_vfork(struct syscall_frame *frame) {
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    child->trace        = parent->trace;
+    rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
     {
         uint32 g;
@@ -2147,6 +2387,8 @@ static uint64 sys_fork(struct syscall_frame *frame) {
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    child->trace        = parent->trace;
+    rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
     {
         uint32 g;
@@ -2259,6 +2501,8 @@ static process_t *spawn_thread(process_t *parent,
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    child->trace        = parent->trace;
+    rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
     {
         uint32 g;
@@ -2628,47 +2872,57 @@ uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame) {
  *
  * The loop shape matters. Reaping is attempted BEFORE the signal check, so a
  * parent woken by its own child's SIGCHLD reaps the child rather than
- * returning -EINTR and making the caller work out that it should try again. */
-#define WNOHANG 1
+ * returning -EINTR and making the caller work out that it should try again.
+ *
+ * WHICH child, and WHAT about it, are proc_wait_child's (process.c): the pid
+ * argument's four forms, and exits, stops (WUNTRACED) and continues
+ * (WCONTINUED) - job control, ROADMAP item 15. This used to reap the first
+ * zombie it found whatever pid was asked for, and then answer -ECHILD if it
+ * was the wrong one, having reported nothing and reaped nothing: a shell
+ * waiting for one job while another had exited could never collect the one
+ * it asked about. */
+#define WNOHANG    1
+#define WUNTRACED  2
+#define WCONTINUED 8
 
-/* Block until one of this process's children is reapable.
+/* Block until one of this process's children answers to `sel` and has
+ * something `want` asks for. Returns it with *kind set, or NULL with *err the
+ * negative errno - 0 for the WNOHANG "nothing yet, and that is not an error"
+ * case, the one result a caller cannot infer from a NULL.
  *
- * EXTRACTED from sys_wait4 when waitid(2) arrived, rather than copied into
- * it. The loop below is four lines of policy wrapped around one line of
- * hard-won detail - the `sti; hlt; cli` and the exact ordering of the
- * waiting_for_child flag around the block - and a second copy of that in
- * waitid would be a second place to get it wrong, in a function whose bugs
- * present as a shell that hangs.
- *
- * Returns the child, or NULL with *err set to the negative errno to return.
- * *err is 0 for the WNOHANG "no child ready, and that is not an error" case,
- * which is the one result the caller cannot infer from a NULL. */
-static process_t *wait_reap_blocking(process_t *p, uint64 options, int64 *err) {
+ * EXTRACTED from sys_wait4 when waitid(2) arrived, rather than copied: the
+ * loop is four lines of policy around one line of hard-won detail - the
+ * `sti; hlt; cli` and the exact ordering of the waiting_for_child flag around
+ * the block - and a second copy of that in waitid would be a second place to
+ * get it wrong, in a function whose bugs present as a shell that hangs. */
+static process_t *wait_child_blocking(process_t *p, int sel, int want,
+                                      int nohang, int *kind, int64 *err) {
     process_t *child;
+    int any;
 
     *err = 0;
     for (;;) {
-        child = proc_reap_child(p);
+        child = proc_wait_child(p, sel, want, kind, &any);
         if (child != NULL) {
             return child;
         }
-        if (!proc_has_children(p)) {
+        if (!any) {
             *err = -10;              /* -ECHILD */
             return NULL;
         }
-        if (options & WNOHANG) {
-            return NULL;             /* children, none exited: not an error */
+        if (nohang) {
+            return NULL;             /* children, none ready: not an error */
         }
 
         /* The flag goes up before the block and comes down after it, so an
-         * exiting child either sees it and wakes us, or has already exited
-         * and will be found by the reap at the top of the loop. */
+         * exiting (or stopping) child either sees it and wakes us, or has
+         * already done it and will be found at the top of the loop. */
         p->waiting_for_child = 1;
         sched_block(p);
         p->waiting_for_child = 0;
 
-        if (proc_reap_child(p) != NULL) {
-            continue;                /* reaped at the top of the loop */
+        if (proc_wait_child(p, sel, want, kind, &any) != NULL) {
+            continue;                /* found at the top of the loop */
         }
         if (signal_pending(p)) {
             *err = -4;               /* -EINTR */
@@ -2686,43 +2940,65 @@ static process_t *wait_reap_blocking(process_t *p, uint64 options, int64 *err) {
     }
 }
 
+/* The wait status word: exit code in bits 15:8 (WIFEXITED), the killing
+ * signal in bits 6:0 (WIFSIGNALED), 0x7f with the stop signal above it
+ * (WIFSTOPPED), 0xffff for a continue (WIFCONTINUED). */
+static int wait_status(const process_t *c, int kind) {
+    if (kind == PROC_WAIT_STOPPED) {
+        return ((c->stop_report & 0xFF) << 8) | 0x7F;
+    }
+    if (kind == PROC_WAIT_CONTINUED) {
+        return 0xFFFF;
+    }
+    if (c->term_signal != 0) {
+        return c->term_signal & 0x7F;
+    }
+    return (c->exit_status & 0xFF) << 8;
+}
+
 static uint64 sys_wait4(uint64 pid, uint64 status_ptr, uint64 options,
                         uint64 rusage) {
     process_t *p = proc_current();
     process_t *child;
     int64      err;
+    int        kind = 0, want = PROC_WAIT_EXITED, reported;
 
     (void)rusage;
 
-    child = wait_reap_blocking(p, options, &err);
+    if (options & ~(uint64)(WNOHANG | WUNTRACED | WCONTINUED)) {
+        return (uint64)-22;
+    }
+    if (status_ptr != 0 && !user_ptr_ok(status_ptr)) {
+        return (uint64)-14;
+    }
+    if (options & WUNTRACED) {
+        want |= PROC_WAIT_STOPPED;
+    }
+    if (options & WCONTINUED) {
+        want |= PROC_WAIT_CONTINUED;
+    }
+
+    child = wait_child_blocking(p, (int)(int64)pid, want,
+                                (options & WNOHANG) != 0, &kind, &err);
     if (child == NULL) {
         return (uint64)err;
     }
-
-    if (pid != (uint64)-1 && (int)pid > 0 && child->pid != (int)pid) {
-        return (uint64)-10;
-    }
-
     if (status_ptr != 0) {
-        if (!user_ptr_ok(status_ptr)) {
-            return (uint64)-14;
-        }
-        /* The wait status encoding: exit code in bits 15:8, signal bits
-         * clear. WEXITSTATUS shifts it back down, and a shell that reports
-         * $? reads it from here. */
-        *(int *)status_ptr = (child->exit_status & 0xFF) << 8;
+        *(int *)status_ptr = wait_status(child, kind);
     }
-
-    {
-        int reaped = child->pid;
+    reported = child->pid;
+    if (kind == PROC_WAIT_STOPPED) {
+        child->stop_report = 0;      /* reported once, as on Linux */
+    } else if (kind == PROC_WAIT_CONTINUED) {
+        child->cont_report = 0;
+    } else {
+        proc_account_reaped(p, child);
         proc_free(child);
-        return (uint64)reaped;
     }
+    return (uint64)reported;
 }
 
 /* waitid(2) - wait, and say what happened in a siginfo_t.
- *
- * --- why it is not just wait4 with a different output shape ---------------
  *
  * Two differences that callers depend on, and both are about being able to
  * distinguish cases wait4 cannot.
@@ -2733,26 +3009,19 @@ static uint64 sys_wait4(uint64 pid, uint64 status_ptr, uint64 options,
  * wait4 overloads its return for both and a caller has to know that 0 is
  * special.
  *
- * IT SAYS WHY. si_code distinguishes CLD_EXITED from CLD_KILLED, so a caller
- * learns whether the status is an exit code or a signal number without the
- * WIFEXITED/WTERMSIG macro dance over a packed int.
+ * IT SAYS WHY. si_code distinguishes CLD_EXITED from CLD_KILLED (and from
+ * CLD_STOPPED and CLD_CONTINUED), so a caller learns whether si_status is an
+ * exit code or a signal number without the macro dance over a packed int.
  *
- * WEXITED IS MANDATORY IN THE OPTIONS, and this is checked rather than
- * assumed: waitid with no state flags set is a call that can never report
- * anything, and Linux answers -EINVAL. Accepting it would give a caller that
- * forgot the flag a wait that blocks forever.
- *
- * WSTOPPED and WCONTINUED parse and are then not satisfiable, because this
- * kernel does not keep stopped children - SIGSTOP's default action returns
- * without changing state (see signal.c's DFL_STOP). Accepted rather than
- * refused so that a caller passing WEXITED|WSTOPPED, which is ordinary, is
- * not rejected over the half that will simply never fire.
+ * A STATE FLAG IS MANDATORY IN THE OPTIONS, and this is checked rather than
+ * assumed: waitid with none of WEXITED, WSTOPPED or WCONTINUED set is a call
+ * that can never report anything, and Linux answers -EINVAL. Accepting it
+ * would give a caller that forgot the flag a wait that blocks forever.
  *
  * WNOWAIT is refused. It means "report this child but leave it reapable",
- * which needs a zombie to survive being reported, and proc_reap_child hands
- * out a child that the caller is then expected to free. Refusing is honest;
- * silently reaping anyway would lose a child the caller expected to wait for
- * a second time. */
+ * and nothing here keeps a report around for a second look. Refusing is
+ * honest; silently reaping anyway would lose a child the caller expected to
+ * wait for a second time. */
 #define P_ALL   0
 #define P_PID   1
 #define P_PGID  2
@@ -2762,8 +3031,10 @@ static uint64 sys_wait4(uint64 pid, uint64 status_ptr, uint64 options,
 #define WCONTINUED_ 0x00000008UL
 #define WNOWAIT_    0x01000000UL
 
-#define CLD_EXITED  1
-#define CLD_KILLED  2
+#define CLD_EXITED    1
+#define CLD_KILLED    2
+#define CLD_STOPPED   5
+#define CLD_CONTINUED 6
 
 /* The x86-64 siginfo_t fields waitid fills, at their real offsets. Written as
  * a struct rather than as stores through a byte pointer so the offsets are
@@ -2810,41 +3081,79 @@ static uint64 sys_waitid(uint64 idtype, uint64 id, uint64 info_ptr,
         return (uint64)-14;
     }
 
-    child = wait_reap_blocking(p, options, &err);
-    if (child == NULL) {
-        if (err != 0) {
-            return (uint64)err;
-        }
-        /* WNOHANG, nothing ready. Zeroed siginfo and success - and the zeroed
-         * si_pid IS the answer, so it has to be written rather than left
-         * alone. A caller distinguishes this from a real report by testing
-         * si_pid, which only works if this call clears it. */
-        if (info_ptr != 0) {
-            uint8 *dst = (uint8 *)info_ptr;
-            for (i = 0; i < sizeof(si); i++) {
-                dst[i] = 0;
+    {
+        int sel, want = 0, kind = 0;
+
+        if (idtype == P_ALL) {
+            sel = -1;
+        } else if (idtype == P_PID) {
+            if ((int)id <= 0) {
+                return (uint64)-22;
             }
+            sel = (int)id;
+        } else {
+            sel = (int)id == 0 ? 0 : -(int)id;   /* P_PGID; 0 is our own */
+        }
+        if (options & WEXITED_) {
+            want |= PROC_WAIT_EXITED;
+        }
+        if (options & WSTOPPED_) {
+            want |= PROC_WAIT_STOPPED;
+        }
+        if (options & WCONTINUED_) {
+            want |= PROC_WAIT_CONTINUED;
+        }
+
+        child = wait_child_blocking(p, sel, want, (options & WNOHANG) != 0,
+                                    &kind, &err);
+        if (child == NULL) {
+            if (err != 0) {
+                return (uint64)err;
+            }
+            /* WNOHANG, nothing ready. Zeroed siginfo and success - and the
+             * zeroed si_pid IS the answer, so it has to be written rather
+             * than left alone. A caller distinguishes this from a real
+             * report by testing si_pid, which only works if this call
+             * clears it. */
+            if (info_ptr != 0) {
+                uint8 *dst = (uint8 *)info_ptr;
+                for (i = 0; i < sizeof(si); i++) {
+                    dst[i] = 0;
+                }
+            }
+            return 0;
+        }
+
+        for (i = 0; i < sizeof(si); i++) {
+            ((uint8 *)&si)[i] = 0;
+        }
+        si.si_signo = SIGCHLD;
+        si.si_pid   = child->pid;
+        si.si_uid   = (int32)child->uid;
+        if (kind == PROC_WAIT_STOPPED) {
+            si.si_code   = CLD_STOPPED;
+            si.si_status = child->stop_report;
+            child->stop_report = 0;
+        } else if (kind == PROC_WAIT_CONTINUED) {
+            si.si_code   = CLD_CONTINUED;
+            si.si_status = SIGCONT;
+            child->cont_report = 0;
+        } else if (child->term_signal != 0) {
+            si.si_code   = CLD_KILLED;
+            si.si_status = child->term_signal;
+        } else {
+            si.si_code   = CLD_EXITED;
+            si.si_status = child->exit_status & 0xFF;
+        }
+        if (info_ptr != 0) {
+            *(struct k_siginfo *)info_ptr = si;
+        }
+        if (kind == PROC_WAIT_EXITED) {
+            proc_account_reaped(p, child);
+            proc_free(child);
         }
         return 0;
     }
-
-    if (idtype == P_PID && child->pid != (int)id) {
-        return (uint64)-10;          /* -ECHILD, same limitation as wait4 */
-    }
-
-    for (i = 0; i < sizeof(si); i++) {
-        ((uint8 *)&si)[i] = 0;
-    }
-    si.si_signo  = SIGCHLD;
-    si.si_code   = CLD_EXITED;
-    si.si_pid    = child->pid;
-    si.si_status = child->exit_status & 0xFF;
-
-    if (info_ptr != 0) {
-        *(struct k_siginfo *)info_ptr = si;
-    }
-    proc_free(child);
-    return 0;
 }
 
 /* --- execve --------------------------------------------------------------
@@ -3594,12 +3903,11 @@ static uint64 sys_reboot(uint64 magic1, uint64 magic2, uint64 cmd, uint64 arg) {
  * reads uninitialised stack as terminal settings and decides what to do from
  * whatever was there. Unknown requests get -ENOTTY now.
  *
- * TCSETS is accepted and IGNORED. The kernel line discipline is always
- * canonical with echo, so a program that asks for raw mode is told yes and
- * gets cooked input anyway. That is a real lie and it has one specific
- * consequence: busybox must be built with FEATURE_EDITING off, or ash will
- * switch to raw mode, echo every character itself, and you will see each
- * keystroke twice. */
+ * TCSETS used to be accepted and IGNORED - the line discipline was always
+ * canonical with echo, so a program asking for raw mode was told yes and got
+ * cooked input anyway, and readline showed every line twice. The console has
+ * a real termios now, and the terminal requests are answered by tty_ioctl in
+ * kernel/dev/tty.c (ROADMAP item 15(k)). */
 /* How many bytes the argument points at, decoded from the request number.
  *
  * Linux packs direction, size, type and number into the ioctl code -
@@ -3676,73 +3984,17 @@ static uint64 sys_ioctl(uint64 fd, uint64 request, uint64 arg) {
         return (uint64)-25;   /* -ENOTTY: a valid fd that is not a terminal */
     }
 
-    switch (request) {
-        case TCGETS: {
-            /* Kernel struct termios: four 32-bit flag words, c_line, then
-             * c_cc[19]. Describing the console honestly - canonical, echoing,
-             * mapping CR to NL on input and NL to CRLF on output - is what
-             * makes a libc treat it as a line-oriented terminal. */
-            if (arg == 0) {
-                return (uint64)-14;
-            }
-            fill(p, 0, 36);
-            *(uint32 *)(p +  0) = 0x0100;              /* c_iflag: ICRNL     */
-            *(uint32 *)(p +  4) = 0x0005;              /* c_oflag: OPOST|ONLCR */
-            *(uint32 *)(p +  8) = 0x00BF;              /* c_cflag: 38400 8N1 */
-            *(uint32 *)(p + 12) = 0x8A3B;              /* c_lflag: ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN */
-            p[17 +  0] = 3;                            /* VINTR  = Ctrl-C    */
-            p[17 +  1] = 28;                           /* VQUIT  = Ctrl-\    */
-            p[17 +  2] = 0x7F;                         /* VERASE = DEL       */
-            p[17 +  3] = 21;                           /* VKILL  = Ctrl-U    */
-            p[17 +  4] = 4;                            /* VEOF   = Ctrl-D    */
-            p[17 +  6] = 1;                            /* VMIN               */
-            return 0;
+    /* The terminal's own requests - termios, process groups, the
+     * controlling terminal, window size - belong to its line discipline
+     * (kernel/dev/tty.c). What is left here is the display. */
+    if (request == KDGETMODE) {
+        if (arg == 0) {
+            return (uint64)-14;
         }
-
-        case TCSETS:
-        case TCSETSW:
-        case TCSETSF:
-            return 0;         /* accepted, ignored - see the note above */
-
-        case TIOCGPGRP:
-            if (arg == 0) {
-                return (uint64)-14;
-            }
-            *(int *)p = tty_foreground_pgid();
-            return 0;
-
-        case TIOCSPGRP:
-            if (arg == 0) {
-                return (uint64)-14;
-            }
-            /* The shell claiming the terminal for a job. Everything typed at
-             * the keyboard - Ctrl-C in particular - goes to this group from
-             * here on. */
-            tty_set_foreground_pgid(*(const int *)p);
-            return 0;
-
-        case KDGETMODE:
-            if (arg == 0) {
-                return (uint64)-14;
-            }
-            *(int *)p = screen_graphics_owner() != 0 ? KD_GRAPHICS : KD_TEXT;
-            return 0;
-
-        case TIOCGWINSZ:
-            if (arg == 0) {
-                return (uint64)-14;
-            }
-            /* The console's real grid: 80x25 in text mode, larger once it
-             * draws into a framebuffer. */
-            *(uint16 *)(p + 0) = (uint16)screen_height_chars();  /* ws_row */
-            *(uint16 *)(p + 2) = (uint16)screen_width_chars();   /* ws_col */
-            *(uint16 *)(p + 4) = 0;    /* ws_xpixel */
-            *(uint16 *)(p + 6) = 0;    /* ws_ypixel */
-            return 0;
-
-        default:
-            return (uint64)-25;   /* -ENOTTY */
+        *(int *)p = screen_graphics_owner() != 0 ? KD_GRAPHICS : KD_TEXT;
+        return 0;
     }
+    return (uint64)tty_ioctl((uint32)request, arg);
 }
 
 /* --- vectored write -----------------------------------------------------
@@ -4060,6 +4312,7 @@ static uint64 sys_setresuid(uint64 r, uint64 e, uint64 sv) {
 #define PR_GENESIS_GRANT_SUPREME  0x47454e01u
 #define PR_GENESIS_REVOKE_SUPREME 0x47454e02u
 #define PR_GENESIS_QUERY_SUPREME  0x47454e03u
+#define PR_GENESIS_TRACE          0x47454e04u
 
 static uint64 sys_prctl(uint64 op, uint64 arg1, uint64 arg2) {
     process_t *p = proc_current();
@@ -4083,6 +4336,11 @@ static uint64 sys_prctl(uint64 op, uint64 arg1, uint64 arg2) {
         /* Load a Windows DLL into this process (ROADMAP item 19) - see
          * kernel/exec/ntmix.c. */
         return nt_genesis_pe_load(arg1, arg2);
+    case PR_GENESIS_TRACE:
+        /* Anyone may trace themselves: it reveals nothing the process could
+         * not already see of its own calls. */
+        p->trace = arg1 != 0;
+        return 0;
     default:
         return 0;
     }
@@ -5198,6 +5456,92 @@ static uint64 sys_clock_nanosleep(uint64 clock_id, uint64 flags,
     }
 }
 
+/* --- resource limits ------------------------------------------------------
+ *
+ * prlimit64 is the one real implementation; getrlimit and setrlimit are it
+ * with pid 0. The rules are Linux's (kernel/sys.c do_prlimit): the soft
+ * limit may not exceed the hard one (-EINVAL); raising a hard limit needs
+ * root (-EPERM); RLIMIT_NOFILE may not be raised past what the descriptor
+ * table can hold, even by root (-EPERM - Linux's nr_open check).
+ *
+ * RLIMIT_STACK's hard limit is the stack exec builds, and it is refused past
+ * that for the same reason: this kernel's user stack is a fixed 64KB, so a
+ * larger limit would be a promise with nothing behind it. `ulimit -s
+ * unlimited` therefore fails here where it succeeds on Linux - an honest
+ * difference, recorded in ROADMAP item 15.
+ *
+ * Another process's limits may be read or set by root, or by a process with
+ * the same uid (Linux also checks the saved and real ids, which are one id
+ * here). */
+static uint64 do_prlimit(uint64 pid, uint64 resource, uint64 new_ptr,
+                         uint64 old_ptr) {
+    process_t *me = proc_current();
+    process_t *t = me;
+    uint64 cur = 0, max = 0;
+
+    if (resource >= RLIMIT_COUNT) {
+        return (uint64)-22;
+    }
+    if (pid != 0 && (int)pid != me->tgid && (int)pid != me->pid) {
+        t = proc_find((int)pid);
+        if (t == NULL || t->state == PROC_UNUSED || t->state == PROC_ZOMBIE) {
+            return (uint64)-3;          /* -ESRCH */
+        }
+        if (me->uid != 0 && me->uid != t->uid) {
+            return (uint64)-1;          /* -EPERM */
+        }
+    }
+    if (new_ptr != 0) {
+        const uint64 *nl = (const uint64 *)new_ptr;
+
+        if (!user_range_ok(new_ptr, 16)) {
+            return (uint64)-14;
+        }
+        cur = nl[0];
+        max = nl[1];
+        if (cur > max) {
+            return (uint64)-22;
+        }
+        if (max > t->rlim[resource].max && me->uid != 0) {
+            return (uint64)-1;
+        }
+        if (resource == RLIMIT_NOFILE && max > MAX_HANDLES) {
+            return (uint64)-1;
+        }
+        if (resource == RLIMIT_STACK && max > USER_STACK_SIZE) {
+            return (uint64)-1;
+        }
+    }
+    if (old_ptr != 0) {
+        uint64 *ol = (uint64 *)old_ptr;
+
+        if (!user_range_ok(old_ptr, 16)) {
+            return (uint64)-14;
+        }
+        ol[0] = t->rlim[resource].cur;
+        ol[1] = t->rlim[resource].max;
+    }
+    if (new_ptr != 0) {
+        t->rlim[resource].cur = cur;
+        t->rlim[resource].max = max;
+    }
+    return 0;
+}
+
+static uint64 sys_getrlimit(uint64 resource, uint64 old_ptr) {
+    if (old_ptr == 0) {
+        return (uint64)-14;
+    }
+    return do_prlimit(0, resource, 0, old_ptr);
+}
+
+static uint64 sys_setrlimit(uint64 resource, uint64 new_ptr) {
+    if (new_ptr == 0) {
+        return (uint64)-14;
+    }
+    return do_prlimit(0, resource, new_ptr, 0);
+}
+
 /* times(2). Genesis accounts run_ticks per process (sched.c), which is
  * exactly tms_utime + tms_stime with no way to separate the two - there is
  * no user/kernel time split in the accounting. Reported as user time with
@@ -5212,12 +5556,47 @@ static uint64 sys_times(uint64 buf_ptr) {
         }
         /* cpu_ticks for the same reason clock_gettime uses it: times(2) is
          * defined to be monotonic, and run_ticks is decayed. */
-        tms[0] = p->cpu_ticks;    /* tms_utime  */
-        tms[1] = 0;               /* tms_stime  */
-        tms[2] = 0;               /* tms_cutime */
-        tms[3] = 0;               /* tms_cstime */
+        tms[0] = proc_group_cpu_ticks(p);  /* tms_utime: the whole process */
+        tms[1] = 0;                        /* tms_stime  */
+        tms[2] = p->child_cpu_ticks;       /* tms_cutime: reaped children */
+        tms[3] = 0;                        /* tms_cstime */
     }
     return timer_ticks_now();
+}
+
+/* getrusage(2). The times are the same accounting times(2) reads - and,
+ * like it, all user time: there is no user/kernel split in this kernel's
+ * tick accounting, so ru_stime is zero rather than an invented share. The
+ * fourteen counters after the two timevals (maxrss, faults, context
+ * switches...) are not kept and are reported as zero, which is what Linux
+ * itself reports for the ones it does not maintain.
+ *
+ * RUSAGE_SELF is the whole thread group, RUSAGE_THREAD the caller alone,
+ * RUSAGE_CHILDREN the reaped descendants (see child_cpu_ticks). */
+#define RUSAGE_SELF_      0
+#define RUSAGE_CHILDREN_ (-1)
+#define RUSAGE_THREAD_    1
+
+static uint64 sys_getrusage(uint64 who, uint64 ru_ptr) {
+    process_t *p = proc_current();
+    int64 *ru = (int64 *)ru_ptr;
+    uint64 ticks, hz = timer_hz(), i;
+
+    switch ((int)who) {
+        case RUSAGE_SELF_:     ticks = proc_group_cpu_ticks(p); break;
+        case RUSAGE_CHILDREN_: ticks = p->child_cpu_ticks;      break;
+        case RUSAGE_THREAD_:   ticks = p->cpu_ticks;            break;
+        default:               return (uint64)-22;
+    }
+    if (!user_range_ok(ru_ptr, 144)) {
+        return (uint64)-14;
+    }
+    for (i = 0; i < 144 / 8; i++) {
+        ru[i] = 0;
+    }
+    ru[0] = (int64)(ticks / hz);                               /* utime.sec  */
+    ru[1] = (int64)((ticks % hz) * 1000000ULL / hz);           /* utime.usec */
+    return 0;
 }
 
 /* Signals delivered but blocked. A real answer, from the same word
@@ -5240,7 +5619,6 @@ static uint64 sys_rt_sigpending(uint64 set_ptr, uint64 setsize) {
  * successful return, it returns only when a handler has run. */
 static uint64 sys_rt_sigsuspend(uint64 mask_ptr, uint64 setsize) {
     process_t *p = proc_current();
-    uint64 saved;
 
     if (setsize != 8) {
         return (uint64)-22;
@@ -5248,13 +5626,16 @@ static uint64 sys_rt_sigsuspend(uint64 mask_ptr, uint64 setsize) {
     if (!user_ptr_ok(mask_ptr)) {
         return (uint64)-14;
     }
-    saved = p->sig_blocked;
-    p->sig_blocked = *(const uint64 *)mask_ptr;
+    /* The caller's mask comes back on the way OUT of the syscall, after the
+     * signal that ended the wait has been delivered under the temporary one
+     * - see sig_saved_mask in process.h. Restoring it here (which this used
+     * to do) re-blocked that signal first: bash's SIGCHLD handler never ran
+     * and the job it was waiting for was never reaped. */
+    signal_set_temp_mask(p, *(const uint64 *)mask_ptr);
 
     while (!signal_pending(p)) {
         sched_block(p);
     }
-    p->sig_blocked = saved;
     return (uint64)-4;                /* -EINTR, always */
 }
 
@@ -5835,16 +6216,15 @@ static uint64 sys_getcwd(char *buf, uint64 size) {
 /* --- tracing ------------------------------------------------------------
  * strace, from the inside. Every call prints before it runs, so when the
  * process dies the LAST line is what it was doing - which is the one fact a
- * register dump cannot give you.
+ * register dump cannot give you - and its result prints after it returns.
  *
- * Off now that the startup path reaches a prompt: an interactive shell issues
- * a burst of calls per keystroke, and a trace line between each one makes the
- * echo unreadable and scrolls the prompt off the screen. Set it back to 1 the
- * moment something unexplained happens - it is still the fastest way to find
- * out which call a process died in. */
-#define SYSCALL_TRACE 0
-
-#if SYSCALL_TRACE
+ * PER PROCESS, switched on at run time, not a compile-time switch. It used to
+ * be `#define SYSCALL_TRACE 0` for the whole machine, and turning it on made
+ * every process trace: an interactive shell issues a burst of calls per
+ * keystroke, so the one program being asked about drowned in everyone else's
+ * lines. Now prctl(PR_GENESIS_TRACE, 1) marks the caller, the mark is
+ * inherited across fork and kept across exec, and /bin/gtrace wraps that into
+ * `gtrace CMD ARGS...`. Nothing is printed for a process that did not ask. */
 static const char *syscall_name(uint64 nr) {
     switch (nr) {
         case SYS_read:            return "read";
@@ -5902,26 +6282,57 @@ static const char *syscall_name(uint64 nr) {
         case SYS_faccessat2:      return "faccessat2";
         case SYS_poll:            return "poll";
         case SYS_ppoll:           return "ppoll";
+        case SYS_select:          return "select";
+        case SYS_pselect6:        return "pselect6";
+        case SYS_getrlimit:       return "getrlimit";
+        case SYS_setrlimit:       return "setrlimit";
+        case SYS_getrusage:       return "getrusage";
         case SYS_futex:           return "futex";
         case SYS_gettid:          return "gettid";
         case SYS_getcwd:          return "getcwd";
         case SYS_chdir:           return "chdir";
-        /* A block of the DISPATCH switch used to sit here, spliced into the
-         * middle of this name table: forty-six lines of
-         * `return sys_rt_sigaction(frame->...)` and friends inside a function
-         * whose return type is const char *. It was invisible because
-         * SYSCALL_TRACE is 0, so the whole function is behind an #if and
-         * nothing ever compiled it.
-         *
-         * The effect was that turning the trace on - which the comment above
-         * recommends as the fastest way to find out which call a process died
-         * in - did not build. The one tool you reach for when something is
-         * unexplained was itself broken, and you would have found that out
-         * while already debugging something else.
-         *
-         * Dead code behind an #if is still code, and nothing had ever
-         * compiled this. That is the actual lesson: a debug facility that is
-         * never built is a debug facility that does not work. */
+        /* A block of the DISPATCH switch once sat here, spliced into this
+         * name table, and nobody noticed because the table was behind
+         * `#if SYSCALL_TRACE` and never compiled - so turning the trace on did
+         * not build. The trace is always compiled now, which is the fix: a
+         * debug facility that is never built is one that does not work. */
+        case SYS_readv:             return "readv";
+        case SYS_pread64:           return "pread64";
+        case SYS_pwrite64:          return "pwrite64";
+        case SYS_dup3:              return "dup3";
+        case SYS_fsync:             return "fsync";
+        case SYS_fdatasync:         return "fdatasync";
+        case SYS_umask:             return "umask";
+        case SYS_madvise:           return "madvise";
+        case SYS_msync:             return "msync";
+        case SYS_sched_yield:       return "sched_yield";
+        case SYS_setsid:            return "setsid";
+        case SYS_getsid:            return "getsid";
+        case SYS_setresuid:         return "setresuid";
+        case SYS_setresgid:         return "setresgid";
+        case SYS_getresuid:         return "getresuid";
+        case SYS_getresgid:         return "getresgid";
+        case SYS_clock_getres:      return "clock_getres";
+        case SYS_clock_nanosleep:   return "clock_nanosleep";
+        case SYS_times:             return "times";
+        case SYS_rt_sigpending:     return "rt_sigpending";
+        case SYS_rt_sigsuspend:     return "rt_sigsuspend";
+        case SYS_pause:             return "pause";
+        case SYS_truncate:          return "truncate";
+        case SYS_ftruncate:         return "ftruncate";
+        case SYS_chmod:             return "chmod";
+        case SYS_fchmod:            return "fchmod";
+        case SYS_chown:             return "chown";
+        case SYS_fchown:            return "fchown";
+        case SYS_statfs:            return "statfs";
+        case SYS_fstatfs:           return "fstatfs";
+        case SYS_mkdir:             return "mkdir";
+        case SYS_rmdir:             return "rmdir";
+        case SYS_unlink:            return "unlink";
+        case SYS_rename:            return "rename";
+        case SYS_mkdirat:           return "mkdirat";
+        case SYS_unlinkat:          return "unlinkat";
+        case SYS_renameat:          return "renameat";
         case SYS_rt_sigreturn:  return "rt_sigreturn";
         case SYS_kill:          return "kill";
         case SYS_setpgid:       return "setpgid";
@@ -5964,7 +6375,9 @@ static const char *syscall_name(uint64 nr) {
 static void trace_call(struct syscall_frame *f) {
     const char *name = syscall_name(f->rax);
 
-    print_string("  >", 0x08);
+    print_string("  [", 0x08);
+    print_hex((uint32)proc_current()->pid, 0x08);
+    print_string("] ", 0x08);
     if (name != NULL) {
         print_string(name, 0x08);
     } else {
@@ -5976,10 +6389,20 @@ static void trace_call(struct syscall_frame *f) {
     print_hex64(f->rsi, 0x08);
     print_string(",", 0x08);
     print_hex64(f->rdx, 0x08);
+    print_string(",", 0x08);
+    print_hex64(f->r10, 0x08);
     print_string(")\n", 0x08);
 }
-#endif   /* SYSCALL_TRACE - the name table and the printer are only referenced
-          * from here, so both go with it rather than sitting unused. */
+
+static void trace_result(uint64 nr, uint64 rc) {
+    print_string("  [", 0x08);
+    print_hex((uint32)proc_current()->pid, 0x08);
+    print_string("] ", 0x08);
+    print_hex((uint32)nr, 0x08);
+    print_string(" = ", 0x08);
+    print_hex64(rc, 0x08);
+    print_string("\n", 0x08);
+}
 
 
 /* The preemption point.
@@ -6028,7 +6451,13 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
      * user mode work the same whichever ABI made the call. */
     pers = personality_route(frame, &rc);
     if (pers != NULL) {
+        uint64 nr = frame->rax;
+        int traced = proc_current() != NULL && proc_current()->trace;
+
         rc = pers->dispatch(frame);
+        if (traced && proc_current() != NULL && proc_current()->trace) {
+            trace_result(nr, rc);
+        }
     }
 
     /* Signal delivery goes here rather than in return_to_user, because it
@@ -6052,6 +6481,9 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
                 rc = frame->rax;
             }
         }
+        /* A temporary mask nobody's signal frame took over: put the
+         * caller's back now. */
+        signal_restore_temp_mask(me);
     }
 
     /* Always a return to user mode from here, so the flag is unconditional. */
@@ -6060,9 +6492,9 @@ uint64 syscall_dispatch(struct syscall_frame *frame) {
 }
 
 uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
-#if SYSCALL_TRACE
-    trace_call(frame);
-#endif
+    if (proc_current()->trace) {
+        trace_call(frame);
+    }
 
     switch (frame->rax) {
         case SYS_read:
@@ -6500,7 +6932,16 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
             return sys_poll(frame->rdi, frame->rsi, frame->rdx);
 
         case SYS_ppoll:
-            return sys_ppoll(frame->rdi, frame->rsi, frame->rdx, frame->r10);
+            return sys_ppoll(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                             frame->r8);
+
+        case SYS_select:
+            return sys_select(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                              frame->r8);
+
+        case SYS_pselect6:
+            return sys_pselect6(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                                frame->r8, frame->r9);
 
         case SYS_set_robust_list:
             /* Declined, and the change from returning 0 is deliberate.
@@ -6521,11 +6962,19 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
              * later one. */
             return (uint64)-38;
 
-        /* Declined deliberately. libc probes these and copes with failure;
+        /* Declined deliberately. libc probes it and copes with failure;
          * pretending to succeed would be worse than saying no. */
         case SYS_rseq:
-        case SYS_prlimit64:
             return (uint64)-38;   /* -ENOSYS */
+
+        case SYS_prlimit64:
+            return do_prlimit(frame->rdi, frame->rsi, frame->rdx, frame->r10);
+        case SYS_getrlimit:
+            return sys_getrlimit(frame->rdi, frame->rsi);
+        case SYS_setrlimit:
+            return sys_setrlimit(frame->rdi, frame->rsi);
+        case SYS_getrusage:
+            return sys_getrusage(frame->rdi, frame->rsi);
         case SYS_readlinkat:
             return (uint64)-22;   /* -EINVAL */
 

@@ -235,6 +235,14 @@ elif [ -f src/elfmix/elfmix.c ]; then
     echo "elfmix: no musl toolchain - skipping" >&2
 fi
 
+# gtrace, the per-process syscall tracer's front end. musl, static.
+if [ -f src/gtrace.c ] && [ -n "$MUSL_CC_FOUND" ]; then
+    "$MUSL_CC_FOUND" -std=c11 -D_GNU_SOURCE \
+        -Wall -Wextra -Werror=implicit-function-declaration -O1 \
+        -static -no-pie -o root/bin/gtrace src/gtrace.c
+    echo "built root/bin/gtrace (musl, static)"
+fi
+
 # ntdll.dll, built with MinGW-w64 as a host tool and staged into
 # /wsr/System32. Skips itself with a message if MinGW is not installed, so
 # this script still works on a machine that only builds the Linux side.

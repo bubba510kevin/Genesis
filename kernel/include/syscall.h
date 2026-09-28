@@ -209,6 +209,11 @@
 #define SYS_faccessat2     439
 #define SYS_poll             7
 #define SYS_ppoll          271
+#define SYS_select          23
+#define SYS_pselect6       270
+#define SYS_getrlimit       97
+#define SYS_setrlimit      160
+#define SYS_getrusage       98
 #define SYS_futex          202
 #define SYS_gettid         186
 
@@ -309,13 +314,8 @@
 #define SEEK_CUR      1
 #define SEEK_END      2
 
-#define TCGETS        0x5401
-#define TCSETS        0x5402
-#define TCSETSW       0x5403
-#define TCSETSF       0x5404
-#define TIOCGWINSZ    0x5413
-#define TIOCGPGRP     0x540F
-#define TIOCSPGRP     0x5410
+/* The terminal ioctl numbers (TCGETS, TIOCSPGRP...) live in kernel/dev/tty.c,
+ * the only code that answers them. */
 
 /* Linux's console display mode (<linux/kd.h>): a program that draws into
  * /dev/fb0 asks the console to stop drawing over it. */

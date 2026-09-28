@@ -2342,6 +2342,321 @@ static void test_fpu(void) {
     __asm__ volatile ("fldcw %0" : : "m"(cw));
 }
 
+/* --- phase 1: what GNU bash needs (ROADMAP item 15) ------------------------
+ *
+ * Each of these was found by running bash, not by reading a table: readline
+ * waits in pselect6, `ulimit` is prlimit64, `time` is getrusage, a job-
+ * control shell waits for a specific pid with WUNTRACED and blocks SIGCHLD
+ * around rt_sigsuspend. The checks are on the syscall ABI directly, for the
+ * reason systest is freestanding at all. */
+
+#define SYS_select        23
+#define SYS_pselect6     270
+#define SYS_ppoll_       271
+#define SYS_getrlimit     97
+#define SYS_setrlimit    160
+#define SYS_getrusage     98
+#define SYS_rt_sigsuspend 130
+#define SYS_pause         34
+#define SYS_nanosleep     35
+#define EMFILE    24
+#define SIGTERM_  15
+#define SIGKILL_   9
+#define SIGSTOP_  19
+#define SIGCONT_  18
+#define RLIMIT_NOFILE_ 7
+#define RLIMIT_STACK_  3
+#define WUNTRACED_  2
+#define WCONTINUED_W 8
+#define WNOHANG_    1
+
+/* A temporary mask must let the signal that ends the wait be DELIVERED,
+ * and the caller's own mask must come back afterwards. Both calls here used
+ * to get one of those wrong: rt_sigsuspend restored the old mask before
+ * delivery (so a normally-blocked signal - SIGCHLD in bash - was pended and
+ * its handler never ran), and ppoll refused a mask outright. */
+static void nap_ms(i64 ms) {
+    i64 ts[2];
+
+    ts[0] = ms / 1000;
+    ts[1] = (ms % 1000) * 1000000;
+    sc2(SYS_nanosleep, ts, 0);
+}
+
+static void test_temp_masks(void) {
+    struct kernel_sigaction sa, old;
+    u64 block = 1ULL << (SIGUSR1 - 1), empty = 0, now = 0;
+    int fds[2];
+    struct { int fd; short events, revents; } pfd;
+    i64 ts[2];
+
+    section("phase 1: temporary signal masks");
+
+    sa.handler  = (u64)&sig_handler;
+    sa.flags    = SA_RESTORER;
+    sa.restorer = (u64)&systest_restorer;
+    sa.mask     = 0;
+    sc4(SYS_rt_sigaction, SIGUSR1, &sa, &old, 8);
+
+    /* rt_sigsuspend. */
+    sc4(SYS_rt_sigprocmask, 0 /* SIG_BLOCK */, &block, 0, 8);
+    handler_ran = 0;
+    sc2(SYS_kill, my_pid, SIGUSR1);
+    check(handler_ran == 0, "a blocked SIGUSR1 stays pending");
+    check_eq(sc2(SYS_rt_sigsuspend, &empty, 8), -EINTR,
+             "rt_sigsuspend with it unblocked returns -EINTR");
+    check(handler_ran == 1,
+          "and the handler RAN - the old mask used to come back first");
+    sc4(SYS_rt_sigprocmask, 0, 0, &now, 8);
+    check((now & block) != 0, "the caller's mask is back afterwards");
+
+    /* ppoll: the same shape, with a descriptor that never becomes ready. */
+    check_eq(sc1(SYS_pipe, fds), 0, "a pipe to wait on");
+    pfd.fd = fds[0];
+    pfd.events = 1;             /* POLLIN */
+    pfd.revents = 0;
+    ts[0] = 5;                  /* long enough to notice a missed wake */
+    ts[1] = 0;
+    handler_ran = 0;
+    sc2(SYS_kill, my_pid, SIGUSR1);
+    check_eq(sc6(SYS_ppoll_, (i64)&pfd, 1, (i64)ts, (i64)&empty, 8, 0), -EINTR,
+             "ppoll with a mask unblocking a pending signal is -EINTR at once");
+    check(handler_ran == 1, "and the handler ran under that mask");
+    now = 0;
+    sc4(SYS_rt_sigprocmask, 0, 0, &now, 8);
+    check((now & block) != 0, "and again the caller's mask came back");
+    check_eq(sc6(SYS_ppoll_, (i64)&pfd, 1, (i64)ts, (i64)&empty, 4, 0), -EINVAL,
+             "a sigsetsize other than 8 is -EINVAL");
+
+    sc4(SYS_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &block, 0, 8);
+    sc4(SYS_rt_sigaction, SIGUSR1, &old, 0, 8);
+    sc1(SYS_close, fds[0]);
+    sc1(SYS_close, fds[1]);
+}
+
+static void test_select(void) {
+    int fds[2];
+    u64 rset[16], wset[16];
+    i64 tv[2], ts[2];
+    i64 r;
+
+    section("phase 1: select and pselect6");
+
+    check_eq(sc1(SYS_pipe, fds), 0, "a pipe");
+    rset[0] = 1ULL << fds[0];
+    tv[0] = 0;
+    tv[1] = 20000;              /* 20ms */
+    check_eq(sc5(SYS_select, fds[0] + 1, rset, 0, 0, tv), 0,
+             "select on an empty pipe times out with 0");
+    check_eq(rset[0], 0, "and clears the bit it was asked about");
+    check(tv[0] == 0 && tv[1] == 0, "and writes back the time left - none");
+
+    sc3(SYS_write, fds[1], "x", 1);
+    rset[0] = 1ULL << fds[0];
+    wset[0] = 1ULL << fds[1];
+    tv[0] = 1;
+    tv[1] = 0;
+    r = sc5(SYS_select, fds[1] + 1, rset, wset, 0, tv);
+    check_eq(r, 2, "readable AND writable: two bits, counted separately");
+    check(rset[0] == (1ULL << fds[0]) && wset[0] == (1ULL << fds[1]),
+          "each set keeps exactly its ready bit");
+
+    rset[0] = 1ULL << fds[0];
+    ts[0] = 0;
+    ts[1] = 0;
+    check_eq(sc6(SYS_pselect6, fds[0] + 1, (i64)rset, 0, 0, (i64)ts, 0), 1,
+             "pselect6 with a zero timeout is a poll: the byte is there");
+
+    rset[0] = 1ULL << 30;       /* not open */
+    ts[0] = 1;
+    check_eq(sc6(SYS_pselect6, 31, (i64)rset, 0, 0, (i64)ts, 0), -EBADF,
+             "a closed descriptor in a set is -EBADF for the whole call");
+
+    sc1(SYS_close, fds[0]);
+    sc1(SYS_close, fds[1]);
+}
+
+static void test_rlimits(void) {
+    u64 lim[2], lim2[2];
+    i64 pid, fd;
+    int status = 0;
+
+    section("phase 1: resource limits");
+
+    check_eq(sc2(SYS_getrlimit, RLIMIT_NOFILE_, lim), 0, "getrlimit(NOFILE)");
+    check(lim[0] == 32 && lim[1] == 32,
+          "is the real descriptor table - 32, soft and hard");
+    check_eq(sc4(SYS_prlimit64, 0, RLIMIT_STACK_, 0, lim), 0,
+             "prlimit64 reads too");
+    check(lim[1] == 0x10000, "RLIMIT_STACK's hard limit is the 64KB exec builds");
+
+    lim2[0] = 64;
+    lim2[1] = 32;
+    check_eq(sc2(SYS_setrlimit, RLIMIT_NOFILE_, lim2), -EINVAL,
+             "soft above hard is -EINVAL");
+    lim2[0] = 64;
+    lim2[1] = 64;
+    check_eq(sc2(SYS_setrlimit, RLIMIT_NOFILE_, lim2), -EPERM,
+             "past what the table holds is -EPERM, even for root");
+
+    /* Lowered in a child, so the rest of this run keeps its descriptors. */
+    pid = sc0(SYS_fork);
+    if (pid == 0) {
+        u64 l[2] = { 6, 32 };
+        u64 g[2];
+        int bad = 0;
+
+        if (sc2(SYS_setrlimit, RLIMIT_NOFILE_, l) != 0) bad |= 1;
+        fd = sc1(SYS_dup, 0);
+        while (fd >= 0 && fd < 6) {
+            fd = sc1(SYS_dup, 0);
+        }
+        if (fd != -EMFILE) bad |= 2;                 /* ENFORCED */
+        if (sc2(SYS_dup2, 0, 9) != -EBADF) bad |= 4; /* dup2 past it too */
+        if (sc0(SYS_fork) == 0) {                    /* and it is inherited */
+            sc2(SYS_getrlimit, RLIMIT_NOFILE_, g);
+            sc1(SYS_exit, g[0] == 6 ? 0 : 1);
+        }
+        sc4(SYS_wait4, -1, &status, 0, 0);
+        if (status != 0) bad |= 8;
+        sc1(SYS_exit, bad);
+    }
+    sc4(SYS_wait4, pid, &status, 0, 0);
+    check_eq((status >> 8) & 0xFF, 0,
+             "a lowered NOFILE is enforced by dup and dup2, and inherited");
+}
+
+static void test_rusage(void) {
+    i64 ru[18];
+    i64 pid;
+    int status;
+
+    section("phase 1: getrusage");
+
+    check_eq(sc2(SYS_getrusage, 0 /* SELF */, ru), 0, "RUSAGE_SELF");
+    check(ru[0] >= 0 && ru[1] >= 0 && ru[1] < 1000000, "a sane utime");
+    check_eq(sc2(SYS_getrusage, 7, ru), -EINVAL, "an unknown who is -EINVAL");
+
+    pid = sc0(SYS_fork);
+    if (pid == 0) {
+        volatile u64 n = 0;
+        u64 t0[2], t1[2];
+
+        /* Burn a few ticks so the parent has something to count. */
+        sc2(SYS_clock_gettime_, 0, t0);
+        do {
+            n++;
+            sc2(SYS_clock_gettime_, 0, t1);
+        } while ((t1[0] - t0[0]) * 1000000000ULL + t1[1] - t0[1] < 60000000ULL);
+        sc1(SYS_exit, 0);
+    }
+    sc4(SYS_wait4, pid, &status, 0, 0);
+    check_eq(sc2(SYS_getrusage, -1 /* CHILDREN */, ru), 0, "RUSAGE_CHILDREN");
+    check(ru[0] * 1000000 + ru[1] > 0,
+          "counts a reaped child's CPU time (it used to be always zero)");
+}
+
+static void test_wait_select(void) {
+    i64 a, b, r;
+    int status = 0;
+
+    section("phase 1: wait4 selection and status");
+
+    /* a exits WHILE the parent is blocked waiting for b: its SIGCHLD
+     * (ignored by default) must neither be reaped as the answer nor
+     * interrupt the wait. Pending-but-ignored signals used to do the second
+     * - wait4 returned -EINTR. */
+    a = sc0(SYS_fork);
+    if (a == 0) {
+        nap_ms(30);
+        sc1(SYS_exit, 3);
+    }
+    b = sc0(SYS_fork);
+    if (b == 0) {
+        nap_ms(120);
+        sc1(SYS_exit, 5);
+    }
+    r = sc4(SYS_wait4, b, &status, 0, 0);
+    check_eq(r, b, "wait4(pid) returns THAT child even with another reapable");
+    check_eq((status >> 8) & 0xFF, 5, "with its own status");
+    r = sc4(SYS_wait4, -1, &status, 0, 0);
+    check_eq(r, a, "and the other is still there for wait4(-1)");
+    check_eq((status >> 8) & 0xFF, 3, "unharmed");
+
+    a = sc0(SYS_fork);
+    if (a == 0) {
+        sc2(SYS_kill, sc0(SYS_getpid), SIGTERM_);
+        sc1(SYS_exit, 0);           /* not reached */
+    }
+    sc4(SYS_wait4, a, &status, 0, 0);
+    check_eq(status & 0x7F, SIGTERM_,
+             "a child killed by SIGTERM is WIFSIGNALED with WTERMSIG 15");
+    check_eq((status >> 8) & 0xFF, 0, "not an exit(143)");
+
+    check_eq(sc4(SYS_wait4, 99999, &status, 0, 0), -ECHILD,
+             "waiting for somebody else's pid is -ECHILD");
+}
+
+static void test_job_control(void) {
+    i64 pid, r;
+    int status = 0;
+
+    section("phase 1: stop, continue, kill");
+
+    /* A child that never makes a system call, so the stop has to be taken
+     * from the interrupt path - the harder of the two. */
+    pid = sc0(SYS_fork);
+    if (pid == 0) {
+        for (;;) {
+            __asm__ volatile ("" ::: "memory");
+        }
+    }
+    check_eq(sc2(SYS_kill, pid, SIGSTOP_), 0, "SIGSTOP sent");
+    r = sc4(SYS_wait4, pid, &status, WUNTRACED_, 0);
+    check_eq(r, pid, "wait4(WUNTRACED) reports the stop");
+    check_eq(status, (SIGSTOP_ << 8) | 0x7F, "as WIFSTOPPED, WSTOPSIG 19");
+    check_eq(sc4(SYS_wait4, pid, &status, WUNTRACED_ | WNOHANG_, 0), 0,
+             "a stop is reported once, not again");
+
+    check_eq(sc2(SYS_kill, pid, SIGCONT_), 0, "SIGCONT sent");
+    r = sc4(SYS_wait4, pid, &status, WCONTINUED_W, 0);
+    check_eq(r, pid, "wait4(WCONTINUED) reports the continue");
+    check_eq(status, 0xFFFF, "as WIFCONTINUED");
+
+    sc2(SYS_kill, pid, SIGSTOP_);
+    sc4(SYS_wait4, pid, &status, WUNTRACED_, 0);
+    check_eq(sc2(SYS_kill, pid, SIGKILL_), 0, "SIGKILL to a STOPPED child");
+    r = sc4(SYS_wait4, pid, &status, 0, 0);
+    check_eq(r, pid, "is reaped - a stop does not make a process unkillable");
+    check_eq(status & 0x7F, SIGKILL_, "killed by signal 9");
+
+    /* The same with a child blocked in a system call. */
+    pid = sc0(SYS_fork);
+    if (pid == 0) {
+        for (;;) {
+            sc0(SYS_pause);
+        }
+    }
+    nap_ms(20);
+    sc2(SYS_kill, pid, SIGSTOP_);
+    r = sc4(SYS_wait4, pid, &status, WUNTRACED_, 0);
+    check(r == pid && (status & 0xFF) == 0x7F,
+          "a child blocked in pause() stops too");
+    sc2(SYS_kill, pid, SIGCONT_);
+    sc2(SYS_kill, pid, SIGKILL_);
+    r = sc4(SYS_wait4, pid, &status, 0, 0);
+    check(r == pid && (status & 0x7F) == SIGKILL_, "and is killed after");
+}
+
+static void test_phase1(void) {
+    test_temp_masks();
+    test_select();
+    test_rlimits();
+    test_rusage();
+    test_wait_select();
+    test_job_control();
+}
+
 /* --- odds and ends ------------------------------------------------------ */
 
 static void test_declined(void) {
@@ -2349,7 +2664,8 @@ static void test_declined(void) {
 
     check_eq(sc4(SYS_rseq, 0, 0, 0, 0), -ENOSYS,
              "rseq says no rather than pretending");
-    check_eq(sc4(SYS_prlimit64, 0, 0, 0, 0), -ENOSYS, "prlimit64 likewise");
+    /* prlimit64 used to be declined here too; it is real now (see the
+     * phase 1 section). */
 }
 
 /* ROADMAP item 19: the kernel picks the syscall table per CALL. A number
@@ -3083,6 +3399,7 @@ void _start(void) {
     test_nt_routing();
     test_signals();
     test_fork();
+    test_phase1();
     test_pipes();
     test_clone();
     test_smp();

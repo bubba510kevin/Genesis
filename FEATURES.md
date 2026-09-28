@@ -215,8 +215,18 @@ and TSC-based short delays (a driver may call `DELAY()` before interrupts are
 on). Clock resolution is **one tick** and is reported honestly.
 
 ### Console and input ✅
-- A **tty** with a line discipline, echo and Ctrl-C (`kernel/dev/screen.c`,
-  `tty.c`). The console draws into the **framebuffer** when there is one
+- A **terminal with a real termios** (`kernel/dev/tty.c`, new 2026-09-27):
+  canonical mode with erase/kill/word-erase/literal-next/reprint, and **raw
+  mode** with `VMIN`/`VTIME` exactly as termios(3) defines them - what
+  readline needs. Input is processed **when it is typed** (as Linux's n_tty
+  does), so **Ctrl-C, Ctrl-Z and Ctrl-backslash raise SIGINT, SIGTSTP and
+  SIGQUIT** in the
+  foreground process group even when nothing is reading the terminal, and
+  type-ahead is echoed as typed. `TCGETS`/`TCSETS[WF]`, `TCFLSH`, `FIONREAD`,
+  `TIOC[GS]PGRP`, `TIOCSCTTY`/`TIOCNOTTY`/`TIOCGSID`, `TIOC[GS]WINSZ` (a new
+  size sends SIGWINCH). A background process group reading the terminal gets
+  **SIGTTIN**. PS/2 arrow and navigation keys send the VT100 sequences
+  (`ESC [ A`...). The console draws into the **framebuffer** when there is one
   (8x16 BIOS font, 16 VGA colours, 128x48 at 1024x768, repainting only the
   cells that changed) and into **VGA text** otherwise. `TIOCGWINSZ` reports
   the real grid. A program that draws to the screen takes it with Linux's
@@ -316,6 +326,18 @@ personality (Linux or Windows). Supported:
 signal on the alternate stack stacks *below* the first instead of overwriting
 it. Signal handlers are shared by a thread group and signal masks are
 per-thread, as POSIX specifies.
+- **Handlers run from the interrupt path too** (new 2026-09-27): a program
+  that never makes a system call still gets its handler at the next timer
+  tick (bash's `while :; do :; done` stops on Ctrl-C). The frame saves every
+  register and the **FPU/SSE state**, and `rt_sigreturn` returns by `iretq`.
+- **Temporary masks done right**: `rt_sigsuspend`, `pselect6` and `ppoll`
+  deliver the signal that ends the wait under the temporary mask and restore
+  the caller's afterwards (Linux's `TIF_RESTORE_SIGMASK`).
+- **Job control**: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU stop the whole process,
+  SIGCONT resumes it, SIGKILL reaches a stopped one; the parent sees stops
+  and continues through `wait4(WUNTRACED|WCONTINUED)` and `waitid`, and a
+  death by signal is reported as `WIFSIGNALED`. `wait4` honours all four pid
+  forms (pid, 0, -1, -pgid).
 
 ### POSIX threads ✅
 `clone()` with the thread flags creates a task that **shares** the address
@@ -427,14 +449,14 @@ point. About **130** syscall numbers are dispatched, in these groups:
 | Memory | `brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`, `rt_sigpending`, `sigaltstack`, `pause` |
 | Time | `clock_gettime`, `clock_getres`, `clock_nanosleep`, `nanosleep`, `gettimeofday`, `times` |
-| Waiting | `poll`, `ppoll`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
+| Waiting | `poll`, `ppoll` (with a signal mask), `select`, `pselect6`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
+| Limits & usage | `getrlimit`, `setrlimit`, `prlimit64` (per process, inherited; `RLIMIT_NOFILE` enforced, `RLIMIT_STACK` is the real stack), `getrusage`, `times` (with reaped children's time) |
 | CPUs | `sched_setaffinity`, `sched_getaffinity`, `getcpu` |
 | Sockets | `socket`, `bind`, `connect`, `listen`, `accept`, `accept4`, `shutdown`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt` |
 | Misc | `uname`, `arch_prctl`, `set_tid_address`, `set_robust_list`, `getrandom`, `prctl`, `reboot` |
 
 **Honest errors.** A call that can't be supported fails with the correct
-errno rather than faking success. For example, `rseq` and `prlimit64` return
-`-ENOSYS`. The socket calls translate at the boundary between the FreeBSD stack
+errno rather than faking success. For example, `rseq` returns `-ENOSYS`. The socket calls translate at the boundary between the FreeBSD stack
 and Linux programs: sockaddr layout, errno numbers (ECONNREFUSED is 111, not
 BSD's 61), `MSG_` flags and socket-option numbers.
 
@@ -693,11 +715,13 @@ same object.
 | Auxiliary vector | ✅ | `AT_PHDR`, `AT_ENTRY`, `AT_PAGESZ`, … |
 | TLS (initial-exec) | ✅ | Through `arch_prctl`/FS base |
 | **musl** C library | ✅ | `mhello` and `ls` are ordinary C programs linked against real musl |
-| Shell | 🟡 | **BusyBox ash** runs as the interactive shell, but this BusyBox build has no applets (no `echo`/`cat`/`rm`); a fuller build is needed |
+| Shell | 🟡 | **GNU bash 5.3** (upstream, unmodified, static musl; `src/bash/build.sh`) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. Not yet the login shell (BusyBox ash is), and there are no utilities to run (no `cat`/`head`) - ROADMAP item 15 |
 | vDSO | ❌ | |
 
-Programs in `/bin`: `busybox` (shell), `ls` (musl), `mhello` (musl), `hello`
-(freestanding), `mkprobe`, `systest`, `verif`, plus the Windows ones in §10.
+Programs in `/bin`: `bash` (GNU bash), `busybox` (shell), `ls` (musl),
+`mhello` (musl), `gtrace` (runs a command with the kernel's syscall trace on),
+`hello` (freestanding), `mkprobe`, `systest`, `verif`, plus the Windows ones
+in §10.
 
 **Filesystem layout.** A standard Linux tree plus **`/wsr`**, the "Windows
 system repository", holding Genesis's rewritten NT components and a Windows
@@ -930,11 +954,17 @@ Collected in one place so nobody has to discover them the hard way:
   can be mapped; files cannot.
 - **No USB** (no controller or HID drivers); input is PS/2 or serial.
 - **No NVMe, no GPT**; ATA is PIO-only.
-- **BusyBox has no applets**, just the shell.
+- **BusyBox has no applets**, just the shell - so bash has no `cat`, `head`
+  or `ls -l` to run either.
+- **Loading a large binary is slow under emulation**: exec reads the whole
+  file through polled ATA PIO, about 25 seconds for bash's 1.4MB under TCG.
 - **Windows**: no registry, COM, child processes, or GUI DLL support yet;
   kernel32 is a small subset.
 - **Clock resolution is one timer tick.**
 - `exec` doesn't honour setuid/setgid bits.
+- A system call interrupted by a job-control stop returns `-EINTR` after
+  SIGCONT rather than restarting; the orphaned-process-group rule for
+  SIGTSTP/SIGTTIN/SIGTTOU is not applied.
 
 ---
 
@@ -956,7 +986,7 @@ The work is organized into **four phases** (THE PLAN in `ROADMAP.md`):
 
 | Phase | What | ROADMAP | Status |
 |---|---|---|---|
-| 1 | **Run GNU bash** as the login shell (readline, job control, its own test suite) | item 15 | ❌ BusyBox's shell runs today |
+| 1 | **Run GNU bash** as the login shell (readline, job control, its own test suite) | item 15 | 🟡 bash 5.3 runs interactively; select, rlimits, termios, job-control stops done; utilities, /tmp, /proc, symlinks and long names remain |
 | 2 | **A modern kernel**: the feature set of current Linux and of NT 10.0 (Windows 10/11) — syscalls, demand paging and a page cache, namespaces/cgroups, tmpfs/procfs/ext4, UEFI/ACPI/NVMe/USB, IPv6; NT's I/O manager, registry, tokens, ALPC, completion ports, and the ntoskrnl surface precompiled drivers import | item 16 (+ 4, 6, 9, 12b, 13, 14 kernel halves) | 🟡 a large base exists; the inventory is open |
 | 3 | **bash understands Windows**: drive-letter paths, `.exe`/`.bat` by bare name, Windows command lines and environment for PE children, CRLF scripts, NT exit codes, ^C as a console event | item 17 | 🟡 [GNTbash](https://github.com/bubba510kevin/GNTbash): paths, PATHEXT, PE argv/env, CRLF done; exit codes, console events and quoting need kernel work |
 | 4 | **The libraries**: non-GUI DLLs written by Genesis (loader, kernel32/kernelbase, C runtimes, advapi32, ws2_32, rpcrt4, COM); GUI DLLs and Linux GUI stacks **taken**, never written; Linux `.so` files from upstream | item 18 (+ 14 (e)-(o)) | 🟡 ntdll and kernel32 subsets; [GNTlibc](https://github.com/bubba510kevin/GNTlibc) brings upstream musl in as `libc.so` for `.so` files that use libc |

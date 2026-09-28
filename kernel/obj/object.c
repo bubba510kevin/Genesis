@@ -282,7 +282,7 @@ int handle_alloc(handle_t *table, open_file_t *file, uint32 flags) {
 }
 
 int handle_alloc_from(handle_t *table, int min, open_file_t *file, uint32 flags) {
-    int i;
+    int i, limit;
 
     if (file == NULL) {
         return -9;    /* -EBADF */
@@ -290,14 +290,15 @@ int handle_alloc_from(handle_t *table, int min, open_file_t *file, uint32 flags)
     if (min < 0) {
         min = 0;
     }
-    if (min >= MAX_HANDLES) {
+    limit = handle_table_limit(table);
+    if (min >= limit) {
         of_deref(file);
         return -24;   /* -EMFILE: the floor is already past the table */
     }
     /* Lowest free index at or above the floor. Not an optimisation - POSIX
      * guarantees it, and `cmd 2>&1` works by closing 1 and expecting the next
      * open to land there. */
-    for (i = min; i < MAX_HANDLES; i++) {
+    for (i = min; i < limit; i++) {
         if (table[i].file == NULL) {
             table[i].file  = file;   /* the caller's reference, transferred */
             table[i].flags = flags;
@@ -312,7 +313,10 @@ int handle_alloc_from(handle_t *table, int min, open_file_t *file, uint32 flags)
 }
 
 int handle_install_at(handle_t *table, int index, open_file_t *file, uint32 flags) {
-    if (index < 0 || index >= MAX_HANDLES || file == NULL) {
+    if (index < 0 || index >= handle_table_limit(table) || file == NULL) {
+        if (file != NULL) {
+            of_deref(file);   /* ownership is taken on failure too */
+        }
         return -9;
     }
     /* dup2(fd, fd) is defined to be a no-op returning fd. Closing first and

@@ -666,11 +666,13 @@ static void test_ppoll(void) {
     check_eq(sc4(SYS_ppoll, &pfd, 1, ts, 0), 1,
              "ppoll with a NULL mask is poll");
 
-    /* Declined rather than ignored, and that is the whole point of ppoll:
-     * accepting a mask without applying it would leave the race it exists to
-     * close wide open while telling the caller it had been closed. */
-    check_eq(sc4(SYS_ppoll, &pfd, 1, ts, 0x1234), -ENOSYS,
-             "ppoll REFUSES a signal mask rather than silently ignoring it");
+    /* The mask is applied now (systest's "phase 1" section checks that it
+     * really is - the signal it unblocks is delivered and the caller's mask
+     * comes back). Here: a mask with the wrong sigsetsize is -EINVAL, not
+     * accepted and misread. This check used to assert -ENOSYS, from when a
+     * mask was declined because nothing could apply one. */
+    check_eq(sc6(SYS_ppoll, (i64)&pfd, 1, (i64)ts, 0x1234, 4, 0), -EINVAL,
+             "ppoll refuses a signal mask of the wrong size");
 
     sc1(SYS_close, fd);
 }
