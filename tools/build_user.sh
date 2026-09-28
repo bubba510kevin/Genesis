@@ -291,6 +291,11 @@ fi
 if [ -f src/winwait/build.sh ]; then
     sh src/winwait/build.sh
 fi
+# libmixa.so/libmixb.so: Linux shared objects mix.exe loads (item 19, stage 3).
+# Built by the host gcc - they are freestanding - before mix.exe needs them.
+if [ -f src/somix/build.sh ]; then
+    sh src/somix/build.sh
+fi
 # mix.exe: PE and ELF code in one process (item 19).
 if [ -f src/winmix/build.sh ]; then
     sh src/winmix/build.sh

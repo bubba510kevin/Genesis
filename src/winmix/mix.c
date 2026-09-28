@@ -166,11 +166,186 @@ static void routing_tests(void) {
           "and so is 0x1FFF");
 }
 
+/* --- stage 3: a Linux .so in this process --------------------------------
+ *
+ * src/somix/libmixa.so and its dependency libmixb.so - freestanding shared
+ * objects built by the host gcc - loaded with LoadLibrary and called through
+ * GetProcAddress, as any Windows program would. */
+
+typedef int       (WINAPI *w_v_t)(void);
+typedef int       (WINAPI *w_i_t)(int);
+typedef int       (WINAPI *w_ii_t)(int, int);
+typedef long long (WINAPI *w_14_t)(long long, long long, long long, long long,
+                                   long long, long long, long long, long long,
+                                   long long, long long, long long, long long,
+                                   long long, long long);
+typedef double    (WINAPI *w_dd_t)(double, double);
+typedef const char *(WINAPI *w_name_t)(int);
+typedef long long (WINAPI *w_str_t)(const char *);
+typedef long long (WINAPI *w_l_t)(void);
+
+/* The raw System V symbol, for a signature the adapter cannot translate
+ * (an int then a double) and for a callback the .so calls back into. */
+typedef double (__attribute__((sysv_abi)) *s_id_t)(int, double);
+typedef int    (__attribute__((sysv_abi)) *s_cb_t)(int);
+typedef int    (WINAPI *w_callback_t)(s_cb_t, int);
+
+static __attribute__((sysv_abi)) int sysv_triple(int v) {
+    return v * 3;
+}
+
+/* Holds known values in every register Win64 says survives a call - RBX,
+ * RBP, RSI, RDI, R12-R15, XMM6, XMM15 - across a call to `fn` (in RCX),
+ * and returns 1 if they all did and fn returned 7. a_clobber, through the
+ * adapter, zeroes RSI, RDI and XMM6-15 the way any System V function may:
+ * only the adapter saving them makes this 1. */
+int probe_adapter(FARPROC fn);
+__asm__(
+".text\n"
+".globl probe_adapter\n"
+"probe_adapter:\n"
+"    pushq %rbx\n  pushq %rbp\n  pushq %rsi\n  pushq %rdi\n"
+"    pushq %r12\n  pushq %r13\n  pushq %r14\n  pushq %r15\n"
+"    subq $0x48, %rsp\n"
+"    movdqu %xmm6, 0x20(%rsp)\n  movdqu %xmm15, 0x30(%rsp)\n"
+"    movq %rcx, %r11\n"
+"    movabsq $0x1111111111111111, %rbx\n"
+"    movabsq $0x2222222222222222, %rbp\n"
+"    movabsq $0x3333333333333333, %rsi\n"
+"    movabsq $0x4444444444444444, %rdi\n"
+"    movabsq $0x5555555555555555, %r12\n"
+"    movabsq $0x6666666666666666, %r13\n"
+"    movabsq $0x7777777777777777, %r14\n"
+"    movabsq $0x8888888888888888, %r15\n"
+"    movabsq $0x9999999999999999, %rax\n"
+"    movq %rax, %xmm6\n  movq %rax, %xmm15\n"
+"    call *%r11\n"
+"    movl %eax, %r8d\n"
+"    xorl %eax, %eax\n"
+"    movabsq $0x1111111111111111, %rcx\n  cmpq %rcx, %rbx\n  jne 9f\n"
+"    movabsq $0x2222222222222222, %rcx\n  cmpq %rcx, %rbp\n  jne 9f\n"
+"    movabsq $0x3333333333333333, %rcx\n  cmpq %rcx, %rsi\n  jne 9f\n"
+"    movabsq $0x4444444444444444, %rcx\n  cmpq %rcx, %rdi\n  jne 9f\n"
+"    movabsq $0x5555555555555555, %rcx\n  cmpq %rcx, %r12\n  jne 9f\n"
+"    movabsq $0x6666666666666666, %rcx\n  cmpq %rcx, %r13\n  jne 9f\n"
+"    movabsq $0x7777777777777777, %rcx\n  cmpq %rcx, %r14\n  jne 9f\n"
+"    movabsq $0x8888888888888888, %rcx\n  cmpq %rcx, %r15\n  jne 9f\n"
+"    movabsq $0x9999999999999999, %rdx\n"
+"    movq %xmm6, %rcx\n  cmpq %rdx, %rcx\n  jne 9f\n"
+"    movq %xmm15, %rcx\n  cmpq %rdx, %rcx\n  jne 9f\n"
+"    cmpl $7, %r8d\n  jne 9f\n"
+"    movl $1, %eax\n"
+"9:\n"
+"    movdqu 0x20(%rsp), %xmm6\n  movdqu 0x30(%rsp), %xmm15\n"
+"    addq $0x48, %rsp\n"
+"    popq %r15\n  popq %r14\n  popq %r13\n  popq %r12\n"
+"    popq %rdi\n  popq %rsi\n  popq %rbp\n  popq %rbx\n"
+"    ret\n"
+);
+
+static int str_is(const char *a, const char *b) {
+    if (a == NULL_PTR) {
+        return 0;
+    }
+    while (*a != '\0' && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static void so_tests(void) {
+    HMODULE so, so2, dep;
+    FARPROC clob;
+
+    say("-- a Linux .so in a Windows program (LoadLibrary)\r\n");
+
+    so = LoadLibraryA("C:\\lib\\libmixa.so");
+    check(so != NULL_PTR, "LoadLibraryA(\"C:\\lib\\libmixa.so\") loads it");
+    if (so == NULL_PTR) {
+        return;
+    }
+    so2 = LoadLibraryA("libmixa.so");
+    check(so2 == so, "a bare \"libmixa.so\" is found in /lib: the same module");
+    dep = LoadLibraryA("libmixb.so");
+    check(dep != NULL_PTR && dep != so,
+          "its DT_NEEDED, libmixb.so, came with it (already loaded)");
+    check(GetProcAddress(so, "no_such_symbol") == NULL_PTR &&
+          GetLastError() == ERROR_PROC_NOT_FOUND,
+          "a missing symbol: NULL, ERROR_PROC_NOT_FOUND");
+    check(LoadLibraryA("nosuch.so") == NULL_PTR && GetLastError() == ERROR_MOD_NOT_FOUND,
+          "a missing .so: NULL, ERROR_MOD_NOT_FOUND");
+
+    check(((w_v_t)GetProcAddress(so, "a_ctor"))() == 42,
+          "its constructor (.init_array) ran");
+    check(((w_ii_t)GetProcAddress(so, "a_add"))(40, 2) == 42,
+          "a_add(40, 2) = 42 - through its PLT into libmixb (JUMP_SLOT)");
+    check(((w_i_t)GetProcAddress(so, "a_call_fp"))(5) == 6,
+          "a function pointer in its data (R_X86_64_64) calls libmixb");
+    check(str_is(((w_name_t)GetProcAddress(so, "a_name"))(2), "two"),
+          "its own pointer table (R_X86_64_RELATIVE): a_name(2) = \"two\"");
+    check(((w_v_t)GetProcAddress(so, "a_bump"))() == 1 &&
+          ((w_v_t)GetProcAddress(so, "a_bump"))() == 2 &&
+          ((w_ii_t)GetProcAddress(dep, "b_add"))(1, 1) == 4,
+          "libmixb's data through libmixa's GOT (GLOB_DAT): one variable");
+    check(((w_14_t)GetProcAddress(so, "a_sum14"))(1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                                   11, 12, 13, 14) == 1015,
+          "fourteen arguments through the adapter: a_sum14 = 1015");
+    check(((w_dd_t)GetProcAddress(so, "a_hyp"))(3.0, 4.0) == 25.0,
+          "leading doubles through the adapter: a_hyp(3, 4) = 25");
+    check(((s_id_t)GenesisGetElfProcAddress(so, "a_mixed"))(4, 2.5) == 10.0,
+          "an int then a double, raw System V: a_mixed(4, 2.5) = 10");
+    check(((w_callback_t)GetProcAddress(so, "a_callback"))(sysv_triple, 5) == 30,
+          "the .so calls back into this program: 5*3*2 = 30");
+    clob = GetProcAddress(so, "a_clobber");
+    check(clob != NULL_PTR && probe_adapter(clob),
+          "the adapter preserves RSI, RDI, XMM6-15 (System V destroys them)");
+
+    check(((w_l_t)GetProcAddress(so, "a_getpid"))() == (long long)GetCurrentProcessId(),
+          "a raw Linux getpid(2) from inside the .so is this process");
+    check(((w_str_t)GetProcAddress(so, "a_write"))("  (written by the .so with write(2))\r\n") == 38,
+          "and its write(2) to fd 1 reaches the console");
+}
+
+/* --- LoadLibrary for an ordinary DLL (ROADMAP item 14(e)) ------------------ */
+
+static void dll_tests(void) {
+    HMODULE dll, again, k32;
+
+    say("-- LoadLibrary of a DLL at run time\r\n");
+
+    k32 = LoadLibraryA("kernel32.dll");
+    check(k32 != NULL_PTR, "LoadLibraryA(\"kernel32.dll\"): already loaded, its base");
+    check(k32 != NULL_PTR && GetProcAddress(k32, "GetCurrentProcessId") != NULL_PTR &&
+          ((w_l_t)GetProcAddress(k32, "GetCurrentProcessId"))() ==
+              (long long)GetCurrentProcessId(),
+          "GetProcAddress on it returns the real GetCurrentProcessId");
+    check(k32 != NULL_PTR && GetProcAddress(k32, "K32CurrentTeb") != NULL_PTR,
+          "a forwarder (kernel32 -> ntdll.NtCurrentTeb) resolves");
+    check(k32 != NULL_PTR && GetProcAddress(k32, (LPCSTR)(ULONG_PTR)42) != NULL_PTR,
+          "and an ordinal-only export: kernel32 #42");
+
+    dll = LoadLibraryA("mixdll");
+    check(dll != NULL_PTR, "LoadLibraryA(\"mixdll\"): .dll added, found in System32");
+    if (dll == NULL_PTR) {
+        return;
+    }
+    check(((w_v_t)GetProcAddress(dll, "attached"))() == 1,
+          "its DllMain ran once with DLL_PROCESS_ATTACH");
+    again = LoadLibraryW(L"C:\\wsr\\System32\\mixdll.dll");
+    check(again == dll && ((w_v_t)GetProcAddress(dll, "attached"))() == 1,
+          "LoadLibraryW by full path: the same module, DllMain not rerun");
+    check(((w_ii_t)GetProcAddress(dll, "add2"))(40, 2) == 42, "and add2(40, 2) = 42");
+    check(FreeLibrary(dll), "FreeLibrary succeeds (nothing is unloaded yet)");
+}
+
 void start(void) {
     out = GetStdHandle(STD_OUTPUT_HANDLE);
     say("mix: PE and ELF code in one process\r\n");
 
     routing_tests();
+    dll_tests();
+    so_tests();
 
     say("mix: ");
     say_u((DWORD)passes);

@@ -384,6 +384,33 @@ typedef LONG (*PTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
 #define STATUS_INVALID_DISPOSITION     0xC0000026u
 #define STATUS_UNWIND                  0xC0000027u
 
+/* NtGenesisLoadImage - Genesis's own call (ROADMAP items 14(e) and 19).
+ * Map the image at the POSIX path `path` - a DLL, or a Linux ELF shared
+ * object - and whatever it needs that is not loaded yet. `out` lists the
+ * new modules dependencies first, for kernel32 to run their initialisers:
+ * a DLL's DllMain in `entry`; a .so's DT_INIT in `entry` and its
+ * .init_array at `init_array` (init_count pointers). The layout matches
+ * kernel/include/ntmix.h. */
+#define GNT_LOAD_MAX 16
+
+typedef struct {
+    unsigned long long base;
+    unsigned long long size;
+    unsigned long long entry;
+    unsigned long long init_array;
+    DWORD              init_count;
+    DWORD              kind;             /* 1 PE, 2 ELF */
+} GNT_LOAD_MODULE;
+
+typedef struct {
+    unsigned long long base;             /* the image asked for */
+    DWORD              count;
+    DWORD              reserved;
+    GNT_LOAD_MODULE    mods[GNT_LOAD_MAX];
+} GNT_LOAD_OUT;
+
+NTSTATUS NtGenesisLoadImage(const char *path, GNT_LOAD_OUT *out);
+
 NTSTATUS NtRaiseException(PEXCEPTION_RECORD rec, PCONTEXT ctx,
                           BOOLEAN FirstChance);
 

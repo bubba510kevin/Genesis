@@ -187,6 +187,20 @@ BOOL   WINAPI FreeEnvironmentStringsW(LPWSTR block);
 DWORD  WINAPI GetCurrentDirectoryW(DWORD chars, LPWSTR buffer);
 HANDLE WINAPI GetModuleHandleW(LPCWSTR name);
 
+/* Loading at run time - DLLs and Linux .so files (loader.c). */
+typedef void *HMODULE;
+typedef long long (WINAPI *FARPROC)();   /* unprototyped, as windows.h has it */
+#define ERROR_MOD_NOT_FOUND    126u
+#define ERROR_PROC_NOT_FOUND   127u
+#define ERROR_DLL_INIT_FAILED 1114u
+HMODULE WINAPI LoadLibraryA(LPCSTR name);
+HMODULE WINAPI LoadLibraryW(LPCWSTR name);
+HMODULE WINAPI LoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags);
+HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags);
+BOOL    WINAPI FreeLibrary(HMODULE module);
+FARPROC WINAPI GetProcAddress(HMODULE module, LPCSTR name);
+FARPROC WINAPI GenesisGetElfProcAddress(HMODULE module, LPCSTR name);
+
 /* Memory */
 HANDLE WINAPI GetProcessHeap(void);
 LPVOID WINAPI HeapAlloc(HANDLE heap, DWORD flags, SIZE_T bytes);

@@ -1,3 +1,4 @@
+#include "elfso.h"
 #include "fs.h"
 #include "nt.h"
 #include "ntmix.h"
@@ -194,34 +195,17 @@ static void release_file(uint8 *buf) {
     fs_free_file(buf);
 }
 
-uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr) {
-    process_t *p = proc_current();
-    char resolved[PATH_MAX_LEN];
+/* Link the DLL at `resolved` into p's space, add the new modules to the
+ * PEB's table, and tell every thread where ntdll's dispatchers are if ntdll
+ * came with it. 0, or a negated errno (the reason already printed). */
+static int load_pe(process_t *p, const char *resolved, pe_runtime_load_t *r_out) {
     nt_module_table_t mt;
     pe_loaded_module_t loaded[PE_MAX_MODULES];
     pe_runtime_load_t r;
-    gnt_pe_load_out_t *out = (gnt_pe_load_out_t *)out_ptr;
     int i, n, rc;
 
-    if (!user_ptr_ok(path_ptr) || !user_ptr_ok(out_ptr) ||
-        !user_ptr_ok(out_ptr + sizeof(*out) - 1)) {
-        return (uint64)-14;
-    }
-    if (path_normalize(p->cwd, (const char *)path_ptr, resolved,
-                       sizeof(resolved)) != PATH_OK) {
-        return (uint64)-36;
-    }
-    if (p->space == NULL || p->space == vmm_kernel_space()) {
-        return (uint64)-22;
-    }
-
-    rc = nt_attach(p);
-    if (rc != 0) {
-        return (uint64)(int64)rc;
-    }
-
     if (nt_modules_read(p->space, &mt) != 0 || mt.magic != NT_MODULES_MAGIC) {
-        return (uint64)-22;
+        return -22;
     }
     n = 0;
     for (i = 0; i < (int)mt.count && i < NT_MAX_MODULES && n < PE_MAX_MODULES; i++) {
@@ -238,21 +222,21 @@ uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr) {
         print_string(": ", 0x0C);
         print_string(pe_strerror(rc), 0x0C);
         print_string("\n", 0x0C);
-        return (uint64)(rc == PE_ERR_NOMEM ? -12 : -8);   /* ENOMEM/ENOEXEC */
+        return rc == PE_ERR_NOMEM ? -12 : -8;              /* ENOMEM/ENOEXEC */
     }
 
     /* The new modules join the table - which is what the NEXT load is
      * seeded with, and what ntdll's unwinder searches. */
     for (i = 0; i < r.count; i++) {
         if (mt.count >= NT_MAX_MODULES) {
-            return (uint64)-12;
+            return -12;
         }
         mt.mod[mt.count].base = r.mods[i].base;
         mt.mod[mt.count].size = r.mods[i].size;
         mt.count++;
     }
     if (nt_modules_publish(p->space, &mt) != 0) {
-        return (uint64)-14;
+        return -14;
     }
 
     /* ntdll arrived: every thread learns where its dispatchers are. */
@@ -275,6 +259,38 @@ uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr) {
         }
     }
 
+    *r_out = r;
+    return 0;
+}
+
+uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr) {
+    process_t *p = proc_current();
+    char resolved[PATH_MAX_LEN];
+    pe_runtime_load_t r;
+    gnt_pe_load_out_t *out = (gnt_pe_load_out_t *)out_ptr;
+    int i, rc;
+
+    if (!user_ptr_ok(path_ptr) || !user_ptr_ok(out_ptr) ||
+        !user_ptr_ok(out_ptr + sizeof(*out) - 1)) {
+        return (uint64)-14;
+    }
+    if (path_normalize(p->cwd, (const char *)path_ptr, resolved,
+                       sizeof(resolved)) != PATH_OK) {
+        return (uint64)-36;
+    }
+    if (p->space == NULL || p->space == vmm_kernel_space()) {
+        return (uint64)-22;
+    }
+
+    rc = nt_attach(p);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    rc = load_pe(p, resolved, &r);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+
     out->base  = r.base;
     out->count = (uint32)r.count;
     out->reserved = 0;
@@ -284,4 +300,112 @@ uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr) {
         out->mods[i].entry = (i < r.count) ? r.mods[i].entry : 0;
     }
     return 0;
+}
+
+/* Link the shared object at `resolved` and add the new objects to the PEB's
+ * ELF table. 0 or a negated errno. */
+static int load_elf(process_t *p, const char *resolved, elfso_result_t *r) {
+    nt_elf_table_t et;
+    elfso_loaded_t loaded[NT_MAX_ELF];
+    int i, n = 0;
+
+    if (nt_elf_read(p->space, &et) != 0) {
+        return -22;
+    }
+    if (et.magic != NT_ELF_MAGIC) {          /* the first .so in the process */
+        et.magic = NT_ELF_MAGIC;
+        et.count = 0;
+    }
+    for (i = 0; i < (int)et.count && i < NT_MAX_ELF; i++) {
+        loaded[n].base = et.mod[i].base;
+        loaded[n].size = et.mod[i].size;
+        n++;
+    }
+    if (elfso_load_library(p->space, resolved, loaded, n, read_file,
+                           release_file, r) != ELFSO_OK) {
+        return -8;
+    }
+    for (i = 0; i < r->count; i++) {
+        if (et.count >= NT_MAX_ELF) {
+            return -12;
+        }
+        et.mod[et.count].base = r->mods[i].base;
+        et.mod[et.count].size = r->mods[i].size;
+        et.count++;
+    }
+    return nt_elf_publish(p->space, &et) == 0 ? 0 : -14;
+}
+
+uint64 nt_genesis_load_image(uint64 path_ptr, uint64 out_ptr) {
+    process_t *p = proc_current();
+    char resolved[PATH_MAX_LEN];
+    gnt_load_out_t *out = (gnt_load_out_t *)out_ptr;
+    uint8 *file = NULL;
+    uint32 size = 0;
+    uint8 magic[4] = { 0, 0, 0, 0 };
+    int i, rc;
+
+    if (!user_ptr_ok(path_ptr) || !user_ptr_ok(out_ptr) ||
+        !user_ptr_ok(out_ptr + sizeof(*out) - 1)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (path_normalize(p->cwd, (const char *)path_ptr, resolved,
+                       sizeof(resolved)) != PATH_OK) {
+        return STATUS_NAME_TOO_LONG;
+    }
+    if (!personality_has_nt(p)) {
+        return STATUS_INVALID_SYSTEM_SERVICE;   /* routing refuses it first */
+    }
+    /* Which linker: the file says. Read once for the magic and released -
+     * each loader reads what it needs itself, dependencies included. */
+    if (fs_read_whole(resolved, &file, &size) != 0) {
+        return STATUS_DLL_NOT_FOUND;
+    }
+    for (i = 0; i < 4 && (uint32)i < size; i++) {
+        magic[i] = file[i];
+    }
+    fs_free_file(file);
+
+    out->reserved = 0;
+    if (magic[0] == 'M' && magic[1] == 'Z') {
+        pe_runtime_load_t r;
+
+        rc = load_pe(p, resolved, &r);
+        if (rc != 0) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        out->base = r.base;
+        out->count = (uint32)r.count;
+        for (i = 0; i < GNT_PE_LOAD_MAX; i++) {
+            out->mods[i].base       = (i < r.count) ? r.mods[i].base : 0;
+            out->mods[i].size       = (i < r.count) ? r.mods[i].size : 0;
+            out->mods[i].entry      = (i < r.count) ? r.mods[i].entry : 0;
+            out->mods[i].init_array = 0;
+            out->mods[i].init_count = 0;
+            out->mods[i].kind       = GNT_KIND_PE;
+        }
+        return STATUS_SUCCESS;
+    }
+    if (magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') {
+        elfso_result_t r;
+
+        rc = load_elf(p, resolved, &r);
+        if (rc != 0) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+        out->base = r.base;
+        out->count = (uint32)r.count;
+        for (i = 0; i < GNT_PE_LOAD_MAX; i++) {
+            int in = i < r.count;
+
+            out->mods[i].base       = in ? r.mods[i].base : 0;
+            out->mods[i].size       = in ? r.mods[i].size : 0;
+            out->mods[i].entry      = in ? r.mods[i].init : 0;
+            out->mods[i].init_array = in ? r.mods[i].init_array : 0;
+            out->mods[i].init_count = in ? r.mods[i].init_count : 0;
+            out->mods[i].kind       = GNT_KIND_ELF;
+        }
+        return STATUS_SUCCESS;
+    }
+    return STATUS_INVALID_IMAGE_FORMAT;
 }

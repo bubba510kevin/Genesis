@@ -239,6 +239,13 @@ struct syscall_frame;
  * dispatches in user mode and calls this only with FirstChance FALSE, when
  * nothing handled it: the process then ends with the exception code. */
 #define NT_SYS_RAISE_EXCEPTION       0x28
+
+/* NtGenesisLoadImage(const char *posix_path, GNT_LOAD_OUT *out) - Genesis's
+ * own, not an NT call: load a DLL or a Linux ELF shared object into the
+ * calling process at run time, with whatever it needs that is not loaded
+ * yet (ROADMAP items 14(e) and 19; kernel/exec/ntmix.c). kernel32's
+ * LoadLibrary is built on it. */
+#define NT_SYS_GENESIS_LOAD_IMAGE    0x29
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -304,6 +311,8 @@ struct syscall_frame;
 /* A tagged call from a process with no NT environment, or a win32k number
  * with no win32k loaded - see NT_SYSCALL_TAG. */
 #define STATUS_INVALID_SYSTEM_SERVICE 0xC000001Cu
+#define STATUS_INVALID_IMAGE_FORMAT   0xC000007Bu
+#define STATUS_DLL_NOT_FOUND          0xC0000135u
 #define STATUS_INVALID_HANDLE     0xC0000008u
 /* Not an error in the usual sense: it is the documented way a caller asks how
  * big a security descriptor is, by calling once with a zero length and

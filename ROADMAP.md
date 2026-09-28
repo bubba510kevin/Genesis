@@ -84,6 +84,7 @@ WHERE EACH EXISTING ITEM NOW LIVES
   item 14 (e)-(g), (k), (l), (n) .......................... phase 4, written
   item 14 (h), (i), (j), (m), (o) ......................... phase 4, taken (GUI)
   item 14 (s) exclusions .................................. unchanged
+  item 19 mixed PE/ELF images (new) ....................... phases 2 and 4
 
 THE ONE DEPENDENCY WORTH SEEING FIRST is DONE. It said: there is no KERNEL
 THREAD, sched.c schedules only processes with user address spaces, and that
@@ -1011,3 +1012,44 @@ TAKEN, NEVER WRITTEN (anything that deals with a GUI):
 LINUX .SO FILES, taken from upstream (they are not GUI, but they already exist and are not the interesting part): musl's libc.so as the dynamic C library first (ld-musl on the staged root), then glibc for running unmodified distribution binaries (which needs more of 16(a) - glibc probes for clone3, rseq, statx and friends), libstdc++ and libgcc_s, zlib, OpenSSL or LibreSSL, ncurses/terminfo (bash's readline moves onto it), libffi, and whatever the first real programs brought over need. Genesis's own ld-gen.so stays the ELF loader until glibc's ld.so can run.
 
 THE CHECK, per DLL: a real program that imports it - one MinGW-built and, from the point ucrtbase exists, one MSVC-built - run in the guest with its output compared to the same program run on Windows. For the taken GUI binaries: the program starts, a window appears on the framebuffer, and a mouse click reaches its window procedure.
+
+
+19. MIXED IMAGES: WINDOWS PROGRAMS LOAD LINUX .SO FILES, LINUX PROGRAMS LOAD DLLS - DONE 2026-09-28 (first version).
+
+One process, both kinds of code. It cuts across phases 2 and 4 and was built in three stages, each committed separately and tested from ring 3. The per-stage details are in the commits and in the files named.
+
+STAGE 1 - THE KERNEL PICKS THE SYSCALL TABLE PER CALL, NOT PER PROCESS. Every NT call now carries NT_SYSCALL_TAG (0x4E54, "NT") in bits 16-31 of EAX. src/ntdll/mknums.py adds the tag when it generates ntsyscalls.h, so the stubs and hand.S did not change. personality_route (kernel/exec/personality.c) sends a tagged call to the NT table and anything else to the Linux table, in every process.
+  - A tagged call from a process with no NT environment is STATUS_INVALID_SYSTEM_SERVICE.
+  - Untagged 0x1000-0x1FFF in a Windows process is reserved for win32k's service table (item 14, route one), so it is never read as a Linux call.
+  - Personality now answers only "what was exec'd" (fault delivery, the entry stack), not which table a call uses.
+  - Checked by src/winmix/mix.exe (raw Linux getpid/uname/openat/read/mmap from a PE process) and systest's routing section.
+
+STAGE 2 - LINUX PROGRAMS LOAD DLLS. prctl(PR_GENESIS_PE_LOAD, path, out) (kernel/exec/ntmix.c). The first call ATTACHES an NT environment to the running process:
+  - the PEB, and the process parameters (GetStdHandle returns the program's own fds 0-2);
+  - an empty module table;
+  - a TEB for every thread. Threads created later by clone() get one too, in any process with NT, PE processes included.
+Loading uses pe_load_library (kernel/exec/pe.c): the exec-time linker, seeded with the modules the PEB's table already lists. Each module's name is read back from its own export directory, so there is no second list to drift.
+  - src/libgnt runs each new module's DllMain, dependencies first, and resolves exports. Call results through GNT_WINAPI (ms_abi) pointers for exact conversion; gnt_pe_sym_sysv returns a System V adapter.
+  - Checked by src/elfmix (static musl) loading mixdll.dll: 27 checks, including threads created both before and after the load.
+  - FIXED ON THE WAY: sys_clone had the TLS and child_tid arguments swapped against the x86-64 Linux ABI. Every musl pthread_create gave its thread a garbage thread pointer; systest's raw clones had the same swap and hid it.
+  - load_image also now places an image in a FREE range when its preferred base is taken. map_range skips pages that are already mapped, so an overlapping image would have been written into another's frames.
+
+STAGE 3 - WINDOWS PROGRAMS LOAD LINUX .SO FILES, AND LOADLIBRARY EXISTS. NtGenesisLoadImage (0x29) loads by the file's magic: a DLL through pe_load_library, an ELF shared object through kernel/exec/elfso.c, rtld.c's design running in the kernel.
+  - elfso.c maps breadth-first through DT_NEEDED (/lib, then the first object's directory) with per-page permission unions, above 256GB.
+  - It relocates eagerly against one scope (the new objects, then those already loaded), looking symbols up through DT_GNU_HASH/DT_HASH.
+  - It handles RELATIVE, 64, GLOB_DAT and JUMP_SLOT. It refuses TLS, COPY and IRELATIVE.
+  - The PEB gets a second table, of ELF objects, at +0xC00. It is separate because ntdll's unwinder reads PE headers from every entry in the first.
+kernel32 (src/kernel32/loader.c) gains LoadLibraryA/W/ExA/ExW, GetProcAddress, FreeLibrary (nothing is unloaded yet) and GenesisGetElfProcAddress.
+  - LoadLibrary runs DllMain for DLLs, and DT_INIT then .init_array (called System V) for .so files.
+  - For a .so, GetProcAddress returns a Win64-to-System V ADAPTER from a fixed pool in kernel32's .text (winelf.S). There is no executable heap: the targets are data.
+  - The adapter moves up to 14 integer arguments, passes XMM0-3 through, and saves RSI, RDI and XMM6-15 (Win64 callee-saved, System V scratch).
+  - GenesisGetElfProcAddress returns the raw address, for __attribute__((sysv_abi)) calls with any signature.
+  - Checked by mix.exe loading libmixa.so and libmixb.so (src/somix, freestanding). The load, the dependency and the constructor run; each relocation type is exercised; fourteen-argument, double and mixed-signature calls work; there is a callback into the PE; register preservation is probed; the .so's own raw Linux getpid/write work. mix.exe also covers LoadLibrary/GetProcAddress on DLLs: forwarders, an ordinal, DllMain running once. 40 checks in all.
+
+NOT YET, in rough order of need:
+  - A .so that uses libc. musl or glibc needs its own startup and a thread pointer in %fs inside a Windows process. A per-thread FS block set up by the loader, plus running libc's init, is the path; until then only freestanding and syscall-only code works.
+  - TLS in either direction: DLLs with __declspec(thread) at run time, and ELF PT_TLS.
+  - Unloading (FreeLibrary and gnt_pe_close only succeed).
+  - SEH across the boundary: a fault in DLL code in a Linux process is a signal, and a fault in .so code in a Windows process is an exception that no .so frame has unwind info for.
+  - Drive letters other than C: in LoadLibrary paths.
+  - dlopen for Linux programs loading other .so files (rtld has no dlopen; item 15/phase 4).

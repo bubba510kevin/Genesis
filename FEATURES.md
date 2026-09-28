@@ -100,6 +100,7 @@ them. See §17.
 | gnfs (native COW FS) | ✅ | Read, write, ACLs, rename, ~1GB files, growing directories, snapshots; crash-safe commits |
 | Permissions | ✅ | One NFSv4/NT ACL model with POSIX and Windows views; chmod, chown, umask, setgid, sticky |
 | Windows programs | 🟡 | PE loading, ntdll + kernel32 subset, 31 NT syscalls; no GUI |
+| Mixed images | ✅ | Windows programs `LoadLibrary` Linux `.so` files; Linux programs load DLLs (`libgnt`); syscalls routed per call |
 | NT object manager | ✅ | Namespace, named events/semaphores/mutexes, \ObjectTypes |
 | Driver models | ✅ | Newbus, LinuxKPI and WDM, loadable from 4 directories, with unload; each with its multiprocessor API |
 | Networking | 🟡 | IPv4, ICMP, ARP, UDP, **TCP**, loopback (FreeBSD's own code); no DHCP, no IPv6 |
@@ -969,7 +970,7 @@ and 4):
 | (b) | Dispatcher objects completed: waits blocking threads, APCs | ✅ |
 | (c) | Structured exception handling (x64 table-based) | ✅ C `__try`; C++ exceptions and stack overflow remain |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |
-| (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | ❌ |
+| (e) | The loader: `LdrLoadDll`/`GetProcAddress` for real | 🟡 `LoadLibrary`/`GetProcAddress` at run time (DLLs and .so files); no search path, API sets or SxS |
 | (f) | kernel32, completed | 🟡 |
 | (g) | advapi32 (registry, security APIs) | ❌ |
 | (h) | The display: a VESA/VBE framebuffer (console), then precompiled display drivers under win32k | 🟡 framebuffer set at boot, `/dev/fb0` with mmap, console drawn into it; the Windows display driver path doesn't exist |

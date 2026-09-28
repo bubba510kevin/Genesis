@@ -264,6 +264,24 @@ int nt_modules_publish(address_space_t *as, const nt_module_table_t *table);
 /* Read the table back - what pe_load_library is seeded with. 0 or -errno. */
 int nt_modules_read(address_space_t *as, nt_module_table_t *table);
 
+/* --- Linux shared objects in the process (ROADMAP item 19, stage 3) ------
+ *
+ * A second table, beside the PE one rather than in it: ntdll's unwinder
+ * walks the PE table and reads each entry's PE headers, and an ELF object
+ * has none. Same shape. What elfso.c is seeded with on the next load. */
+#define NT_PEB_ELF_OFFSET       0xC00
+#define NT_ELF_MAGIC            0x464C4547u   /* "GELF" */
+#define NT_MAX_ELF              8
+
+typedef struct {
+    uint32            magic;
+    uint32            count;
+    nt_module_entry_t mod[NT_MAX_ELF];
+} nt_elf_table_t;
+
+int nt_elf_read(address_space_t *as, nt_elf_table_t *table);
+int nt_elf_publish(address_space_t *as, const nt_elf_table_t *table);
+
 /* Build a thread's TLS area from the table in the PEB and point its TEB
  * (at teb_va) at it. `*pages_out` is 0 when the process has no implicit
  * TLS - nothing is mapped. 0 or a negative errno. */

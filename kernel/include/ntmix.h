@@ -32,6 +32,29 @@ typedef struct {
 
 uint64 nt_genesis_pe_load(uint64 path_ptr, uint64 out_ptr);
 
+/* NtGenesisLoadImage (NT_SYS_GENESIS_LOAD_IMAGE): the same for a process
+ * that already has NT - a DLL through the PE linker, or a Linux shared object
+ * through elfso.c, chosen by the file's first bytes. Returns an NTSTATUS.
+ * The layout of what it writes is GNT_LOAD_OUT in src/ntdll/ntdll.h. */
+#define GNT_KIND_PE   1u
+#define GNT_KIND_ELF  2u
+
+typedef struct {
+    uint64 base;
+    uint32 count;
+    uint32 reserved;
+    struct {
+        uint64 base;
+        uint64 size;
+        uint64 entry;            /* DllMain, or DT_INIT                   */
+        uint64 init_array;       /* ELF: .init_array, absolute            */
+        uint32 init_count;
+        uint32 kind;             /* GNT_KIND_PE / GNT_KIND_ELF            */
+    } mods[GNT_PE_LOAD_MAX];
+} gnt_load_out_t;
+
+uint64 nt_genesis_load_image(uint64 path_ptr, uint64 out_ptr);
+
 /* Give thread `t` a TEB of its own in a free slot and point its GS base at
  * it: every thread of a process with NT gets one, including those clone()
  * makes after the fact. 0 or -errno. */

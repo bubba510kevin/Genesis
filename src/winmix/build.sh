@@ -33,7 +33,9 @@ LDFLAGS="-nostdlib -nostartfiles \
          -Wl,--image-base,0x140000000 \
          -Wl,--subsystem,console"
 
-$CC $CFLAGS $LDFLAGS -o mix.exe mix.c ../kernel32/libkernel32.a
+# -Wno-cast-function-type: casting GetProcAddress's FARPROC to the real
+# signature is how every Windows program uses it, and -Wextra flags each one.
+$CC $CFLAGS -Wno-cast-function-type $LDFLAGS -o mix.exe mix.c ../kernel32/libkernel32.a
 
 # The import table is the claim this binary makes. Check it: exactly one DLL,
 # and it is kernel32. A stray ntdll import would mean the compiler emitted a
