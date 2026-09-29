@@ -60,6 +60,6 @@ $CC $CFLAGS -shared -nostdlib -nostartfiles \
     -Wl,--entry=DllMainCRTStartup \
     -Wl,--image-base,0x190000000 \
     -o mixdll.dll mixdll.c ../kernel32/libkernel32.a
-mkdir -p "$ROOT/root/wsr/System32"
-cp mixdll.dll "$ROOT/root/wsr/System32/mixdll.dll"
-echo "built root/wsr/System32/mixdll.dll (imports kernel32.dll)"
+mkdir -p "$ROOT/root/wsr/Windows/System32"
+cp mixdll.dll "$ROOT/root/wsr/Windows/System32/mixdll.dll"
+echo "built root/wsr/Windows/System32/mixdll.dll (imports kernel32.dll)"

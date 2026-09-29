@@ -28,7 +28,7 @@
  *
  * Paths: "C:\x\y.so" and "C:/x/y" are the root volume's /x/y; any other
  * name with a separator is a path as it stands; a bare name is looked for
- * in /lib if it is a .so and in /wsr/System32 otherwise (".dll" added when
+ * in /lib if it is a .so and in /wsr/Windows/System32 otherwise (".dll" added when
  * there is no extension). */
 
 #include "kernel32.h"
@@ -100,7 +100,7 @@ static int to_posix(const char *in, char *out, SIZE_T cap) {
             prefix = "/";
         }
     } else if (!has_sep) {
-        prefix = is_shared_object(in, n) ? "/lib/" : "/wsr/System32/";
+        prefix = is_shared_object(in, n) ? "/lib/" : "/wsr/Windows/System32/";
         for (i = 0; i < n; i++) {
             if (in[i] == '.') {
                 has_dot = 1;

@@ -151,7 +151,7 @@ int main(void) {
 
     check(((fn_v_t)gnt_pe_sym(dll, "attached"))() == 1,
           "its entry point ran once, with DLL_PROCESS_ATTACH");
-    again = gnt_pe_open("/wsr/System32/mixdll.dll");
+    again = gnt_pe_open("/wsr/Windows/System32/mixdll.dll");
     check(again == dll, "loading it again returns the same base");
     check(((fn_v_t)gnt_pe_sym(dll, "attached"))() == 1,
           "and does not run the entry point again");

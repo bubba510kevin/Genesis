@@ -576,7 +576,7 @@ descriptors on named kernel objects.
   `kernel32.dll` gets `ntdll.dll` pulled in as kernel32's dependency);
 - **ordinal-only imports** (with the ordinal-base subtraction) and
   **forwarded exports** (`kernel32.K32CurrentTeb → ntdll.NtCurrentTeb`);
-- DLLs are loaded from `/wsr/System32/`.
+- DLLs are loaded from `/wsr/Windows/System32/`.
 
 ### What the kernel builds for a Windows program ✅
 Exactly as Windows does, before the first instruction runs

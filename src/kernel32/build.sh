@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build kernel32.dll with MinGW-w64 and stage it into /wsr/System32.
+# Build kernel32.dll with MinGW-w64 and stage it into /wsr/Windows/System32.
 #
 # kernel32 imports from ntdll, so this is the first DLL in the tree that is
 # itself a client of another one - which makes it the first test of the
@@ -48,7 +48,7 @@ $CC $CFLAGS -c loader.c -o loader.o
 $CC -c winelf.S -o winelf.o
 $CC $LDFLAGS -o kernel32.dll err.o file.o proc.o thread.o sysinfo.o tls.o except.o loader.o winelf.o kernel32.def ../ntdll/libntdll.a
 
-mkdir -p "$ROOT/root/wsr/System32"
-cp kernel32.dll "$ROOT/root/wsr/System32/kernel32.dll"
+mkdir -p "$ROOT/root/wsr/Windows/System32"
+cp kernel32.dll "$ROOT/root/wsr/Windows/System32/kernel32.dll"
 
-echo "built root/wsr/System32/kernel32.dll"
+echo "built root/wsr/Windows/System32/kernel32.dll"

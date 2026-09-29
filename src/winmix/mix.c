@@ -377,7 +377,7 @@ static void dll_tests(void) {
     }
     check(((w_v_t)GetProcAddress(dll, "attached"))() == 1,
           "its DllMain ran once with DLL_PROCESS_ATTACH");
-    again = LoadLibraryW(L"C:\\wsr\\System32\\mixdll.dll");
+    again = LoadLibraryW(L"C:\\wsr\\Windows\\System32\\mixdll.dll");
     check(again == dll && ((w_v_t)GetProcAddress(dll, "attached"))() == 1,
           "LoadLibraryW by full path: the same module, DllMain not rerun");
     check(((w_ii_t)GetProcAddress(dll, "add2"))(40, 2) == 42, "and add2(40, 2) = 42");

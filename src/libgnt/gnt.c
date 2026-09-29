@@ -67,7 +67,7 @@ int gnt_pe_errno(void) {
 typedef int (GNT_WINAPI *dll_entry_t)(void *instance, u32 reason, void *reserved);
 
 void *gnt_pe_open(const char *path) {
-    static const char sysdir[] = "/wsr/System32/";
+    static const char sysdir[] = "/wsr/Windows/System32/";
     char full[256];
     load_out_t out;
     u64 i, n;

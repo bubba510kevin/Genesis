@@ -236,7 +236,7 @@ elif [ -f src/elfmix/elfmix.c ]; then
 fi
 
 # ntdll.dll, built with MinGW-w64 as a host tool and staged into
-# /wsr/System32. Skips itself with a message if MinGW is not installed, so
+# /wsr/Windows/System32. Skips itself with a message if MinGW is not installed, so
 # this script still works on a machine that only builds the Linux side.
 if [ -f src/ntdll/build.sh ]; then
     sh src/ntdll/build.sh

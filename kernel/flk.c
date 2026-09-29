@@ -146,7 +146,7 @@ static const char *const user_argv[] = { "sh", "-i", NULL };
  * every path, so ash's search fails at the first directory - the string is in
  * place ahead of the syscall layer that will make it mean something. */
 static const char *const user_envp[] = {
-    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/wsr/System32",
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/wsr/Windows/System32",
     "HOME=/",
     "TERM=linux",
     NULL

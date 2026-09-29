@@ -12,7 +12,7 @@
  * ring-3 halves: runs each new DLL's entry point, dependencies first, and
  * looks symbols up in export directories.
  *
- *     void *dll = gnt_pe_open("mixdll.dll");       // /wsr/System32/mixdll.dll
+ *     void *dll = gnt_pe_open("mixdll.dll");       // /wsr/Windows/System32/mixdll.dll
  *     int (GNT_WINAPI *add2)(int, int) = gnt_pe_sym(dll, "add2");
  *     add2(2, 3);
  *
@@ -46,7 +46,7 @@
 
 #define GNT_WINAPI __attribute__((ms_abi))
 
-/* Load `path` (a bare name is looked for in /wsr/System32) and whatever it
+/* Load `path` (a bare name is looked for in /wsr/Windows/System32) and whatever it
  * imports that is not loaded yet; run the new modules' entry points,
  * dependencies first. Returns the DLL's base - its HMODULE - or 0, with the
  * reason in gnt_pe_errno(). Loading a DLL again returns the same base and

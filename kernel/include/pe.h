@@ -224,7 +224,7 @@ typedef struct __attribute__((packed)) {
 /* Where the loader looks for an imported DLL. One directory, deliberately:
  * a search PATH for libraries is a security decision and a compatibility
  * decision, and neither should be made by accident this early. */
-#define PE_SYSTEM_DIR "/wsr/System32/"
+#define PE_SYSTEM_DIR "/wsr/Windows/System32/"
 
 /* Modules one link can hold: the image, its DLLs and, at run time, what the
  * process already had (pe_load_library). The PEB's table holds 16 too. */

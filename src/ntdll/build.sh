@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build ntdll.dll with MinGW-w64 and stage it into /wsr/System32.
+# Build ntdll.dll with MinGW-w64 and stage it into /wsr/Windows/System32.
 #
 # MinGW is a HOST TOOL here: permissive-licensed, a build dependency and not a
 # linked one. Nothing of its runtime reaches the image - -nostdlib and
@@ -40,11 +40,11 @@ $CC $CFLAGS -c waitaddr.c -o waitaddr.o
 $CC $CFLAGS -c except.c -o except.o
 $CC $LDFLAGS -o ntdll.dll stubs.o rtl.o sync.o tls.o waitaddr.o except.o ntdll.def
 
-# /wsr/System32 is the Windows side of the volume, and the name is 8.3-clean:
+# /wsr/Windows/System32 is the Windows side of the volume, and the name is 8.3-clean:
 # WSR and SYSTEM32 both fit, as does NTDLL.DLL. A DLL that cannot be named by
 # the filesystem is a problem to find out about now rather than when the
 # loader goes looking for it.
-mkdir -p "$ROOT/root/wsr/System32"
-cp ntdll.dll "$ROOT/root/wsr/System32/ntdll.dll"
+mkdir -p "$ROOT/root/wsr/Windows/System32"
+cp ntdll.dll "$ROOT/root/wsr/Windows/System32/ntdll.dll"
 
-echo "built root/wsr/System32/ntdll.dll"
+echo "built root/wsr/Windows/System32/ntdll.dll"
