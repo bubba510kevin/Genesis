@@ -628,7 +628,7 @@ void flk(void) {
      * The selftest runs at boot rather than from userspace on purpose: this
      * code is unreachable from ring 3 (there is no socket layer yet, by
      * design - see the plan's non-goals), so a boot-time check is the only
-     * place it gets exercised at all. See src/verif.c. */
+     * place it gets exercised at all. See src/verif/verif.c. */
     /* The Local APIC.
      *
      * Position is load-bearing and was got wrong once: this was first placed
@@ -895,7 +895,7 @@ void flk(void) {
      * volume namespace_init/storage_init just built (/wsr/Windows/
      * System32/Drivers/, the path ROADMAP item 4 names), and before
      * start_init_process's point of no return. test.sys is Genesis's own
-     * synthetic mkpe.py-built image (src/mkpe.py --sys), not a real
+     * synthetic mkpe.py-built image (tools/mkpe.py --sys), not a real
      * third-party driver - see the plan's Non-goals - but it is a REAL
      * PE32+ file on REAL disk, mapped into REAL kernel address space,
      * relocated, and import-resolved against the synthetic ntoskrnl.exe

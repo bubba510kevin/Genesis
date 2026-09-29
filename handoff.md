@@ -28,6 +28,35 @@ ntoskrnl/hal/port-library export surface drivers import. Drivers with source
 stay Genesis's own. Be honest about scale: item 14 is bigger than everything
 built so far.
 
+## Two repositories (split 2026-09-28)
+
+**This repository is the kernel alone.** Everything that runs in ring 3 is
+in **Genesis-userland** (github.com/bubba510kevin/Genesis-userland), split out
+with its history: ntdll, kernel32, the rtld, libgnt, systest, verif and every
+test program, the committed `root/` tree, and — as submodules —
+**GNTbash** (`/bin/bash`) and **GNTlibc** (`/lib/libc.so`). ntdll and
+kernel32 are expected to move to repositories of their own later; each
+component there is a self-contained `src/<name>/` for that reason.
+
+Check the two out side by side:
+```
+code/Genesis/Genesis/            this repo   (the kernel checkout)
+code/Genesis/Genesis-userland/   userland    (git clone --recurse-submodules)
+```
+- `build.py disk` stages `../Genesis-userland/root` (or `GENESIS_USERLAND`),
+  then this repo's `modules/root` on top: the loadable modules and
+  `test.sys`, which stayed here because they are kernel code
+  (`modules/build.sh`, `tools/mkpe.py --sys`). A file in both trees is an
+  error. `tests/host/check_staged_tree.py` checks the merged tree.
+- Userland's `build.sh` reads one file from here, `kernel/include/nt.h`
+  (ntdll's syscall numbers), via `GENESIS_KERNEL` (default `../Genesis`).
+  **Changing an NT syscall number means rebuilding ntdll in userland.**
+- `src/...` paths in kernel comments and in `ROADMAP.md` now mean
+  Genesis-userland (single-file programs moved into directories:
+  `src/verif/verif.c`, `src/systest/systest.c`, `src/gtrace/gtrace.c`...).
+- A change that spans both (a new syscall and its test) is two commits, one
+  per repository; land the kernel side first.
+
 ## Where things stand (2026-09-27)
 
 Done and verified in the latest sessions — details in `ROADMAP.md`:
@@ -76,10 +105,11 @@ scratch — it is taken (precompiled Windows binaries on the real win32k.sys,
 or ported open source); Genesis writes the support underneath.
 
 ### Phase 1 — run bash (ROADMAP item 15) — IN PROGRESS
-**Done (2026-09-27):** GNU bash 5.3.20 is built from the pinned upstream
-tarball (`src/bash/build.sh`, called by `tools/build_user.sh`; source fetched
-into gitignored `vendsrc/bash/` and checked against SHA-256 pins) and runs
-interactively as `/bin/bash`: readline editing, history, tab completion,
+**Done (2026-09-27):** bash 5.3 runs interactively as `/bin/bash` — now
+**GNTbash**, built by Genesis-userland from its `third_party/GNTbash`
+submodule (the first bring-up used a plain upstream build; GNTbash with
+winmode off is upstream bash, and the kernel work below is the same for
+both): readline editing, history, tab completion,
 Ctrl-C of the prompt and of a running loop. Underneath it: `select`/`pselect6`,
 real rlimits (`RLIMIT_NOFILE` enforced), `getrusage`, **a real termios line
 discipline** (`kernel/dev/tty.c` — raw mode, VMIN/VTIME, signal characters at
@@ -91,7 +121,8 @@ fixed. ROADMAP item 15 has the detail and the three bugs found.
 **Tools for this work:** `/bin/gtrace CMD` traces CMD's syscalls (and its
 children's) on the console; `tools/guest_sh.py -f FILE` types FILE's lines
 into the guest shell (`@wait:REGEX` waits for output — bash takes ~25s to
-load under TCG, see below). `guest_run.py` runs `root/usr/tests/bashtest.sh`
+load under TCG, see below). `guest_run.py` runs userland's
+`root/usr/tests/bashtest.sh`
 under bash as its last suite (non-interactive: fork/wait, signals, pipes,
 here-docs, rlimits, `read -t`); the interactive side is still checked by
 hand with `guest_sh.py`.
@@ -148,8 +179,10 @@ The shell is its own repository, **GNTbash**
 Genesis commits on `main`. Done there: drive-letter paths, `pwd -W`, PATHEXT
 lookup, the PE argument vector and environment, `.bat` via `cmd.exe`, CRLF
 scripts (`igncr`), and `winpath`/`unixpath`/`where`. Its `genesis/build.sh`
-builds the static musl binary; it already runs under Genesis (only
-`getrlimit` is missing). Left: exact PE command-line quoting (a kernel fix
+builds the static musl binary, and Genesis-userland stages it as
+`/bin/bash` (`getrlimit`, the one call it was missing, exists since phase
+1). GNTbash is at bash patch level 9 (upstream is at 20+): catching up is a
+rebase in that repository. Left: exact PE command-line quoting (a kernel fix
 in `kernel/exec/ntproc.c`), the full 32-bit exit code and console control
 events (both need kernel interfaces), completion, and a `cmd.exe`.
 
@@ -163,8 +196,9 @@ pointer via `arch_prctl(ARCH_SET_FS)` from user space (musl's own
 set `%fs`), plus `libc.page_size` and `libc.auxv`. No kernel change was needed:
 `libc.so` has no `PT_TLS` and only relocations `elfso` already applies, and
 musl's untagged syscalls route to the Linux table from a PE process.
-`tools/build_user.sh` finds a GNTlibc checkout (`GNTLIBC_SRC`), stages
-`libc.so` to `/lib`, and `src/somix/build.sh` builds `libmixc.so` against it;
+Genesis-userland's `build.sh` builds its `third_party/GNTlibc` submodule
+(or `GNTLIBC_SRC`), stages `libc.so` to `/lib`, and `src/somix/build.sh`
+builds `libmixc.so` against it;
 `mix.exe` proves `malloc`/`printf`/`strtol`/`errno`/`libm` (47 checks). Next
 there: a `CreateThread` thread inside a PE process needs `__gnt_thread_init`
 wired to the Windows thread path; TLS both ways; unloading; SEH.
@@ -218,8 +252,9 @@ shared by every reader, no `O_NONBLOCK` on device reads.
   moving a directory to a new parent should need write on the directory
   itself; symlinks; gnfs dataset directory.
 - **Build**: `vendsrc/` (upstream FreeBSD source) is gitignored and only
-  partly present on this machine — `src/kmod/build.sh` now skips rebuilding
-  `if_rl`/`if_re` without it and keeps the staged `root/boot/kernel/ifre.ko`.
+  partly present on this machine — `modules/build.sh` skips rebuilding
+  `if_rl`/`if_re` without it and keeps the staged
+  `modules/root/boot/kernel/ifre.ko`.
   Restore `vendsrc/sys/dev/{rl,re}` if that driver must change.
 
 ## Rules learned the hard way
@@ -246,13 +281,17 @@ Everything builds and runs in WSL (Debian) against this working copy
 does the same). On a bare Linux box - a cloud container, say - the tools are
 `apt-get install nasm qemu-system-x86 gcc-mingw-w64-x86-64 musl-tools
 dosfstools mtools clang` (clang builds `seh.exe`: GCC has no `__try`), and each line below is the part in quotes, run from the
-repository root. Rebuilding changes the committed binaries under `root/`
-and `src/` whenever the toolchain version differs; commit only those whose
-source changed.
+repository root. Rebuilding changes committed binaries (userland's `root/`,
+this repo's `modules/`) whenever the toolchain version differs; commit only
+those whose source changed. A fresh clone on Windows: Git for Windows
+defaults `core.autocrlf` to true, which breaks every shell script here - set
+`git config core.autocrlf false` in this checkout (Genesis-userland forces LF
+with `.gitattributes`).
 ```
 wsl bash build/b.sh                                   # kernel -> build/kernel.elf
-wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && sh tools/build_user.sh"   # all user programs and DLLs
-wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && rm -f build/disk.img && python3 build.py disk"   # restage the FAT root from root/
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis-userland && sh build.sh"   # all user programs, DLLs, GNTbash, GNTlibc
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && sh modules/build.sh"   # loadable kernel modules (rarely needed)
+wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && rm -f build/disk.img && python3 build.py disk"   # restage the FAT root: userland root/ + modules/root
 wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && python3 tools/guest_run.py > build/gr.out 2>&1"  # boot + ring-3 suites
 wsl bash -c "cd /mnt/c/Users/kevin/code/Genesis/Genesis && bash tests/host/run.sh"   # host-side tests
 ```

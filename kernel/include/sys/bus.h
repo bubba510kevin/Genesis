@@ -292,7 +292,7 @@ const char *device_get_nameunit(device_t dev);
  * dev.<name>.<unit>. Real driver source calls these in attach to hang its
  * tunables somewhere - if_rl.c's twister_enable, if_re.c's re_add_sysctls -
  * and until they existed those two files DID NOT COMPILE, which is what made
- * src/kmod/build.sh (and tools/build_user.sh with it) exit 1.
+ * modules/build.sh (and the userland build (Genesis-userland's build.sh) with it) exit 1.
  *
  * The context and the tree are created on first use and the same device gets
  * the same pair every time, so a driver may call either accessor in any

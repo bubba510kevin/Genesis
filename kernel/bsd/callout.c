@@ -185,7 +185,7 @@ void net_callout_init(void) {
      * 4294.967, so dividing by it reports a 10000us tick as 10002. Scaling
      * up first keeps the printed number equal to the real one, which
      * matters because this line is the boot-time evidence for the check in
-     * src/verif.c. */
+     * src/verif/verif.c. */
     kprintf("callout: wheel up - %d buckets, %d Hz, tick %d us, "
             "wheel spans %d ms\n",
             CALLOUT_BUCKETS, hz,
@@ -399,7 +399,7 @@ void net_callout_tick(void) {
 }
 
 /* ------------------------------------------------------------------------
- * Selftest. See src/verif.c.
+ * Selftest. See src/verif/verif.c.
  */
 
 static int fired_count;

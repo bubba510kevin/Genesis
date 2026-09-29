@@ -140,7 +140,21 @@ BOOT_BIN = f"{BUILD}/boot.bin"
 OS_IMG = f"{BUILD}/os.img"
 DISK_IMG = f"{BUILD}/disk.img"
 DISK_MB = 32
-ROOT_DIR = "root"      # staged onto disk.img by cmd_disk
+# What cmd_disk stages onto disk.img, in order:
+#
+#   USERLAND_ROOT  the root tree of a Genesis-userland checkout - every ring-3
+#                  program and library. Userland has its own repository; this
+#                  one holds the kernel alone. GENESIS_USERLAND names the
+#                  checkout, default ../Genesis-userland beside this one.
+#   MODULES_ROOT   the kernel's own additions: loadable modules and test.sys,
+#                  built by modules/build.sh and tools/mkpe.py. Staged ON TOP
+#                  of the userland tree; a file present in both is an error
+#                  (fatfs refuses the duplicate), never a silent shadow.
+USERLAND_DIR = os.environ.get("GENESIS_USERLAND") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "Genesis-userland")
+USERLAND_ROOT = os.path.join(USERLAND_DIR, "root")
+MODULES_ROOT = "modules/root"
 BOOT_ASM = "bootloader/boot/boot.asm"
 LINKER_SCRIPT = "linker.ld"
 PAGING_H = "kernel/include/paging.h"
@@ -449,8 +463,16 @@ def cmd_disk():
     """
     if os.path.exists(DISK_IMG):
         print(f"{DISK_IMG} exists, leaving it alone "
-              f"(delete it to re-stage from {ROOT_DIR}/)")
+              f"(delete it to re-stage from {USERLAND_ROOT})")
         return
+
+    # Checked BEFORE anything is created: a disk with no userland on it boots
+    # to a kernel with nothing to run, which looks like a hang rather than a
+    # missing checkout.
+    if not os.path.isdir(USERLAND_ROOT):
+        sys.exit(f"build.py disk: no userland at {USERLAND_ROOT}\n"
+                 "  clone https://github.com/bubba510kevin/Genesis-userland "
+                 "beside this repository, or set GENESIS_USERLAND to a checkout")
 
     os.makedirs(BUILD, exist_ok=True)
     run(["dd", "if=/dev/zero", f"of={DISK_IMG}", "bs=1M", f"count={DISK_MB}",
@@ -461,22 +483,23 @@ def cmd_disk():
     run(["mkfs.fat", "-F", "16", "-n", "GENESIS", DISK_IMG])
     print(f"{DISK_IMG}: {DISK_MB}MB FAT16")
 
-    # Stage the tree from root/ so the on-disk layout is in version control
-    # rather than being something assembled by hand once and unreproducible.
+    # Stage committed trees so the on-disk layout is in version control rather
+    # than being something assembled by hand once and unreproducible.
     # mkfs.fat still owns the geometry - this only allocates clusters and
     # writes directory entries - so the driver is still reading a filesystem
     # laid out by a reference implementation.
-    if os.path.isdir(ROOT_DIR):
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        "tools"))
-        import fatfs
-        vol = fatfs.Fat16(DISK_IMG)
-        try:
-            vol.stage(ROOT_DIR)
-        finally:
-            vol.close()
-    else:
-        print(f"  no {ROOT_DIR}/ to stage")
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "tools"))
+    import fatfs
+    vol = fatfs.Fat16(DISK_IMG)
+    try:
+        print(f"  userland: {USERLAND_ROOT}")
+        vol.stage(USERLAND_ROOT)
+        if os.path.isdir(MODULES_ROOT):
+            print(f"  kernel modules: {MODULES_ROOT}")
+            vol.stage(MODULES_ROOT)
+    finally:
+        vol.close()
 
     print("  mount it with:  sudo mount -o loop,uid=$(id -u) "
           f"{DISK_IMG} /mnt/genesis")
@@ -687,7 +710,6 @@ def cmd_usbrun():
 
 
 def cmd_run():
-    #run(["tools/build_user.sh"])
     run(qemu_args())
 
 

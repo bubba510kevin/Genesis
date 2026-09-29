@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Two of the three test suites in this tree - src/systest.c and src/verif.c -
+Two of the three test suites - src/systest/systest.c and src/verif/verif.c in Genesis-userland -
 are USERLAND programs. They run from the guest's shell, which means "did the
 tests pass" used to be a question answered by a human sitting in front of the
 QEMU window. A suite that only runs when someone remembers to run it is a

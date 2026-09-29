@@ -364,7 +364,7 @@ void net_mbuf_init(void) {
 
 /* Exercises the real vendored allocation paths and reports pass/fail. Called
  * from flk.c at boot; the matching manual-verification entry is in
- * src/verif.c.
+ * src/verif/verif.c.
  *
  * Every call below goes through the vendored inline in sys/mbuf.h into
  * uma_zalloc_arg and out through the vendored constructor - there is no

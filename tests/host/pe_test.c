@@ -46,7 +46,7 @@ static void check_eq(long got, long want, const char *what) {
     }
 }
 
-/* The same layout src/mkpe.py emits: headers at 0x80, .text raw 0x200 /
+/* The same layout tools/mkpe.py emits: headers at 0x80, .text raw 0x200 /
  * RVA 0x1000, .rdata raw 0x400 / RVA 0x2000. */
 #define IMG_SIZE      0x800
 #define LFANEW        0x80
@@ -252,7 +252,7 @@ static void test_raw_larger_than_virtual(void) {
              "and the entry point is unaffected");
 }
 
-/* The failure src/mkpe.py actually produced.
+/* The failure tools/mkpe.py actually produced.
  *
  * Its raw file offsets were hardcoded with a 0x200 gap for .text. When the
  * Win64 convention gave every call site a stack frame, .text grew past that

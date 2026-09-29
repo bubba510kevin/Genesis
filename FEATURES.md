@@ -715,7 +715,7 @@ same object.
 | Auxiliary vector | ✅ | `AT_PHDR`, `AT_ENTRY`, `AT_PAGESZ`, … |
 | TLS (initial-exec) | ✅ | Through `arch_prctl`/FS base |
 | **musl** C library | ✅ | `mhello` and `ls` are ordinary C programs linked against real musl |
-| Shell | 🟡 | **GNU bash 5.3** (upstream, unmodified, static musl; `src/bash/build.sh`) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. Not yet the login shell (BusyBox ash is), and there are no utilities to run (no `cat`/`head`) - ROADMAP item 15 |
+| Shell | 🟡 | **GNTbash** (GNU bash 5.3 + a switchable Windows layer; Genesis-userland's `third_party/GNTbash`, static musl) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. Not yet the login shell (BusyBox ash is), and there are no utilities to run (no `cat`/`head`) - ROADMAP item 15 |
 | vDSO | ❌ | |
 
 Programs in `/bin`: `bash` (GNU bash), `busybox` (shell), `ls` (musl),
@@ -914,17 +914,18 @@ points at this same working copy.
 | Command (inside WSL, from the repo root) | Does |
 |---|---|
 | `python3 build.py image` | Build the kernel and the bootable `build/os.img` |
-| `python3 build.py disk` | Build the FAT16 data disk from `root/` (kept if it exists) |
+| `python3 build.py disk` | Build the FAT16 data disk from Genesis-userland's `root/` (`GENESIS_USERLAND`, default `../Genesis-userland`) plus `modules/root` (kept if it exists) |
 | `python3 build.py run` | Boot the full machine in QEMU (window + serial console) |
 | `python3 build.py debug` | The same, paused, with a GDB stub |
 | `python3 build.py usb` / `usbrun` | Build / test the single-disk bare-metal image |
 | `python3 build.py test` | The kernel heap allocator's native test |
 | `python3 build.py clean` | Remove build products, keeping `disk.img` |
 | `bash tests/host/run.sh` | The host test suite |
-| `python3 tools/guest_run.py` | Boot and run verif, systest, thr.exe, smp.exe, tls.exe and fbtest (`GENESIS_SMP=N` picks the CPU count, default 4) |
+| `python3 tools/guest_run.py` | Boot and run every ring-3 suite: verif, systest, the Windows suites, mix/elfmix, fbtest and bashtest (`GENESIS_SMP=N` picks the CPU count, default 4) |
+| `python3 tools/guest_sh.py -f FILE` | Boot and type FILE's lines into the guest shell (`@wait:REGEX` waits for output) |
 | `python3 tools/guest_dump.py CMD...` | Run commands, then press Ctrl-T and print the task dump (for a guest that hangs) |
-| `sh src/<ntdll\|kernel32\|winthread\|…>/build.sh` | Build a Windows DLL or program (MinGW-w64) |
-| `tools/build_user.sh` | Build every user program (its final staging step needs `sudo`) |
+| `sh modules/build.sh` | Build the loadable kernel modules into `modules/root` |
+| `sh build.sh` *(in Genesis-userland)* | Build every user program, DLL, GNTbash and GNTlibc into its `root/` |
 
 `GENESIS_VBE=WxH` (build time) caps the graphics mode the bootloader picks;
 `GENESIS_VBE=off` keeps VGA text mode.
@@ -1041,17 +1042,22 @@ Genesis/
 │   ├── bsd/                   vendored FreeBSD (network stack, UMA, sysctl, taskqueue, …)
 │   ├── lib/                   kprintf, ksyms, backtrace, locks
 │   └── include/               all headers (flat, on purpose; see kernel/README.md)
-├── src/
-│   ├── ntdll/  kernel32/      clean-room Windows DLLs
-│   ├── winhello/ hand/ k32demo/ winsync/ winthread/ winsmp/   Windows test programs
-│   ├── rtld/                  the ELF dynamic linker (ld-gen.so)
-│   ├── kmod/                  loadable driver modules (if_re, lkpi_ahci, lkpi_pcpu, nb_rtl, …)
-│   ├── systest.c  verif.c     the in-machine test suites
-│   ├── fbtest.c               the framebuffer and mouse, from ring 3
-│   └── hello.c hello_musl.c ls.c mkprobe.c
-├── root/                      the files staged onto the boot disk (/bin, /lib, /boot, /wsr)
+├── modules/                   loadable driver modules (if_re, lkpi_ahci, lkpi_pcpu, nb_rtl, …)
+│   └── root/                  their staged .ko files and test.sys, overlaid on userland's root
 ├── tests/host/                host test suite and the gnfs ACL fixture
-├── tools/                     guest_run.py, mkgnfs.c, fatfs.py, build_user.sh, …
+├── tools/                     guest_run.py, guest_sh.py, mkgnfs.c, fatfs.py, mkpe.py, …
 ├── build.py                   the build
 └── ROADMAP.md  ROADMAP-archive.md  handoff.md  FEATURES.md
+
+Genesis-userland/              everything in ring 3 (its own repository since 2026-09-28)
+├── build.sh                   builds all of it into root/
+├── src/
+│   ├── ntdll/  kernel32/      clean-room Windows DLLs
+│   ├── winhello/ hand/ k32demo/ winsync/ winthread/ winsmp/ …   Windows test programs
+│   ├── rtld/  libgnt/         the ELF dynamic linker (ld-gen.so); DLL loading for ELF programs
+│   ├── systest/  verif/       the in-machine test suites
+│   └── fbtest/ ls/ mhello/ mkprobe/ gtrace/ somix/ winmix/ elfmix/
+├── third_party/GNTbash        submodule: /bin/bash
+├── third_party/GNTlibc        submodule: /lib/libc.so
+└── root/                      the files staged onto the boot disk (/bin, /lib, /usr, /wsr)
 ```

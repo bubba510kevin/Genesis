@@ -112,7 +112,7 @@ int pci_set_powerstate(device_t dev, int state);
  *
  * These belong to <dev/pci/pcireg.h>, which real driver source includes and
  * which is now vendored verbatim at kernel/bsd/compat/dev/pci/pcireg.h. They
- * stay here as well because a driver on the src/kmod include path sees only
+ * stay here as well because a driver on the modules/ include path sees only
  * kernel/include and would otherwise have nowhere to get them - so both
  * spellings exist and the guard makes whichever is included first win rather
  * than warn. */

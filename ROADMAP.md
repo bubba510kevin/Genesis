@@ -11,6 +11,15 @@ refer to "ROADMAP item 11", "item 6", "item 7" by number in dozens of places;
 renumbering would make every one of them point at the wrong thing. The gaps in
 the sequence are the completed items.
 
+USERLAND MOVED OUT, 2026-09-28. This repository is the kernel alone; every
+ring-3 program, the root/ tree, GNTbash and GNTlibc are in Genesis-userland
+(github.com/bubba510kevin/Genesis-userland), split with their history. A
+"src/..." path below means that repository (single-file programs moved into
+directories: src/verif.c is src/verif/verif.c, src/systest.c is
+src/systest/systest.c). src/kmod is this repository's modules/, and
+src/mkpe.py is tools/mkpe.py. The item text below is history and is not
+rewritten for the move. handoff.md "Two repositories" has the layout.
+
 ================================================================================
 THE PLAN - FOUR PHASES (reorganized 2026-09-27)
 ================================================================================
@@ -904,9 +913,13 @@ WHERE THIS STANDS RELATIVE TO EVERYTHING ELSE IN THIS FILE: every other item her
 
 15. RUN BASH - PHASE 1. IN PROGRESS (started 2026-09-27).
 
-WHERE IT STANDS: GNU bash 5.3 (patch level 20) is built from the pinned
-upstream tarball by src/bash/build.sh - static against musl, bundled readline,
-no curses - and staged as /bin/bash. Started from BusyBox's shell it runs
+WHERE IT STANDS: /bin/bash is GNTbash (Genesis-userland's third_party/GNTbash
+submodule: bash 5.3 patch level 9 plus the switchable Windows layer, built by
+its own genesis/build.sh - static against musl, bundled readline, no curses).
+The bring-up below was done with a plain upstream bash 5.3.20 built the same
+way; that build script was dropped for GNTbash when userland moved to its own
+repository, and with winmode off the two are the same shell. Started from
+BusyBox's shell it runs
 interactively: prompt, readline editing, history recall with the arrow keys,
 tab completion of commands, command substitution, pipelines, here-documents,
 functions, `ulimit`, `read -t`, `times`, Ctrl-C at the prompt and Ctrl-C of a
