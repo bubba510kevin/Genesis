@@ -68,8 +68,9 @@ PHASE 4 - THE LIBRARIES: MAJOR .SO AND DLLS (item 18; item 14 (e)-(o)).
   import through, rpcrt4, the non-GUI half of ole32/combase, and the rest of
   item 18's list. GUI DLLs are TAKEN, per the rule above: item 14's (h), (i),
   (j), (m) and (o) are precompiled binaries on win32k.sys (route one). Linux
-  .so files are taken from upstream (musl, then glibc; libstdc++; zlib and
-  friends) and the work is making them load and run; Linux GUI libraries
+  .so files are taken from upstream (musl - DONE as GNTlibc - then glibc;
+  libstdc++; zlib and friends) and the work is making them load and run; Linux
+  GUI libraries
   (Wayland/X, Mesa, GTK/Qt) are taken the same way, never written.
 
 WHERE EACH EXISTING ITEM NOW LIVES
@@ -987,7 +988,17 @@ The original plan follows. MSYS2's and Cygwin's bash patches solve the mirror-im
 THE CHECK: a systest-style script run by bash in the guest that cds by drive letter, runs a .exe by bare name with arguments containing spaces and quotes (the child echoes GetCommandLineW back), reads WINSTATUS after an ExitProcess(0xC0000005), runs a CRLF script, runs a .bat through cmd, and ^C's a PE program that has a console control handler registered and sees the handler ran.
 
 
-18. THE LIBRARIES: MAJOR .SO AND DLLS - PHASE 4. INVENTORY.
+18. THE LIBRARIES: MAJOR .SO AND DLLS - PHASE 4. INVENTORY; STARTED 2026-09-28 (GNTlibc).
+
+FIRST PIECE DONE: musl as a shared libc that loads and runs. GNTlibc
+(github.com/bubba510kevin/GNTlibc) is musl 1.2.6 built as libc.so and staged
+to /lib. It is proven the harder way first - loaded into a WINDOWS process
+through LoadLibrary (item 19's stage 4), where there is no libc startup at all
+- so a Linux process linking against it (its intended home, once dynamic musl
+replaces the static link in items 15/17) is the easier remaining case. malloc,
+printf/snprintf, string/memory, strtol, errno and libm all work from a .so in a
+PE process (mix.exe, 47 checks). See item 19 for how the thread pointer is set
+up. Still upstream-only from here: glibc, libstdc++, zlib and the rest below.
 
 Two lists, split by the GUI rule. Everything here is loaded by the loaders item 14(e) completes (LdrLoadDll, the search path, API sets, SxS) and by the ELF dynamic linker (src/rtld, ld-gen.so).
 
@@ -1009,7 +1020,7 @@ TAKEN, NEVER WRITTEN (anything that deals with a GUI):
   Windows, precompiled from the user's own install, on win32k.sys loaded as a precompiled driver (item 14's route one): win32k.sys, user32.dll, gdi32.dll (and gdi32full.dll on Windows 10), comctl32.dll (v5 and v6 SxS), comdlg32.dll, shell32.dll, uxtheme.dll, dwmapi.dll, imm32.dll, msctf.dll, the display driver, explorer.exe - items 14(h), (i), (j), (m), (o).
   Linux, from upstream: a display server (a Wayland compositor such as weston or sway, or Xorg) on DRM/KMS (16(h)) or fbdev, Mesa (llvmpipe software rendering first), libX11/libxcb, wayland-client, GTK and/or Qt, fontconfig, FreeType, HarfBuzz, Cairo, Pango, libinput on evdev. The work is the kernel surface they need (DRM ioctls, evdev, udev-shaped device events, shared memory with memfd), not the libraries.
 
-LINUX .SO FILES, taken from upstream (they are not GUI, but they already exist and are not the interesting part): musl's libc.so as the dynamic C library first (ld-musl on the staged root), then glibc for running unmodified distribution binaries (which needs more of 16(a) - glibc probes for clone3, rseq, statx and friends), libstdc++ and libgcc_s, zlib, OpenSSL or LibreSSL, ncurses/terminfo (bash's readline moves onto it), libffi, and whatever the first real programs brought over need. Genesis's own ld-gen.so stays the ELF loader until glibc's ld.so can run.
+LINUX .SO FILES, taken from upstream (they are not GUI, but they already exist and are not the interesting part): musl's libc.so as the dynamic C library first (ld-musl on the staged root) - DONE as GNTlibc, see the note at the top of this item and item 19 - then glibc for running unmodified distribution binaries (which needs more of 16(a) - glibc probes for clone3, rseq, statx and friends), libstdc++ and libgcc_s, zlib, OpenSSL or LibreSSL, ncurses/terminfo (bash's readline moves onto it), libffi, and whatever the first real programs brought over need. Genesis's own ld-gen.so stays the ELF loader until glibc's ld.so can run.
 
 THE CHECK, per DLL: a real program that imports it - one MinGW-built and, from the point ucrtbase exists, one MSVC-built - run in the guest with its output compared to the same program run on Windows. For the taken GUI binaries: the program starts, a window appears on the framebuffer, and a mouse click reaches its window procedure.
 
