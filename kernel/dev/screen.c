@@ -121,25 +121,33 @@ static void invalidate_all(void) {
     cursor_row = -1;
 }
 
-static void putc_at(char c, int col, int row, uint8 color) {
-    uint16 v;
+/* One cell's raw value (character | attribute << 8), wherever the grid is
+ * shown. putc_at and the terminal's shifting operations both come here. */
+static int t_quiet;   /* the terminal selftest: update the grid, show nothing */
 
+static void set_cell(int col, int row, uint16 v) {
     if (col < 0 || col >= screen_cols || row < 0 || row >= screen_rows) {
         return;  /* never write outside the visible page - the VGA aperture
                   * runs to 0xBFFFF, so an overrun scribbles silently into
                   * text pages 1-7 instead of faulting */
     }
-    /* (uint8) before (uint16) matters: char is signed on x86, so a byte with
-     * the high bit set sign-extends to 0xFFxx and the OR leaves the attribute
-     * as 0xFF - white on white - discarding the caller's colour. Only shows
-     * up on non-ASCII bytes, which is why it hides for a long time. */
-    v = (uint16)(uint8)c | ((uint16)color << 8);
     cells[row * screen_cols + col] = v;
+    if (t_quiet) {
+        return;
+    }
     if (fbi == NULL) {
         video[row * VGA_WIDTH + col] = v;
     } else if (drawing()) {
         render_cell(col, row, 0);
     }
+}
+
+static void putc_at(char c, int col, int row, uint8 color) {
+    /* (uint8) before (uint16) matters: char is signed on x86, so a byte with
+     * the high bit set sign-extends to 0xFFxx and the OR leaves the attribute
+     * as 0xFF - white on white - discarding the caller's colour. Only shows
+     * up on non-ASCII bytes, which is why it hides for a long time. */
+    set_cell(col, row, (uint16)(uint8)c | ((uint16)color << 8));
 }
 
 /* Shift everything up one row and blank the bottom. Called before each
@@ -186,6 +194,290 @@ static void reclaim_display(void) {
     }
 }
 
+/* --- the terminal -----------------------------------------------------------
+ *
+ * The screen is a TERMINAL, not a printer: what programs write to the console
+ * includes control characters and escape sequences, and until this existed
+ * every one of them was drawn as a glyph. readline erases a character with
+ * "\b \b" and moves along a line with \r, \b and ESC [ C/K; bash's Backspace
+ * put the font's glyph for 0x08 on the screen instead of taking a character
+ * back. (The serial side never had the problem - it passes bytes through to
+ * a real terminal emulator, which interprets them.)
+ *
+ * A subset of the Linux console (TERM=linux), which is what programs are told
+ * this is: \r \b \t, BEL ignored, other C0 controls dropped; ESC 7 / ESC 8
+ * (save/restore cursor), ESC c (reset); and CSI sequences - cursor movement
+ * A B C D G d H f, erase K J X, delete/insert characters P @, save/restore
+ * s u, and SGR colours (m). Private-mode sequences (ESC [ ? ...) are parsed
+ * and ignored: the cursor is always shown.
+ *
+ * The parser's state is static because a sequence can be split across
+ * writes - console_write hands this 64 bytes at a time. */
+enum { T_NORMAL, T_ESC, T_CSI };
+#define T_MAXPARAM 8
+
+static int    t_state = T_NORMAL;
+static int    t_param[T_MAXPARAM];
+static int    t_nparam;
+static int    t_private;
+static int    t_sgr = -1;          /* attribute set by SGR, -1 = the caller's */
+static int    t_saved_col, t_saved_row;
+
+static uint8 t_color(uint8 color) {
+    return t_sgr >= 0 ? (uint8)t_sgr : color;
+}
+
+/* The cursor's row with a pending scroll resolved to the last row: after a
+ * line fills, screen_row can be one past the end until the next character. */
+static void t_clamp(void) {
+    if (screen_row >= screen_rows) {
+        screen_row = screen_rows - 1;
+    }
+    if (screen_row < 0) {
+        screen_row = 0;
+    }
+    if (screen_col >= screen_cols) {
+        screen_col = screen_cols - 1;
+    }
+    if (screen_col < 0) {
+        screen_col = 0;
+    }
+}
+
+static void t_erase(int from, int to, uint8 color) {    /* [from, to) cells */
+    int i;
+
+    for (i = from; i < to; i++) {
+        putc_at(' ', i % screen_cols, i / screen_cols, color);
+    }
+}
+
+/* SGR: 0 reset, 1 bright, 7 reverse, 30-37/90-97 foreground, 40-47
+ * background, 39/49 default. Anything else is ignored rather than guessed. */
+static void t_sgr_apply(uint8 color) {
+    int i, a = t_sgr >= 0 ? t_sgr : color;
+    static const uint8 ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+
+    if (t_nparam == 0) {
+        t_sgr = -1;
+        return;
+    }
+    for (i = 0; i < t_nparam; i++) {
+        int p = t_param[i];
+
+        if (p == 0) {
+            t_sgr = -1;
+            a = color;
+            continue;
+        }
+        if (p == 1) {
+            a |= 0x08;
+        } else if (p == 7) {
+            a = ((a & 0x0F) << 4) | ((a >> 4) & 0x0F);
+        } else if (p >= 30 && p <= 37) {
+            a = (a & 0xF8) | ansi_to_vga[p - 30];
+        } else if (p >= 90 && p <= 97) {
+            a = (a & 0xF0) | 0x08 | ansi_to_vga[p - 90];
+        } else if (p == 39) {
+            a = (a & 0xF0) | (color & 0x0F);
+        } else if (p >= 40 && p <= 47) {
+            a = (a & 0x0F) | (ansi_to_vga[p - 40] << 4);
+        } else if (p == 49) {
+            a = (a & 0x0F) | (color & 0xF0);
+        } else {
+            continue;
+        }
+        t_sgr = a;
+    }
+}
+
+static void t_csi(char final, uint8 color) {
+    int p0 = t_nparam > 0 ? t_param[0] : 0;
+    int n = p0 > 0 ? p0 : 1;
+    int i, row_base;
+    uint8 c = t_color(color);
+
+    if (t_private) {
+        return;                     /* ESC [ ? ... : modes, ignored */
+    }
+    if (final == 'm') {
+        t_sgr_apply(color);
+        return;
+    }
+    t_clamp();
+    row_base = screen_row * screen_cols;
+    switch (final) {
+        case 'A': screen_row -= n;             break;
+        case 'B': screen_row += n;             break;
+        case 'C': screen_col += n;             break;
+        case 'D': screen_col -= n;             break;
+        case 'G': screen_col = n - 1;          break;
+        case 'd': screen_row = n - 1;          break;
+        case 'H':
+        case 'f':
+            screen_row = n - 1;
+            screen_col = (t_nparam > 1 && t_param[1] > 0) ? t_param[1] - 1 : 0;
+            break;
+        case 'K':
+            if (p0 == 0) {
+                t_erase(row_base + screen_col, row_base + screen_cols, c);
+            } else if (p0 == 1) {
+                t_erase(row_base, row_base + screen_col + 1, c);
+            } else {
+                t_erase(row_base, row_base + screen_cols, c);
+            }
+            break;
+        case 'J':
+            if (p0 == 0) {
+                t_erase(row_base + screen_col, screen_rows * screen_cols, c);
+            } else if (p0 == 1) {
+                t_erase(0, row_base + screen_col + 1, c);
+            } else {
+                t_erase(0, screen_rows * screen_cols, c);
+            }
+            break;
+        case 'X':
+            t_erase(row_base + screen_col,
+                    row_base + (screen_col + n < screen_cols ? screen_col + n
+                                                             : screen_cols), c);
+            break;
+        case 'P':                   /* delete n characters, pull the rest left */
+            for (i = screen_col; i < screen_cols; i++) {
+                set_cell(i, screen_row, i + n < screen_cols
+                         ? cells[row_base + i + n]
+                         : (uint16)' ' | ((uint16)c << 8));
+            }
+            break;
+        case '@':                   /* insert n blanks, push the rest right */
+            for (i = screen_cols - 1; i >= screen_col; i--) {
+                set_cell(i, screen_row, i - n >= screen_col
+                         ? cells[row_base + i - n]
+                         : (uint16)' ' | ((uint16)c << 8));
+            }
+            break;
+        case 's':
+            t_saved_col = screen_col;
+            t_saved_row = screen_row;
+            break;
+        case 'u':
+            screen_col = t_saved_col;
+            screen_row = t_saved_row;
+            break;
+        default:
+            break;                  /* unknown: consumed, not drawn */
+    }
+    t_clamp();
+}
+
+/* One byte of output onto the grid. */
+static void t_putc(char ch, uint8 color) {
+    uint8 b = (uint8)ch;
+
+    if (t_state == T_ESC) {
+        t_state = T_NORMAL;
+        if (b == '[') {
+            t_state = T_CSI;
+            t_nparam = 0;
+            t_private = 0;
+            t_param[0] = 0;
+        } else if (b == '7') {
+            t_saved_col = screen_col;
+            t_saved_row = screen_row;
+        } else if (b == '8') {
+            screen_col = t_saved_col;
+            screen_row = t_saved_row;
+            t_clamp();
+        } else if (b == 'c') {
+            t_sgr = -1;
+            t_erase(0, screen_rows * screen_cols, color);
+            screen_col = 0;
+            screen_row = 0;
+        }
+        return;
+    }
+    if (t_state == T_CSI) {
+        if (b >= '0' && b <= '9') {
+            if (t_nparam == 0) {
+                t_nparam = 1;
+            }
+            t_param[t_nparam - 1] = t_param[t_nparam - 1] * 10 + (b - '0');
+            return;
+        }
+        if (b == ';') {
+            if (t_nparam == 0) {
+                t_nparam = 1;
+            }
+            if (t_nparam < T_MAXPARAM) {
+                t_param[t_nparam++] = 0;
+            }
+            return;
+        }
+        if (b == '?' || b == '>' || b == '=') {
+            t_private = 1;
+            return;
+        }
+        if (b >= 0x40 && b <= 0x7E) {
+            t_state = T_NORMAL;
+            t_csi((char)b, color);
+            return;
+        }
+        if (b < 0x20 || b > 0x7E) {
+            t_state = T_NORMAL;     /* malformed: drop the sequence */
+        }
+        return;
+    }
+
+    switch (b) {
+        case 0x1B:
+            t_state = T_ESC;
+            return;
+        case '\n':
+            scroll_if_needed(t_color(color));
+            screen_row++;
+            screen_col = 0;
+            return;
+        case '\r':
+            if (screen_row >= screen_rows) {
+                scroll_if_needed(t_color(color));
+            }
+            screen_col = 0;
+            return;
+        case '\b':
+            if (screen_col > 0) {
+                screen_col--;
+            }
+            return;
+        case '\t':
+            scroll_if_needed(t_color(color));
+            screen_col = (screen_col + 8) & ~7;
+            if (screen_col >= screen_cols) {
+                screen_col = screen_cols - 1;
+            }
+            return;
+        default:
+            break;
+    }
+    if (b < 0x20 || b == 0x7F) {
+        return;                     /* BEL and the other controls: not drawn */
+    }
+    scroll_if_needed(t_color(color));
+    putc_at(ch, screen_col, screen_row, t_color(color));
+    screen_col++;
+    if (screen_col >= screen_cols) {
+        screen_col = 0;
+        screen_row++;
+    }
+}
+
+static void con_write(const char *str, uint8 color) {
+    int i;
+
+    for (i = 0; str[i] != '\0'; i++) {
+        t_putc(str[i], color);
+    }
+    move_cursor();
+}
+
 void print_string(const char *str, uint8 color) {
     /* Mirrored to COM1 before anything else happens, so the transcript is
      * complete even when the screen half of this scrolls the line away or the
@@ -193,24 +485,7 @@ void print_string(const char *str, uint8 color) {
      * and a log file has none. */
     serial_write(str);
     reclaim_display();
-
-    for (int i = 0; str[i] != '\0'; i++) {
-        scroll_if_needed(color);
-
-        if (str[i] == '\n') {
-            screen_row++;
-            screen_col = 0;
-            continue;
-        }
-
-        putc_at(str[i], screen_col, screen_row, color);
-        screen_col++;
-        if (screen_col >= screen_cols) {
-            screen_col = 0;
-            screen_row++;
-        }
-    }
-    move_cursor();
+    con_write(str, color);
 }
 
 /* --- cursor ---------------------------------------------------------------
@@ -402,6 +677,94 @@ void screen_set_graphics(int on, int owner_pid) {
 
 int screen_graphics_owner(void) {
     return gfx_owner;
+}
+
+/* The terminal interpreter, checked against the Linux console's behaviour on
+ * the bottom row, with t_quiet set so the screen never shows it and the row
+ * put back afterwards. Returns the number of failed checks.
+ *
+ * Each check is something a program actually sends: readline's erase is
+ * "\b \b" and its redisplay uses \r, CSI K, CSI D/C, CSI P and CSI @. */
+static void t_feed(const char *s) {
+    while (*s != '\0') {
+        t_putc(*s++, 0x07);
+    }
+}
+
+static int t_expect(int row, const char *want, int col) {
+    int i, bad = 0;
+
+    for (i = 0; want[i] != '\0'; i++) {
+        if ((char)(cells[row * screen_cols + i] & 0xFF) != want[i]) {
+            bad++;
+        }
+    }
+    if (screen_col != col || screen_row != row) {
+        bad++;
+    }
+    return bad;
+}
+
+int screen_term_selftest(void) {
+    static uint16 saved[MAX_COLS];
+    int row = screen_rows - 1, col = screen_col, srow = screen_row;
+    int sgr = t_sgr, scol = t_saved_col, ssrow = t_saved_row;
+    int i, bad = 0;
+    char pos[16];
+    int n = row + 1, k = 0;
+
+    for (i = 0; i < screen_cols; i++) {
+        saved[i] = cells[row * screen_cols + i];
+    }
+    /* ESC [ <last row> ; 1 H */
+    pos[k++] = 0x1B;
+    pos[k++] = '[';
+    if (n >= 100) pos[k++] = (char)('0' + n / 100);
+    if (n >= 10)  pos[k++] = (char)('0' + (n / 10) % 10);
+    pos[k++] = (char)('0' + n % 10);
+    pos[k++] = ';';
+    pos[k++] = '1';
+    pos[k++] = 'H';
+    pos[k] = '\0';
+
+    t_quiet = 1;
+    t_state = T_NORMAL;
+    t_sgr = -1;
+
+    t_feed(pos);
+    t_feed("\x1b[2K");
+    bad += t_expect(row, "        ", 0);           /* CUP, then EL 2 */
+    t_feed("abc\b\bX");
+    bad += t_expect(row, "aXc", 2);                /* \b moves, does not draw */
+    t_feed("\r\x1b[K");
+    bad += t_expect(row, "   ", 0);                /* CR, EL 0 */
+    t_feed("hello\x1b[3D\x1b[P");
+    bad += t_expect(row, "helo ", 2);              /* CUB, DCH */
+    t_feed("\x1b[2@");
+    bad += t_expect(row, "he  lo", 2);             /* ICH */
+    t_feed("\x1b[C\x1b" "[1C");
+    bad += t_expect(row, "he  lo", 4);             /* CUF, default and 1 */
+    t_feed("\r\x1b[K\tZ");
+    bad += t_expect(row, "        Z", 9);          /* HT to column 8 */
+    t_feed("\x1b[31mR\x1b[0m\x07");
+    bad += t_expect(row, "        ZR", 10);        /* SGR, BEL not drawn */
+    if (((cells[row * screen_cols + 9] >> 8) & 0x0F) != 4 || t_sgr != -1) {
+        bad++;                                     /* red, then reset */
+    }
+    t_feed("\x1b[?25l");
+    bad += t_expect(row, "        ZR ", 10);       /* private mode: ignored */
+
+    for (i = 0; i < screen_cols; i++) {
+        cells[row * screen_cols + i] = saved[i];
+    }
+    t_quiet = 0;
+    t_state = T_NORMAL;
+    t_sgr = sgr;
+    t_saved_col = scol;
+    t_saved_row = ssrow;
+    screen_col = col;
+    screen_row = srow;
+    return bad;
 }
 
 /* Draw one known cell and compare every pixel with the font - the console's

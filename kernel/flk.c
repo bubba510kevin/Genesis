@@ -528,6 +528,17 @@ void flk(void) {
     kbd_init();
     tty_init();
     print_string("Keyboard ready\n", 0x0F);
+    {
+        int bad = screen_term_selftest();
+
+        if (bad == 0) {
+            print_string("console: terminal selftest passed\n", 0x0A);
+        } else {
+            print_string("console: terminal selftest FAILED (", 0x0C);
+            print_hex((uint32)bad, 0x0C);
+            print_string(")\n", 0x0C);
+        }
+    }
 
     /* The pointer event queue, for the same reason: empty before the first
      * mouse interrupt can land in it. */

@@ -226,7 +226,11 @@ on). Clock resolution is **one tick** and is reported honestly.
   `TIOC[GS]PGRP`, `TIOCSCTTY`/`TIOCNOTTY`/`TIOCGSID`, `TIOC[GS]WINSZ` (a new
   size sends SIGWINCH). A background process group reading the terminal gets
   **SIGTTIN**. PS/2 arrow and navigation keys send the VT100 sequences
-  (`ESC [ A`...). The console draws into the **framebuffer** when there is one
+  (`ESC [ A`...). The screen side is a **terminal**, a Linux-console
+  subset (new 2026-09-29): `\r \b \t`, cursor movement, erase line/screen,
+  insert/delete characters, save/restore, SGR colours - what readline's
+  line editing sends (checked at boot: `console: terminal selftest passed`).
+  The console draws into the **framebuffer** when there is one
   (8x16 BIOS font, 16 VGA colours, 128x48 at 1024x768, repainting only the
   cells that changed) and into **VGA text** otherwise. `TIOCGWINSZ` reports
   the real grid. A program that draws to the screen takes it with Linux's
