@@ -1,20 +1,22 @@
-/* Host tests for keyboard.c.
+/* Host tests for keyboard.c and the terminal line discipline in tty.c.
  *
- * The line discipline is the half of a keyboard driver that is actually easy
- * to get wrong and hard to debug on target: an off-by-one in the backspace
- * path or the buffer-full path shows up as a shell that behaves strangely
- * three keystrokes in, with nothing to inspect. None of it touches hardware -
- * kbd_scancode takes a byte and kbd_read_line fills a buffer - so all of it
- * runs here.
+ * The line discipline is the half of a terminal that is actually easy to get
+ * wrong and hard to debug on target: an off-by-one in the erase path or a
+ * mode switch that loses a half-typed line shows up as a shell that behaves
+ * strangely three keystrokes in, with nothing to inspect. None of it touches
+ * hardware - kbd_scancode takes a byte and the console's read fills a buffer
+ * - so all of it runs here.
  *
- * What is NOT covered: kbd_irq (one inb) and the blocking wait in kbd_wait,
- * whose whole content is the sti/hlt sequence the harness strips. Those two
- * are only testable on the machine. */
+ * What is NOT covered: kbd_irq (one inb) and the blocking waits, whose whole
+ * content is the sti/hlt sequence the harness strips. Every test here queues
+ * its input BEFORE reading, and the end of the run asserts that nothing ever
+ * reached the scheduler stubs. */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "keyboard.h"
+#include "tty.h"
 #include "waitq.h"
 #include "typesk.h"
 
@@ -37,12 +39,16 @@ void print_backspace(uint8 color) {
     }
 }
 
-/* The keyboard blocks through the scheduler now. The harness has no
- * processes, and every test feeds a complete line before reading, so these
- * stubs are never reached by the line-discipline tests - they exist to link,
- * and asserting that keeps a future change from silently depending on them.
- * test_waitq below calls sched_wake deliberately, and runs after that
- * assertion for exactly that reason.
+int screen_width_chars(void)  { return 80; }
+int screen_height_chars(void) { return 25; }
+uint32 timer_hz(void)         { return 100; }
+process_t *proc_at(int index) { (void)index; return NULL; }
+
+/* The terminal blocks through the scheduler. The harness has no processes,
+ * and every test queues its input before reading, so these stubs are never
+ * reached by the line-discipline tests - they exist to link, and the run
+ * asserts that. test_waitq below calls sched_wake deliberately, and runs
+ * after that assertion for exactly that reason.
  *
  * Real signatures rather than void *: waitq.h pulls in process.h, and a stub
  * that disagrees with the declaration it is standing in for is a link-time
@@ -52,9 +58,8 @@ void sched_block(process_t *p) { (void)p; sched_stub_calls++; }
 void sched_wake(process_t *p)  { (void)p; sched_stub_calls++; }
 process_t *proc_current(void)  { return NULL; }
 
-/* Ctrl-C sends a real signal now. The harness has no processes and no tty
- * ownership, so these record the call and go no further - which lets the
- * Ctrl-C test assert that the signal was raised without needing a scheduler. */
+/* The signal characters send real signals, at input time. The harness has
+ * no processes, so this records the call and goes no further. */
 int  signal_stub_sends;
 int  signal_stub_last;
 void signal_send_group(int pgid, int signo) {
@@ -73,7 +78,6 @@ void signal_send(process_t *p, int signo) {
     pipe_sigs++;
     pipe_last_sig = signo;
 }
-int  tty_foreground_pgid(void) { return 42; }
 
 static void echo_reset(void) {
     echo_len = 0;
@@ -95,6 +99,57 @@ static void check(int cond, const char *what) {
     } else {
         printf("  ok    %s\n", what);
     }
+}
+
+/* --- the terminal from a program's side ---------------------------------- */
+
+static int64 rd(char *buf, uint64 n) {
+    object_t *o = tty_console();
+
+    return o->type->read(o, buf, n, NULL);
+}
+
+/* How much a read could take right now - FIONREAD. Asked before every read
+ * in the tests below, because reading an empty terminal would block, and
+ * blocking here is a spin on the stubs. */
+static int avail(void) {
+    int n = -1;
+
+    tty_ioctl(0x541B, (uint64)(uintptr)&n);
+    return n;
+}
+
+/* Linux's kernel termios, as the ioctls move it. */
+struct kt {
+    uint32 iflag, oflag, cflag, lflag;
+    uint8  line;
+    uint8  cc[19];
+};
+
+#define L_ISIG   0000001
+#define L_ICANON 0000002
+#define L_ECHO   0000010
+#define I_ICRNL  0000400
+#define CC_VTIME 5
+#define CC_VMIN  6
+
+static void get_mode(struct kt *t) {
+    tty_ioctl(0x5401, (uint64)(uintptr)t);          /* TCGETS */
+}
+
+static void set_mode(const struct kt *t) {
+    tty_ioctl(0x5402, (uint64)(uintptr)t);          /* TCSETS */
+}
+
+/* readline's mode: no ICANON, no ECHO, signals still on, one byte at a time. */
+static void raw_mode(void) {
+    struct kt t;
+
+    get_mode(&t);
+    t.lflag &= ~(uint32)(L_ICANON | L_ECHO);
+    t.cc[CC_VMIN] = 1;
+    t.cc[CC_VTIME] = 0;
+    set_mode(&t);
 }
 
 /* --- scancode helpers ---------------------------------------------------- */
@@ -137,83 +192,131 @@ static void type(const char *s) {
 
 static void type_enter(void) { press(SC_ENTER); }
 
-/* --- tests --------------------------------------------------------------- */
+static void ctrl(char letter) {
+    kbd_scancode(SC_CTRL);
+    press(scancode_for(letter));
+    kbd_scancode(SC_CTRL | SC_RELEASE);
+}
+
+/* A fresh terminal for each test: the defaults, nothing queued. */
+static void fresh(void) {
+    tty_init();
+    echo_reset();
+    signal_stub_sends = 0;
+}
+
+/* --- canonical mode ------------------------------------------------------- */
 
 static void test_plain_line(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: a typed line comes back intact\n");
-    echo_reset();
+    printf("\ntty: a typed line comes back intact\n");
+    fresh();
 
     type("ls -l");
+    check(avail() == 0, "an unfinished line is not readable yet");
     type_enter();
-    n = kbd_read_line(buf, sizeof(buf));
+    check(avail() == 6, "Enter (CR, mapped by ICRNL) completes it");
+    n = rd(buf, sizeof(buf));
 
     check(n == 6, "returned the byte count including the newline");
     check(memcmp(buf, "ls -l\n", 6) == 0, "buffer holds exactly what was typed");
-    check(strcmp(echo_text(), "ls -l\n") == 0, "every character was echoed once");
+    check(strcmp(echo_text(), "ls -l\n") == 0,
+          "every character was echoed once, AS IT WAS TYPED");
 }
 
 static void test_backspace(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: backspace removes from the buffer and the screen\n");
-    echo_reset();
+    printf("\ntty: backspace removes from the line and the screen\n");
+    fresh();
 
     type("lsx");
     press(SC_BACKSPACE);
     type(" -l");
     type_enter();
-    n = kbd_read_line(buf, sizeof(buf));
+    n = rd(buf, sizeof(buf));
 
     check(n == 6, "the erased character is not counted");
     check(memcmp(buf, "ls -l\n", 6) == 0, "the erased character is not delivered");
     check(strcmp(echo_text(), "ls -l\n") == 0, "the screen matches the buffer");
+
+    /* DEL (what a serial terminal sends) is VERASE and erases too. */
+    fresh();
+    kbd_inject('a');
+    kbd_inject('b');
+    kbd_inject(0x7F);
+    kbd_inject('\r');
+    n = rd(buf, sizeof(buf));
+    check(n == 2 && memcmp(buf, "a\n", 2) == 0, "DEL from the serial line erases");
 }
 
 static void test_backspace_on_empty_line(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: backspace at the start of a line does nothing\n");
-    echo_reset();
+    printf("\ntty: backspace at the start of a line does nothing\n");
+    fresh();
 
     press(SC_BACKSPACE);
     press(SC_BACKSPACE);
     type("ok");
     type_enter();
-    n = kbd_read_line(buf, sizeof(buf));
+    n = rd(buf, sizeof(buf));
 
-    /* The interesting failure here is an underflow: len-- at len == 0 wraps a
-     * uint64 to 0xFFFF... and the next store writes far outside the buffer. */
+    /* The interesting failure here is an underflow: len-- at len == 0 wraps
+     * and the next store writes far outside the buffer. */
     check(n == 3, "the line is unaffected");
     check(memcmp(buf, "ok\n", 3) == 0, "no underflow past the start of the buffer");
+}
+
+static void test_kill_and_werase(void) {
+    char buf[64];
+    int64 n;
+
+    printf("\ntty: ^U kills the line, ^W erases a word\n");
+    fresh();
+    type("wrong words");
+    ctrl('u');
+    type("ls");
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 3 && memcmp(buf, "ls\n", 3) == 0, "^U discards everything typed");
+    check(strcmp(echo_text(), "ls\n") == 0, "and takes it off the screen (ECHOKE)");
+
+    fresh();
+    type("echo two words");
+    ctrl('w');
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 10 && memcmp(buf, "echo two \n", 10) == 0,
+          "^W takes back the last word and nothing before it");
 }
 
 static void test_shift_and_caps(void) {
     char buf[64];
 
-    printf("\nkbd: shift and caps lock\n");
-    echo_reset();
+    printf("\ntty: shift and caps lock\n");
+    fresh();
 
     kbd_scancode(SC_LSHIFT);
     type("ab");
     kbd_scancode(SC_LSHIFT | SC_RELEASE);
     type("c");
     type_enter();
-    kbd_read_line(buf, sizeof(buf));
+    rd(buf, sizeof(buf));
     check(memcmp(buf, "ABc\n", 4) == 0, "shift capitalises only while held");
 
-    echo_reset();
+    fresh();
     press(SC_CAPS);
     type("ab");
     kbd_scancode(SC_LSHIFT);
     type("c");
     kbd_scancode(SC_LSHIFT | SC_RELEASE);
     type_enter();
-    kbd_read_line(buf, sizeof(buf));
+    rd(buf, sizeof(buf));
     check(memcmp(buf, "ABc\n", 4) == 0, "caps lock XORs with shift rather than overriding it");
     press(SC_CAPS);   /* back off for later tests */
 }
@@ -221,14 +324,14 @@ static void test_shift_and_caps(void) {
 static void test_shifted_symbols(void) {
     char buf[64];
 
-    printf("\nkbd: shifted number row gives symbols\n");
-    echo_reset();
+    printf("\ntty: shifted number row gives symbols\n");
+    fresh();
 
     kbd_scancode(SC_LSHIFT);
     type("12");
     kbd_scancode(SC_LSHIFT | SC_RELEASE);
     type_enter();
-    kbd_read_line(buf, sizeof(buf));
+    rd(buf, sizeof(buf));
     check(memcmp(buf, "!@\n", 3) == 0, "shift+1 and shift+2 are ! and @");
 }
 
@@ -236,66 +339,60 @@ static void test_ctrl_c(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: Ctrl-C raises SIGINT rather than faking a newline\n");
-    echo_reset();
-    signal_stub_sends = 0;
+    printf("\ntty: Ctrl-C raises SIGINT when it is TYPED\n");
+    fresh();
 
     type("half typed");
-    kbd_scancode(SC_CTRL);
-    press(scancode_for('c'));
-    kbd_scancode(SC_CTRL | SC_RELEASE);
-
-    n = kbd_read_line(buf, sizeof(buf));
-    check(signal_stub_sends == 1, "one signal was sent");
+    ctrl('c');
+    /* Nobody is reading. The old discipline only looked at ^C inside a
+     * read, so a program not reading the terminal could not be interrupted
+     * at all - `sleep 100` ran its full hundred seconds. */
+    check(signal_stub_sends == 1, "one signal was sent, with no reader");
     check(signal_stub_last == 2, "and it was SIGINT");
-    /* The half-typed line is discarded: it belonged to the command being
-     * interrupted, not to whatever runs next. */
-    check(n == -4, "the interrupted read returns -EINTR, not end of input");
+    check(strcmp(echo_text(), "half typed^C\n") == 0, "echoed as ^C (ECHOCTL)");
+    check(avail() == 0, "nothing became readable");
+    type("x");
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 2 && memcmp(buf, "x\n", 2) == 0,
+          "the half-typed line was discarded, not prefixed to the next one");
 
-    /* The distinction that keeps a shell alive. Zero is Ctrl-D and only
-     * Ctrl-D; if Ctrl-C ever returns it again, ash exits on an empty line. */
-    echo_reset();
-    signal_stub_sends = 0;
-    kbd_scancode(SC_CTRL);
-    press(scancode_for('c'));
-    kbd_scancode(SC_CTRL | SC_RELEASE);
-    n = kbd_read_line(buf, sizeof(buf));
-    check(n != 0, "on an empty line it is still not end of input");
-    check(signal_stub_sends == 1, "and it still raises SIGINT");
+    /* Type-ahead queued before the ^C belonged to the interrupted command
+     * too - delivering it would run a command nobody typed at this prompt. */
+    fresh();
+    type("rm");
+    type_enter();
+    ctrl('c');
+    check(avail() == 0, "a whole line typed ahead of the ^C is flushed too");
+    type("ok");
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 3 && memcmp(buf, "ok\n", 3) == 0, "and the next line reads normally");
 
-    /* Type-ahead queued behind the Ctrl-C belonged to the interrupted
-     * command too - delivering it would run a command nobody typed at this
-     * prompt. */
-    echo_reset();
-    signal_stub_sends = 0;
-    kbd_scancode(SC_CTRL);
-    press(scancode_for('c'));
-    kbd_scancode(SC_CTRL | SC_RELEASE);
-    type("rm\n");
-    n = kbd_read_line(buf, sizeof(buf));
-    check(n == -4, "the read still ends at the Ctrl-C");
-    check(!kbd_has_input(), "and the type-ahead behind it was flushed");
+    fresh();
+    ctrl('z');
+    check(signal_stub_sends == 1 && signal_stub_last == 20, "^Z is SIGTSTP");
+    fresh();
+    kbd_inject(28);                   /* ^\ */
+    check(signal_stub_sends == 1 && signal_stub_last == 3, "^\\ is SIGQUIT");
 }
 
 static void test_ctrl_d(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: Ctrl-D\n");
-    echo_reset();
+    printf("\ntty: Ctrl-D\n");
+    fresh();
 
-    kbd_scancode(SC_CTRL);
-    press(scancode_for('d'));
-    kbd_scancode(SC_CTRL | SC_RELEASE);
-    n = kbd_read_line(buf, sizeof(buf));
+    ctrl('d');
+    check(avail() >= 0, "(queued)");
+    n = rd(buf, sizeof(buf));
     check(n == 0, "on an empty line it is end of input - the shell will exit");
 
-    echo_reset();
+    fresh();
     type("hi");
-    kbd_scancode(SC_CTRL);
-    press(scancode_for('d'));
-    kbd_scancode(SC_CTRL | SC_RELEASE);
-    n = kbd_read_line(buf, sizeof(buf));
+    ctrl('d');
+    n = rd(buf, sizeof(buf));
     check(n == 2 && memcmp(buf, "hi", 2) == 0,
           "mid-line it submits what was typed, with no newline");
 }
@@ -304,37 +401,155 @@ static void test_line_longer_than_buffer(void) {
     char buf[8];
     int64 n;
 
-    printf("\nkbd: a line longer than the buffer\n");
-    echo_reset();
+    printf("\ntty: a line longer than the buffer\n");
+    fresh();
 
     type("0123456789");
     type_enter();
 
-    n = kbd_read_line(buf, sizeof(buf));
+    n = rd(buf, sizeof(buf));
     check(n == 8, "the first read fills the buffer exactly");
     check(memcmp(buf, "01234567", 8) == 0, "and holds the first 8 bytes");
 
-    n = kbd_read_line(buf, sizeof(buf));
+    n = rd(buf, sizeof(buf));
     check(n == 3 && memcmp(buf, "89\n", 3) == 0,
           "the rest arrives on the next read instead of being discarded");
+}
+
+static void test_one_line_per_read(void) {
+    char buf[64];
+    int64 n;
+
+    printf("\ntty: canonical reads stop at the end of a line\n");
+    fresh();
+    type("one");
+    type_enter();
+    type("two");
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 4 && memcmp(buf, "one\n", 4) == 0, "the first read gets one line");
+    n = rd(buf, sizeof(buf));
+    check(n == 4 && memcmp(buf, "two\n", 4) == 0, "the second read gets the next");
+}
+
+/* --- non-canonical (raw) mode --------------------------------------------- */
+
+static void test_raw_mode(void) {
+    char buf[64];
+    int64 n;
+    struct kt t;
+
+    printf("\ntty: raw mode, as readline sets it\n");
+    fresh();
+    raw_mode();
+
+    type("ab");
+    check(avail() == 2, "bytes are readable at once, no Enter needed");
+    check(echo_len == 0, "and nothing was echoed - readline echoes itself");
+    n = rd(buf, 1);
+    check(n == 1 && buf[0] == 'a', "VMIN=1 returns the first byte alone");
+    n = rd(buf, sizeof(buf));
+    check(n == 1 && buf[0] == 'b', "and the next read the rest");
+
+    type_enter();
+    n = rd(buf, sizeof(buf));
+    check(n == 1 && buf[0] == '\n', "Enter still reads as NL under ICRNL");
+
+    /* A PS/2 arrow key must reach readline as the sequence a VT100 sends -
+     * this used to be swallowed, so history recall was impossible. */
+    kbd_scancode(0xE0);
+    kbd_scancode(0x48);
+    kbd_scancode(0xE0);
+    kbd_scancode(0x48 | SC_RELEASE);
+    n = rd(buf, sizeof(buf));
+    check(n == 3 && memcmp(buf, "\033[A", 3) == 0, "Up arrow reads as ESC [ A");
+
+    ctrl('c');
+    check(signal_stub_sends == 1 && signal_stub_last == 2,
+          "^C still signals in raw mode while ISIG is on");
+
+    get_mode(&t);
+    t.lflag &= ~(uint32)L_ISIG;
+    set_mode(&t);
+    signal_stub_sends = 0;
+    ctrl('c');
+    n = rd(buf, sizeof(buf));
+    check(signal_stub_sends == 0 && n == 1 && buf[0] == 3,
+          "with ISIG off, ^C is just byte 3");
+
+    /* VMIN=0 VTIME=0 is a poll: an empty terminal returns 0 at once. */
+    get_mode(&t);
+    t.cc[CC_VMIN] = 0;
+    t.cc[CC_VTIME] = 0;
+    set_mode(&t);
+    n = rd(buf, sizeof(buf));
+    check(n == 0, "VMIN=0 VTIME=0 on an empty queue returns 0 without blocking");
+}
+
+static void test_mode_switch(void) {
+    char buf[64];
+    int64 n;
+    struct kt t, back;
+
+    printf("\ntty: switching modes keeps what was typed\n");
+    fresh();
+    get_mode(&back);
+    type("par");
+    raw_mode();
+    check(avail() == 3, "a half line becomes readable when ICANON goes off");
+    n = rd(buf, sizeof(buf));
+    check(n == 3 && memcmp(buf, "par", 3) == 0, "with its bytes intact");
+
+    set_mode(&back);
+    get_mode(&t);
+    check(t.lflag == back.lflag && t.iflag == back.iflag &&
+          t.cc[CC_VMIN] == back.cc[CC_VMIN],
+          "TCGETS returns exactly what TCSETS stored");
+    check((t.lflag & L_ICANON) && (t.lflag & L_ECHO) && (t.iflag & I_ICRNL),
+          "and the default is canonical, echoing, CR->NL");
+
+    /* TCSETSF flushes pending input; TCSETS does not. */
+    type("gone");
+    type_enter();
+    tty_ioctl(0x5404, (uint64)(uintptr)&t);
+    check(avail() == 0, "TCSETSF discards unread input");
+}
+
+static void test_winsize(void) {
+    uint16 ws[4] = { 0, 0, 0, 0 };
+    uint16 set[4] = { 50, 132, 0, 0 };
+
+    printf("\ntty: window size\n");
+    fresh();
+    tty_ioctl(0x5413, (uint64)(uintptr)ws);
+    check(ws[0] == 25 && ws[1] == 80, "TIOCGWINSZ reports the console grid");
+    tty_ioctl(0x5414, (uint64)(uintptr)set);
+    check(signal_stub_sends == 1 && signal_stub_last == 28,
+          "TIOCSWINSZ with a new size sends SIGWINCH");
+    tty_ioctl(0x5413, (uint64)(uintptr)ws);
+    check(ws[0] == 50 && ws[1] == 132, "and the new size is what is reported");
+    signal_stub_sends = 0;
+    tty_ioctl(0x5414, (uint64)(uintptr)set);
+    check(signal_stub_sends == 0, "setting the same size again signals nobody");
+    check(tty_ioctl(0x1234, 0) == -25, "an unknown request is -ENOTTY");
 }
 
 static void test_extended_and_release(void) {
     char buf[64];
     int64 n;
 
-    printf("\nkbd: prefixed and release codes produce nothing\n");
-    echo_reset();
+    printf("\ntty: release codes and unmapped extended keys type nothing\n");
+    fresh();
 
-    kbd_scancode(0xE0);              /* an arrow key: prefix... */
-    kbd_scancode(0x48);              /* ...then a code that collides with 'b' */
+    kbd_scancode(0xE0);              /* right Alt: prefix... */
+    kbd_scancode(0x38);              /* ...then a code that is plain Alt */
     kbd_scancode(scancode_for('a') | SC_RELEASE);   /* a bare release */
     type("z");
     type_enter();
 
-    n = kbd_read_line(buf, sizeof(buf));
+    n = rd(buf, sizeof(buf));
     check(n == 2 && memcmp(buf, "z\n", 2) == 0,
-          "neither the arrow key nor the stray release typed a character");
+          "neither the extended key nor the stray release typed a character");
 }
 
 
@@ -347,7 +562,7 @@ static void test_extended_and_release(void) {
  * silent hang on the machine and four lines to check here.
  *
  * Runs after the "no scheduler stubs" assertion above on purpose: this test
- * calls sched_wake deliberately, and it must not be able to hide a keyboard
+ * calls sched_wake deliberately, and it must not be able to hide a terminal
  * test that started blocking by accident. */
 static void test_waitq(void) {
     wait_queue_t q, other;
@@ -418,17 +633,22 @@ int kbd_run_tests(void) {
     test_plain_line();
     test_backspace();
     test_backspace_on_empty_line();
+    test_kill_and_werase();
     test_shift_and_caps();
     test_shifted_symbols();
     test_ctrl_c();
     test_ctrl_d();
     test_line_longer_than_buffer();
+    test_one_line_per_read();
+    test_raw_mode();
+    test_mode_switch();
+    test_winsize();
     test_extended_and_release();
 
-    printf("\nkbd: the blocking path was never entered\n");
-    /* Every test above supplies a full line before reading, so kbd_wait
-     * never had to block. If this ever fires, a test changed shape and the
-     * stubs above started standing in for real scheduling. */
+    printf("\ntty: the blocking path was never entered\n");
+    /* Every test above queues its input before reading, so no read ever had
+     * to block. If this ever fires, a test changed shape and the stubs above
+     * started standing in for real scheduling. */
     check(sched_stub_calls == 0, "no test relied on the scheduler stubs");
 
     test_waitq();

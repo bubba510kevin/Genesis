@@ -10,7 +10,7 @@
  *
  * All of this is boot-time only: bus.c is not reachable from ring 3, and
  * there is no syscall that would make it so. Same posture as the mbuf and
- * callout selftests - see src/verif.c.
+ * callout selftests - see src/verif/verif.c.
  *
  * These devices are created with a NULL ivars pointer and are never given
  * to a real bus. That is deliberate: the point is to test the MATCHING

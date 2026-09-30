@@ -14,7 +14,7 @@
  * interrupt_dispatch's >47 branch -> idt_dispatch_vector -> handler ->
  * lapic_eoi. That is the same path an MSI takes, minus the device writing
  * the message - which is the part QEMU's default machine gives no way to
- * exercise (see pci_msi_report and src/verif.c).
+ * exercise (see pci_msi_report and src/verif/verif.c).
  */
 
 static volatile int fired;

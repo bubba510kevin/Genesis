@@ -35,6 +35,7 @@ cp kernel/include/*.h "$OUT/include/"
 # a test harness that silently tests less than it claims is worse than one
 # that does not run.
 cp kernel/mm/pmm.c kernel/mm/paging.c kernel/arch/e820.c kernel/dev/keyboard.c \
+   kernel/dev/tty.c \
    kernel/proc/waitq.c kernel/fs/pipe.c kernel/exec/pe.c kernel/fs/fat.c \
    kernel/fs/path.c kernel/obj/object.c kernel/mm/kstack.c kernel/obj/ns.c \
    kernel/dev/devices.c kernel/exec/ntproc.c kernel/dev/rtc.c kernel/dev/part.c \
@@ -132,7 +133,7 @@ python3 tests/host/mkimg.py "$OUT/imgs"
 
 gcc -std=c99 -Wall -Wextra -g -no-pie -fno-pie \
     -I"$OUT/include" -Itests/host \
-    "$OUT/pmm.c" "$OUT/paging.c" "$OUT/e820.c" "$OUT/keyboard.c" "$OUT/waitq.c" "$OUT/pipe.c" "$OUT/pe.c" "$OUT/fat.c" "$OUT/path.c" "$OUT/object.c" "$OUT/kstack.c" "$OUT/ns.c" "$OUT/devices.c" "$OUT/ntproc.c" "$OUT/rtc.c" "$OUT/part.c" "$OUT/device.c" "$OUT/bcache.c" \
+    "$OUT/pmm.c" "$OUT/paging.c" "$OUT/e820.c" "$OUT/keyboard.c" "$OUT/tty.c" "$OUT/waitq.c" "$OUT/pipe.c" "$OUT/pe.c" "$OUT/fat.c" "$OUT/path.c" "$OUT/object.c" "$OUT/kstack.c" "$OUT/ns.c" "$OUT/devices.c" "$OUT/ntproc.c" "$OUT/rtc.c" "$OUT/part.c" "$OUT/device.c" "$OUT/bcache.c" \
     "$OUT/volume.c" "$OUT/vfs.c" "$OUT/fatfs.c" "$OUT/fileobj.c" "$OUT/pcache.c" "$OUT/acl.c" "$OUT/ntsec.c" \
     "$OUT/gnfs_format.c" "$OUT/gnfs_object.c" "$OUT/gnfs_vfs.c" \
     tests/host/vmm_test.c tests/host/kbd_test.c tests/host/fat_test.c \

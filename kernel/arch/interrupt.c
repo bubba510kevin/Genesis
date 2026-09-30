@@ -377,6 +377,7 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
         bkl_acquire();
         c->user_entries++;
         kill_on_fatal_signal();
+        signal_deliver_irq(proc_current(), frame);
         return_to_user(1);
         bkl_exit_to_user();
         return;
@@ -424,6 +425,14 @@ void interrupt_dispatch(struct interrupt_frame *frame) {
      * switching away would abandon them. */
     if (from_user) {
         kill_on_fatal_signal();
+        /* A handled signal for a thread that is not making system calls:
+         * run its handler now rather than at a syscall that may never come
+         * (see signal_deliver_irq). BEFORE return_to_user, as the syscall
+         * path delivers before it: a stop signal's default action marks the
+         * thread stopped, and return_to_user is where it parks. The frame is
+         * on this thread's own kernel stack, so it is this thread that
+         * eventually returns through it whichever CPU that happens on. */
+        signal_deliver_irq(proc_current(), frame);
         return_to_user(1);
         /* Possibly on another CPU now - schedule() may have moved this
          * thread - so the release goes through the CPU it is on. */

@@ -10,9 +10,9 @@
  *   if_rl.c:655: implicit declaration of function 'device_get_sysctl_ctx'
  *   sysctl.h:259: invalid type argument of '->' (have 'int')
  *
- * which stopped src/kmod/build.sh (and therefore tools/build_user.sh) dead at
+ * which stopped modules/build.sh (and therefore the userland build (Genesis-userland's build.sh)) dead at
  * that file, with `set -e`, before the two modules after it. The ROADMAP has
- * carried "tools/build_user.sh exits 1 on the rtl8139 module" as an open item;
+ * carried "the userland build (Genesis-userland's build.sh) exits 1 on the rtl8139 module" as an open item;
  * this is the whole of it. if_re.c calls the same pair in re_add_sysctls.
  *
  * --- where the state lives, and why it is a side table --------------------

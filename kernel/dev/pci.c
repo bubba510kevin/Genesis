@@ -131,7 +131,7 @@ static void scan_bus(uint8 bus);
  * ROADMAP item 11 names this as deferred, and pci.c's own comment named the
  * register to read. QEMU's default i440fx machine exposes no P2P bridge, so
  * this recursion finds nothing there and is exercised with `-device
- * pci-bridge` - see src/verif.c. That is worth stating plainly: on the
+ * pci-bridge` - see src/verif/verif.c. That is worth stating plainly: on the
  * default machine this code path is correct and untaken, which is a weaker
  * claim than "verified" and should not be dressed up as one.
  *

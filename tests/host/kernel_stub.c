@@ -60,6 +60,15 @@ void bkl_wait_for_interrupt(void) {
 void proc_dump(void) {
 }
 
+/* --- object.h: descriptor allocation's RLIMIT_NOFILE bound. There is no
+ * current process on the host, which is exactly the case the kernel answers
+ * with the whole table. */
+#include "object.h"
+int handle_table_limit(const handle_t *table) {
+    (void)table;
+    return MAX_HANDLES;
+}
+
 /* --- vmalloc.h ----------------------------------------------------------
  * The kernel VA allocator. Answering 0 is not a failure to implement it: 0 is
  * "the region is exhausted", which is exactly the answer both callers here

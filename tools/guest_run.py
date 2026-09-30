@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Two of the three test suites in this tree - src/systest.c and src/verif.c -
+Two of the three test suites - src/systest/systest.c and src/verif/verif.c in Genesis-userland -
 are USERLAND programs. They run from the guest's shell, which means "did the
 tests pass" used to be a question answered by a human sitting in front of the
 QEMU window. A suite that only runs when someone remembers to run it is a
@@ -190,11 +190,14 @@ def main():
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
 
+    # bashtest is GNU bash running a script (ROADMAP item 15); it is last
+    # because exec'ing bash takes ~25s under TCG (polled ATA PIO).
     commands = sys.argv[1:] or ["/bin/verif", "/bin/systest", "/bin/thr.exe",
                                 "/bin/smp.exe", "/bin/tls.exe",
                                 "/bin/wait.exe", "/bin/seh.exe", "/bin/mix.exe",
                                 "/bin/elfmix",
-                                "/bin/fbtest"]
+                                "/bin/fbtest",
+                                "/bin/bash /usr/tests/bashtest.sh"]
     log = os.path.join("build", "guest.log")
     if os.path.exists(log):
         os.remove(log)

@@ -827,7 +827,7 @@ int kld_load(const char *name, const void *image, uint64 size) {
     /* --- pass 4b: the init function by NAME ------------------------------
      *
      * The fallback, for a module that predates the section mechanism or is
-     * hand-written against the kernel directly (src/kmod/hello_kmod.c is
+     * hand-written against the kernel directly (modules/hello_kmod.c is
      * both). Three spellings are accepted, so a module written for either
      * upstream's convention loads unmodified.
      *

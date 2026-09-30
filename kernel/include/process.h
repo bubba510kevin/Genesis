@@ -25,6 +25,54 @@
 /* 64: each CPU also needs an idle thread, and a machine with several CPUs
  * runs several threads of one program at once, which is the point of it. */
 #define MAX_PROCESSES  64
+
+/* Resource limits: Linux's numbering (asm-generic/resource.h). */
+#define RLIMIT_CPU         0
+#define RLIMIT_FSIZE       1
+#define RLIMIT_DATA        2
+#define RLIMIT_STACK       3
+#define RLIMIT_CORE        4
+#define RLIMIT_RSS         5
+#define RLIMIT_NPROC       6
+#define RLIMIT_NOFILE      7
+#define RLIMIT_MEMLOCK     8
+#define RLIMIT_AS          9
+#define RLIMIT_LOCKS      10
+#define RLIMIT_SIGPENDING 11
+#define RLIMIT_MSGQUEUE   12
+#define RLIMIT_NICE       13
+#define RLIMIT_RTPRIO     14
+#define RLIMIT_RTTIME     15
+#define RLIMIT_COUNT      16
+#define RLIM_INFINITY     (~0ULL)
+
+/* Set a fresh process's limits to the boot defaults. */
+struct process;
+void rlimit_defaults(struct process *p);
+/* Inherit across fork: the child gets the parent's limits, soft and hard. */
+void rlimit_copy(struct process *child, const struct process *parent);
+
+/* What wait4/waitid are looking for, and which of them was found. */
+#define PROC_WAIT_EXITED    1
+#define PROC_WAIT_STOPPED   2
+#define PROC_WAIT_CONTINUED 4
+
+/* The first child of p that answers to `sel` (wait4's pid: >0 a pid, 0 p's
+ * own group, -1 any, <-1 the group -sel) and has something `want` asks for:
+ * a reapable zombie, an unreported stop, an unreported continue. *kind says
+ * which. *any_match is set if ANY child answers to sel at all - the
+ * difference between "wait" and -ECHILD. Consumes nothing: the caller
+ * clears the report, or reaps. */
+struct process *proc_wait_child(struct process *p, int sel, int want,
+                                int *kind, int *any_match);
+
+/* Fold a child that is about to be reaped into its parent's child CPU time.
+ * Called by wait4 and waitid before proc_free. */
+void proc_account_reaped(struct process *parent, const struct process *child);
+
+/* CPU ticks of a whole thread group: every live thread sharing p's tgid.
+ * RUSAGE_SELF and times() report the process, not the calling thread. */
+uint64 proc_group_cpu_ticks(const struct process *p);
 #define PROC_ARG_MAX   32
 
 /* Which ABI a process speaks.
@@ -349,6 +397,12 @@ typedef struct process {
      * touch. Those are different lifetimes, so they are different fields. */
     uint64          cpu_ticks;
 
+    /* CPU time of every child this process has reaped, and of everything
+     * THEY reaped - the tms_cutime/RUSAGE_CHILDREN total. Added at reap time
+     * (proc_account_reaped), which is exactly POSIX's rule: a child that has
+     * not been waited for is not counted. */
+    uint64          child_cpu_ticks;
+
     /* --- signals ---------------------------------------------------------
      * pending and blocked are bitmasks over signals 1..31. handlers is
      * per-process rather than per-thread because that is what POSIX says:
@@ -357,6 +411,54 @@ typedef struct process {
      * place now would be invisible too - right up until clone(). */
     uint64             sig_pending;
     uint64             sig_blocked;
+
+    /* A mask to put back on the way out of the current system call - Linux's
+     * TIF_RESTORE_SIGMASK. rt_sigsuspend, pselect6 and ppoll wait under a
+     * TEMPORARY mask, and the signal that ends the wait is usually one the
+     * caller's own mask blocks (bash blocks SIGCHLD and sigsuspends for it).
+     * Restoring the old mask inside the syscall re-blocks that signal before
+     * delivery, so the handler never runs and the wait was for nothing. So
+     * the syscall leaves the temporary mask in place and records the old one
+     * here; signal_deliver saves THIS in the signal frame (the handler runs,
+     * and rt_sigreturn restores the caller's mask), and syscall_dispatch
+     * restores it itself if nothing was delivered. */
+    uint64             sig_saved_mask;
+    int                sig_restore_mask;
+
+    /* --- job control (ROADMAP item 15) -----------------------------------
+     *
+     * job_stopped is per THREAD: set on every thread of a group when a stop
+     * signal's default action is taken, cleared by SIGCONT (or SIGKILL).
+     * A stopped thread parks in return_to_user - the same parking NT
+     * suspension uses, so nothing but a resume wakes it - and never runs
+     * ring-3 code while it is set.
+     *
+     * The reports are on the process (the group leader) and are what wait4
+     * with WUNTRACED/WCONTINUED hands the parent: stop_report holds the
+     * signal that stopped it until a wait consumes it, cont_report is set by
+     * a SIGCONT that resumed it. A stop clears a pending continue report and
+     * a continue clears a pending stop report, as Linux's do.
+     *
+     * term_signal is the signal that killed the process, 0 if it exited:
+     * what makes WIFSIGNALED true. It used to be folded into the exit status
+     * as 128+signo, so a shell saw every killed child as one that had called
+     * exit(130) - $? was right and `kill -l $?`-style reporting was not. */
+    int                job_stopped;
+    int                stop_report;
+    int                cont_report;
+    int                term_signal;
+
+    /* --- resource limits (getrlimit/setrlimit/prlimit64) -----------------
+     *
+     * Linux's sixteen, soft then hard, RLIM_INFINITY as all ones. Per
+     * process, inherited across fork and kept across exec, as POSIX says.
+     * ENFORCED rather than reported where this kernel has the thing being
+     * limited: RLIMIT_NOFILE bounds descriptor allocation (handle_alloc_from
+     * and handle_install_at), and RLIMIT_STACK's hard limit is the stack exec
+     * actually builds, so it cannot be raised past what exists. The rest are
+     * recorded and returned faithfully; see rlimit_defaults in process.c for
+     * which are which. */
+    struct { uint64 cur, max; } rlim[RLIMIT_COUNT];
 
     /* --- the alternate signal stack (sigaltstack(2)) ---------------------
      *
@@ -457,6 +559,12 @@ typedef struct process {
     uint64          affinity;
     int             ideal_cpu;
     int             is_idle;
+
+    /* Syscall tracing (PR_GENESIS_TRACE, /bin/gtrace): non-zero prints every
+     * Linux-personality call this process makes, with its result. Inherited
+     * across fork and kept across exec, so tracing a shell traces what it
+     * runs - which is the point when the question is "what did bash do". */
+    int             trace;
 } process_t;
 
 /* Set up the table and build the first process, which inherits the boot

@@ -329,13 +329,34 @@ void return_to_user(int to_user) {
      * blocked thread is a spurious wake here; only NtResumeThread taking the
      * count to 0 lets it out. A kill does not come back through here at
      * all - a zombie's schedule() never returns. */
-    while (me != NULL && me->nt_suspend_count > 0 &&
-           me->state != PROC_ZOMBIE) {
-        me->nt_parked = 1;
-        sched_block(me);
-    }
-    if (me != NULL) {
-        me->nt_parked = 0;
+    /*
+     * A job-control stop (SIGSTOP, ^Z's SIGTSTP...) parks the same way and
+     * for the same reason: until SIGCONT, not one more ring-3 instruction.
+     * nt_parked is what keeps an ordinary signal from waking it (see
+     * signal_send); SIGCONT and SIGKILL clear job_stopped and wake it. */
+    {
+        int was_stopped = 0;
+
+        while (me != NULL && (me->nt_suspend_count > 0 || me->job_stopped) &&
+               me->state != PROC_ZOMBIE) {
+            if (me->job_stopped) {
+                was_stopped = 1;
+            }
+            me->nt_parked = 1;
+            sched_block(me);
+        }
+        if (me != NULL) {
+            me->nt_parked = 0;
+        }
+        /* Let out by SIGKILL: die now, not after one more trip to ring 3. */
+        if (me != NULL && was_stopped && signal_kill_if_fatal(me)) {
+            schedule();
+            print_string("\n[nothing left to run]\n", 0x4F);
+            __asm__ volatile ("cli");
+            for (;;) {
+                __asm__ volatile ("hlt");
+            }
+        }
     }
     /* A GS base changed from another thread (nt_attach giving this one a
      * TEB): loaded now, so the next instruction in ring 3 sees it. */

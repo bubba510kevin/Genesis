@@ -1,26 +1,4 @@
-src/ntdll/*.o
-src/ntdll/ntdll.dll
-src/ntdll/libntdll.a
-src/ntdll/ntsyscalls.h
-src/winhello/*.o
-src/winhello/hello.exe
-src/hand/*.o
-src/hand/hand.exe
-src/kernel32/*.o
-src/kernel32/kernel32.dll
-src/kernel32/libkernel32.a
-src/k32demo/*.o
-src/k32demo/k32.exe
-src/winthread/*.o
-src/winthread/thr.exe
-src/winwait/*.o
-src/winwait/wait.exe
-src/winmix/*.o
-src/winmix/mix.exe
-src/winmix/mixdll.dll
-src/somix/*.so
-src/winseh/*.o
-src/winseh/seh.exe
+# Userland (and its build outputs) lives in Genesis-userland now.
 
 # Build output and generated artifacts
 build/

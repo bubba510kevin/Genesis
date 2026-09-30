@@ -11,6 +11,15 @@ refer to "ROADMAP item 11", "item 6", "item 7" by number in dozens of places;
 renumbering would make every one of them point at the wrong thing. The gaps in
 the sequence are the completed items.
 
+USERLAND MOVED OUT, 2026-09-28. This repository is the kernel alone; every
+ring-3 program, the root/ tree, GNTbash and GNTlibc are in Genesis-userland
+(github.com/bubba510kevin/Genesis-userland), split with their history. A
+"src/..." path below means that repository (single-file programs moved into
+directories: src/verif.c is src/verif/verif.c, src/systest.c is
+src/systest/systest.c). src/kmod is this repository's modules/, and
+src/mkpe.py is tools/mkpe.py. The item text below is history and is not
+rewritten for the move. handoff.md "Two repositories" has the layout.
+
 ================================================================================
 THE PLAN - FOUR PHASES (reorganized 2026-09-27)
 ================================================================================
@@ -41,6 +50,9 @@ PHASE 1 - RUN BASH (item 15).
   Pulls forward from phase 2: select/pselect6, getrlimit/prlimit64, a writable
   /tmp, /proc (at least /proc/self/fd for process substitution), /etc/passwd
   and /etc/group, symlinks, and long filenames on the root volume.
+  STATUS 2026-09-27: bash 5.3 runs interactively; select/pselect6, rlimits,
+  getrusage, a real termios line discipline and job-control stops are done
+  (item 15 has the detail). Next: utilities to run, /tmp, /etc, long names.
 
 PHASE 2 - A MODERN KERNEL: LINUX AND NT 10.0 PARITY (item 16).
   The feature set a current Linux kernel and the NT 10.0 kernel (Windows 10
@@ -899,7 +911,96 @@ THE ARCHITECTURAL FORK THAT DECIDES EVERYTHING BELOW IT - DECIDED 2026-09-27, TH
 WHERE THIS STANDS RELATIVE TO EVERYTHING ELSE IN THIS FILE: every other item here is a real, load-bearing piece of the eventual answer - the NT object manager, the PE loader, WDM driver loading (now the road to every precompiled driver, win32k.sys included), and this session's ACL work in particular are exactly the foundation (a), (b) and (g) build on. But (a) through (r) above are, collectively, larger than everything this tree has built so far, and ReactOS's (and, for running precompiled Windows binaries on another kernel, Wine's) multi-decade timeline on almost exactly this problem is the honest comparison, not a discouraging one - it is evidence this is a real, hard, well-precedented problem rather than one this tree is failing to solve quickly.
 
 
-15. RUN BASH - PHASE 1. NOT STARTED.
+15. RUN BASH - PHASE 1. IN PROGRESS (started 2026-09-27).
+
+WHERE IT STANDS: /bin/bash is GNTbash (Genesis-userland's third_party/GNTbash
+submodule: bash 5.3 patch level 9 plus the switchable Windows layer, built by
+its own genesis/build.sh - static against musl, bundled readline, no curses).
+The bring-up below was done with a plain upstream bash 5.3.20 built the same
+way; that build script was dropped for GNTbash when userland moved to its own
+repository, and with winmode off the two are the same shell. Started from
+BusyBox's shell it runs
+interactively: prompt, readline editing, history recall with the arrow keys,
+tab completion of commands, command substitution, pipelines, here-documents,
+functions, `ulimit`, `read -t`, `times`, Ctrl-C at the prompt and Ctrl-C of a
+running loop. It is not yet the login shell and there is nothing for it to run
+(no cat, no head) - (j) below.
+
+HOW THE LIST BELOW WAS WORKED, and the method is the reusable part: run bash
+and watch what it does. /bin/gtrace CMD turns on the kernel's syscall trace
+for CMD and everything it forks (prctl PR_GENESIS_TRACE, inherited across fork
+and exec; each call prints as it enters and as it returns). The trace used to
+be a compile-time switch that traced EVERY process, which made it useless for
+one program on a live shell. tools/guest_sh.py drives the guest shell from a
+file of lines, with "@wait:REGEX" for slow starts.
+
+The first trace was the whole story in two lines: bash started, installed its
+handlers, set up job control, printed "bash-5.3# " - and then readline's wait
+for the first keystroke was pselect6, -ENOSYS, which readline reads as end of
+input, and bash exited cleanly. Along the way getrlimit/prlimit64 were -ENOSYS
+too. The rest of what is below fell out of using the shell once it stayed up.
+
+DONE:
+  (a) select and pselect6 - over the same ob_poll readiness poll uses, with
+      Linux's mapping of readiness to the three sets, -EBADF for a closed
+      descriptor, and the time left written back.
+  (b) getrlimit/setrlimit/prlimit64 - per process, inherited across fork,
+      kept across exec. RLIMIT_NOFILE is ENFORCED (handle_alloc_from and
+      handle_install_at consult handle_table_limit) and its ceiling is the
+      real table, 32; RLIMIT_STACK's hard limit is the real 64KB stack, so
+      `ulimit -s unlimited` fails here where Linux allows it. Honest, and
+      the reason is the fixed stack, not the limit code.
+  (c) getrusage and the child half of times() - reaped children's CPU time
+      is accumulated at reap time, which is POSIX's rule.
+  (k) THE TERMINAL - kernel/dev/tty.c is a real line discipline with a
+      termios. See FEATURES "Console and input". The shape changed as well as
+      the features: input is processed when it arrives, in the interrupt, so
+      Ctrl-C reaches a program that is not reading (before, `sleep` could not
+      be interrupted at all) and readline's raw mode (VMIN/VTIME) exists.
+      TIOCSCTTY, SIGTTIN for background readers and SIGWINCH on a size
+      change are in; SIGTTOU (TOSTOP) is not.
+  JOB CONTROL, which the list did not name separately: stop signals stop the
+      whole process (they were IGNORED - nothing could resume a stopped one),
+      SIGCONT resumes, SIGKILL reaches a stopped process; wait4/waitid report
+      stops, continues and deaths by signal (WIFSIGNALED, where a signal
+      death used to look like exit(128+n)), and wait4 honours pid, 0, -1 and
+      -pgid - it used to reap the first zombie whatever pid was asked for.
+
+FOUR KERNEL BUGS FOUND ON THE WAY, each worth its own line:
+  rt_sigsuspend put the caller's mask back BEFORE delivery, so a signal that
+      mask blocks - SIGCHLD, in every job-control shell - was re-blocked and
+      its handler never ran. Fixed the Linux way (TIF_RESTORE_SIGMASK): the
+      temporary mask stays until the signal frame takes the caller's mask
+      over; pselect6 and ppoll use the same mechanism, which is also why
+      ppoll with a mask stopped being -ENOSYS.
+  Signal handlers ran only at system-call boundaries. A compute-bound
+      program with a handler never got it: bash's `while :; do :; done`
+      echoed ^C and went on for ever. The interrupt return path now delivers
+      (signal_deliver_irq); that frame saves every register and the FXSAVE
+      state, and its rt_sigreturn leaves by iretq because sysret cannot
+      restore rcx and r11. The FPU state is saved for every delivery now -
+      a handler is ordinary C and uses xmm registers.
+  SIGWINCH and SIGURG TERMINATED by default (anything unlisted did); Linux
+      ignores both.
+  AN IGNORED SIGNAL WAS MADE PENDING, and a pending signal ends any blocking
+      wait with -EINTR. Invisible while wait4 reaped whatever zombie came
+      first; once it waited for ONE pid, another child's SIGCHLD (ignored by
+      default) broke `wait $pid` - on one CPU reliably, on four by timing.
+      signal_send now discards an ignored, unblocked signal (Linux's
+      sig_ignored), and systest arranges the race deterministically.
+
+STILL OPEN here: (d) /tmp, (e) /proc, (f) FIFOs and /dev/fd, (g) /etc,
+(h) symlinks, (i) long names, (j) utilities, (l) #! and setuid; bash as the
+login shell; the in-guest bash test suite. Two job-control gaps, recorded in
+FEATURES: a system call interrupted by a stop returns -EINTR after SIGCONT
+instead of restarting, and the orphaned-process-group rule is not applied.
+Found and not yet understood: completing "/bi<Tab>" beeps instead of giving
+"/bin/" (command-name completion works). And exec of bash takes about 25
+seconds under TCG - polled ATA PIO, one sector at a time, for 1.4MB - which
+makes every guest test that starts bash slow; multi-sector PIO or loading
+from the AHCI disk is the fix, and it belongs to phase 2.
+
+THE ORIGINAL PLAN FOR THIS ITEM, kept as written:
 
 The target: GNU bash (current upstream release), built by this tree and staged as /bin/bash, is the login shell - interactive, with readline line editing and history, job control (^Z, fg, bg, jobs), and its own test suite passing in the guest except for tests that are recorded as not applicable. What runs today is BusyBox's shell with no applets.
 
