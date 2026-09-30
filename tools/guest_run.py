@@ -92,6 +92,15 @@ def free_port():
     return port
 
 
+# The guest's shell is ready for input. Process 1 is /sbin/init, which starts
+# bash as the login shell (its prompt is "bash-5.3# "); a root with no init
+# boots BusyBox's ash instead, which announces itself with its banner. Either
+# means "type now". 300s: loading bash's 1.4MB over polled ATA takes ~25s
+# under TCG, on top of the boot.
+SHELL_READY = r"built-in shell \(ash\)|bash-[0-9.]+# "
+SHELL_TIMEOUT = 300
+
+
 def wait_for(path, pattern, timeout, since=0):
     """Wait until `pattern` appears in `path` beyond offset `since`.
 
@@ -217,10 +226,8 @@ def main():
 
     rc = 0
     try:
-        # The shell's banner. Waiting for the PROMPT would be nicer but it is
-        # a bare "# " with no newline after it, which a line-oriented poll
-        # cannot see arrive.
-        pos = wait_for(log, r"built-in shell \(ash\)", 180)
+        # ash's banner, or bash's prompt - see SHELL_READY.
+        pos = wait_for(log, SHELL_READY, SHELL_TIMEOUT)
         if pos < 0:
             print("guest_run: the shell never came up", file=sys.stderr)
             return 2

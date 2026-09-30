@@ -715,7 +715,8 @@ same object.
 | Auxiliary vector | ✅ | `AT_PHDR`, `AT_ENTRY`, `AT_PAGESZ`, … |
 | TLS (initial-exec) | ✅ | Through `arch_prctl`/FS base |
 | **musl** C library | ✅ | `mhello` and `ls` are ordinary C programs linked against real musl |
-| Shell | 🟡 | **GNTbash** (GNU bash 5.3 + a switchable Windows layer; Genesis-userland's `third_party/GNTbash`, static musl) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. Not yet the login shell (BusyBox ash is), and there are no utilities to run (no `cat`/`head`) - ROADMAP item 15 |
+| Shell | 🟡 | **GNTbash** (GNU bash 5.3 + a switchable Windows layer; Genesis-userland's `third_party/GNTbash`, static musl) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. It is the **login shell**: process 1 is `/sbin/init` (Genesis-userland `src/init`), which starts bash and restarts it when it exits (BusyBox `sh` if there is no init). There are no utilities to run yet (no `cat`/`head`) - ROADMAP item 15 |
+| Process 1 | ✅ | `/sbin/init`: login shell with its own session and controlling terminal, respawned on exit, reaps orphans; the kernel reparents a dead process's children to pid 1 |
 | vDSO | ❌ | |
 
 Programs in `/bin`: `bash` (GNU bash), `busybox` (shell), `ls` (musl),

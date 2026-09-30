@@ -127,7 +127,15 @@ static uint8 pmm_refcounts[PMM_FRAME_COUNT];
  * directory happened to agree. It is also the shape execve needs - "resolve a
  * path, load what it points at" is the same operation whether the caller is
  * the boot path or a syscall. */
+/* Process 1 is /sbin/init when the userland provides one - Genesis-userland's
+ * src/init, which starts the login shell (bash) and starts a new one whenever
+ * it exits, and reaps the orphans proc_retire hands it. BusyBox's shell as
+ * process 1, which is what ran here before, died for good on `exit`: nothing
+ * restarted it and the machine sat there echoing keystrokes nobody read.
+ * It stays as the fallback for a root with no init. */
+#define INIT_BINARY  "/sbin/init"
 #define USER_BINARY  "/bin/busybox"
+static const char *const init_argv[] = { "init", NULL };
 
 /* An interactive shell rather than a one-shot command.
  *
@@ -236,6 +244,8 @@ static void start_init_process(void) {
     uint32 size;
     uint8 *image = NULL;
     int rc;
+    const char *const *argv = init_argv;
+    const char *binary = INIT_BINARY;
 
     /* Through fs_read_whole, not fat_read_path.
      *
@@ -249,10 +259,17 @@ static void start_init_process(void) {
      * entry and treats a short read as -EIO, which is the check the two-call
      * version could not make: a read that came back short after a successful
      * size probe was indistinguishable from a small file. */
-    rc = fs_read_whole(USER_BINARY, &image, &size);
+    rc = fs_read_whole(binary, &image, &size);
+    if (rc == -2) {                          /* -ENOENT: no init, use ash */
+        print_string("  no " INIT_BINARY " - starting " USER_BINARY " sh\n",
+                     0x0E);
+        binary = USER_BINARY;
+        argv = user_argv;
+        rc = fs_read_whole(binary, &image, &size);
+    }
     if (rc == -2) {                          /* -ENOENT */
         print_string("  no ", 0x0E);
-        print_string(USER_BINARY, 0x0E);
+        print_string(binary, 0x0E);
         print_string(" on the volume\n", 0x0E);
         return;
     }
@@ -314,7 +331,7 @@ static void start_init_process(void) {
              * stops being true, the fix is for boot to execve rather than for
              * this call site to learn about dynamic linking. */
             uint64 stack = user_stack_create(USER_STACK_TOP, USER_STACK_SIZE,
-                                             user_argv, user_envp,
+                                             argv, user_envp,
                                              info.phdr_vaddr, info.phnum,
                                              info.phentsize, info.entry, 0);
 
