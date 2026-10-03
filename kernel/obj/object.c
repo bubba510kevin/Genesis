@@ -45,9 +45,11 @@ object_t *ob_create(const object_type_t *type, void *body) {
 
     for (i = 0; i < MAX_OBJECTS; i++) {
         if (object_pool[i].refcount == 0) {
-            object_pool[i].type     = type;
-            object_pool[i].body     = body;
-            object_pool[i].refcount = 1;
+            object_pool[i].type         = type;
+            object_pool[i].body         = body;
+            object_pool[i].refcount     = 1;
+            object_pool[i].handle_count = 0;
+            object_pool[i].ob_flags     = 0;
             return &object_pool[i];
         }
     }
@@ -71,6 +73,14 @@ void ob_deref(object_t *obj) {
         }
         obj->type = NULL;
         obj->body = NULL;
+        obj->handle_count = 0;
+        obj->ob_flags = 0;
+    }
+}
+
+void ob_make_temporary(object_t *obj) {
+    if (obj != NULL && obj->refcount != 0) {
+        obj->ob_flags |= OB_FLAG_TEMPORARY;
     }
 }
 
@@ -240,6 +250,7 @@ open_file_t *of_open(object_t *obj, uint32 access) {
             open_file_pool[i].status   = 0;
             open_file_pool[i].refcount = 1;
             ob_ref(obj);
+            obj->handle_count++;
             return &open_file_pool[i];
         }
     }
@@ -258,7 +269,19 @@ void of_deref(open_file_t *f) {
     }
     f->refcount--;
     if (f->refcount == 0) {
-        ob_deref(f->obj);
+        object_t *obj = f->obj;
+
+        /* The last open instance of a temporarily named object takes its
+         * name with it. Before the ob_deref below, so the object is still
+         * alive while the namespace lets go of its own reference - and the
+         * flag is cleared first, so nothing reached from ns_remove_object
+         * can come back here and remove it twice. */
+        if (obj != NULL && obj->handle_count != 0 &&
+            --obj->handle_count == 0 && (obj->ob_flags & OB_FLAG_TEMPORARY)) {
+            obj->ob_flags &= ~OB_FLAG_TEMPORARY;
+            (void)ns_remove_object(obj);
+        }
+        ob_deref(obj);
         f->obj    = NULL;
         f->offset = 0;
         f->access = 0;
