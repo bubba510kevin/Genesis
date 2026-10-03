@@ -157,8 +157,8 @@ The pieces already queued from earlier work belong here:
   (ntdll stubs, kernel32 `CreateMutexW` with names / `OpenMutexW` /
   `OpenEventW` / `OpenSemaphoreW`, sync.exe and wait.exe checks); land it,
   then add `/bin/sync.exe`, `/bin/ntsync.exe`, `/bin/vm.exe`,
-  `/bin/proc.exe`, `/bin/reg.exe`, `/bin/npipe.exe` and `/bin/tok.exe` to
-  `guest_run.py`'s default list (they print tallies only
+  `/bin/proc.exe`, `/bin/reg.exe`, `/bin/npipe.exe`, `/bin/tok.exe` and
+  `/bin/ovl.exe` to `guest_run.py`'s default list (they print tallies only
   from that commit on).
 - **Table sizes — DONE 2026-10-03**: `MAX_PROCESSES` 64 -> 256 (kernel
   stacks to match), Windows threads per process 64 -> 128, `MAX_HANDLES`
@@ -186,6 +186,12 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **Overlapped I/O — DONE 2026-10-03** (16(o), `kernel/fs/iomgr.c`, NT
+  calls `0x9D`-`0x9F`): asynchronous file objects, pending reads and pipe
+  connects completed by the `iomgr` kernel thread, event/APC/completion
+  port. **kernel32's CreateFileW now passes FILE_SYNCHRONOUS_IO_NONALERT**
+  unless FILE_FLAG_OVERLAPPED - an NtOpenFile with options 0 is
+  asynchronous now, as on NT. ovl.exe in the userland patch.
 - **Access tokens — first slice DONE 2026-10-03** (16(n),
   `kernel/obj/token.c`, NT calls `0x97`-`0x9C`): process tokens with
   user, groups, privileges and integrity; tok.exe in the userland patch.
@@ -301,8 +307,8 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x9C`.
-  `0x40`-`0x7F` is the display/input range; the next core call is `0x9D`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x9F`.
+  `0x40`-`0x7F` is the display/input range; the next core call is `0xA0`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
@@ -363,6 +369,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `reg` (`reg.exe`) | 31 passed | |
 | `npipe` (`npipe.exe`) | 31 passed | |
 | `tok` (`tok.exe`) | 24 passed | |
+| `ovl` (`ovl.exe`) | 34 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
 | `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |

@@ -392,6 +392,11 @@ struct syscall_frame;
 #define NT_SYS_QUERY_TOKEN           0x9B
 #define NT_SYS_ADJUST_PRIVILEGES     0x9C
 
+/* The I/O manager's asynchronous half (ROADMAP 16(o)), kernel/fs/iomgr.c. */
+#define NT_SYS_SET_INFORMATION_FILE  0x9D
+#define NT_SYS_CANCEL_IO_FILE        0x9E
+#define NT_SYS_CANCEL_IO_FILE_EX     0x9F
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -490,6 +495,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_IO_TIMEOUT         0xC00000B5u
 #define STATUS_CANCELLED          0xC0000120u
 #define STATUS_NO_TOKEN           0xC000007Cu
+#define STATUS_NOT_FOUND          0xC0000225u
 #define STATUS_INVALID_DEVICE_REQUEST 0xC0000010u
 #define STATUS_OBJECT_NAME_INVALID 0xC0000033u
 #define STATUS_PIPE_BUFFER_OVERFLOW 0x80000005u   /* STATUS_BUFFER_OVERFLOW */

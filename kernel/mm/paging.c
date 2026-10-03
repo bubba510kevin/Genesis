@@ -2,6 +2,7 @@
 #include "e820.h"
 #include "io.h"
 #include "paging.h"
+#include "iomgr.h"
 #include "pmm.h"
 #include "ksmp.h"
 #include "kprintf.h"
@@ -416,6 +417,8 @@ void vmm_space_destroy(address_space_t *as) {
         }
     }
 
+    /* Asynchronous I/O still aimed at this space has nowhere to land. */
+    iomgr_space_gone(as);
     if (vmm_space_destroy_hook != NULL) {
         vmm_space_destroy_hook(as);
     }

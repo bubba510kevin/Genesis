@@ -310,6 +310,12 @@ typedef struct open_file {
     uint32    access;
     uint32    status;
     uint32    refcount;
+    /* NT's per-file-object state (iomgr.h): OF_NT_* flags - asynchronous
+     * or not, the completion-notification options - and the completion
+     * port the file is associated with (referenced) and its key. */
+    uint32    nt_flags;
+    object_t *port;
+    uint64    port_key;
 } open_file_t;
 
 /* One entry of a process's table. A POSIX fd is an index into this array. */

@@ -1,6 +1,7 @@
 #include "ns.h"
 #include "object.h"
 #include "epoll.h"
+#include "iomgr.h"
 #include "typesk.h"
 
 /* Static pools rather than the heap.
@@ -250,6 +251,9 @@ open_file_t *of_open(object_t *obj, uint32 access) {
             open_file_pool[i].access   = access;
             open_file_pool[i].status   = 0;
             open_file_pool[i].refcount = 1;
+            open_file_pool[i].nt_flags = 0;
+            open_file_pool[i].port     = NULL;
+            open_file_pool[i].port_key = 0;
             ob_ref(obj);
             obj->handle_count++;
             return &open_file_pool[i];
@@ -273,8 +277,16 @@ void of_deref(open_file_t *f) {
         object_t *obj = f->obj;
 
         /* Out of every epoll interest list first: they key on this open
-         * instance, and the slot is about to be reused for another. */
+         * instance, and the slot is about to be reused for another. Its
+         * pending asynchronous requests are cancelled for the same reason,
+         * and it lets go of its completion port. */
         epoll_file_released(f);
+        iomgr_file_closed(f);
+        if (f->port != NULL) {
+            ob_deref(f->port);
+            f->port = NULL;
+        }
+        f->nt_flags = 0;
 
         /* The last open instance of a temporarily named object takes its
          * name with it. Before the ob_deref below, so the object is still

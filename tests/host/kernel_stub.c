@@ -148,3 +148,12 @@ struct open_file;
 void epoll_file_released(struct open_file *of) {
     (void)of;
 }
+
+/* The same for the I/O manager's two teardown hooks (kernel/fs/iomgr.c). */
+struct address_space;
+void iomgr_file_closed(struct open_file *of) {
+    (void)of;
+}
+void iomgr_space_gone(struct address_space *as) {
+    (void)as;
+}

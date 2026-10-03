@@ -4,6 +4,7 @@
 #include "ns.h"
 #include "dispatch.h"
 #include "npfs.h"
+#include "iomgr.h"
 #include "nt.h"
 #include "nt_context.h"
 #include "ntmix.h"
@@ -208,6 +209,9 @@ static uint64 nt_terminate_process(uint64 handle, uint64 status,
  * than silently resolving to a different object. Device and drive names are
  * ASCII in practice; the day one is not, the failure is a -ENOENT with a
  * visibly mangled name and not a mystery. */
+#define FILE_SYNCHRONOUS_IO_ALERT_     0x10u
+#define FILE_SYNCHRONOUS_IO_NONALERT_  0x20u
+
 static int unicode_to_path(uint64 str_ptr, char *out, uint64 cap) {
     nt_unicode_string_t us;
     uint64 chars, i;
@@ -280,7 +284,8 @@ static uint64 status_from_ns(int rc) {
  *
  * Six parameters, so all of them are in registers. */
 static uint64 nt_open_file(uint64 handle_out, uint64 access_mask,
-                           uint64 attrs_ptr, uint64 iosb_ptr) {
+                           uint64 attrs_ptr, uint64 iosb_ptr,
+                           uint64 options) {
     process_t *p = proc_current();
     nt_object_attributes_t oa;
     nt_io_status_block_t *iosb = (nt_io_status_block_t *)iosb_ptr;
@@ -358,6 +363,12 @@ static uint64 nt_open_file(uint64 handle_out, uint64 access_mask,
     if (of == NULL) {
         return STATUS_TOO_MANY_OPENED_FILES;
     }
+    /* Without FILE_SYNCHRONOUS_IO_ALERT/NONALERT the file object is
+     * ASYNCHRONOUS - what FILE_FLAG_OVERLAPPED asks for (iomgr.h). */
+    if (!((uint32)options & (FILE_SYNCHRONOUS_IO_ALERT_ |
+                             FILE_SYNCHRONOUS_IO_NONALERT_))) {
+        of->nt_flags |= OF_NT_ASYNC;
+    }
     /* Not inheritable by default. That is the NT rule and the opposite of the
      * POSIX one, which is exactly why HANDLE_INHERITABLE exists as a separate
      * bit from HANDLE_CLOEXEC rather than as its inverse. */
@@ -398,7 +409,8 @@ static uint64 nt_close(uint64 handle) {
  * value. That is the shape difference from read(2) that catches people: a
  * caller reading the NTSTATUS as a length sees 0 and concludes end of file on
  * every successful read. */
-static uint64 nt_rw_file(uint64 handle, int writing) {
+static uint64 nt_rw_file(uint64 handle, int writing, uint64 event,
+                         uint64 apc, uint64 apc_ctx) {
     process_t   *p = proc_current();
     open_file_t *f;
     nt_io_status_block_t *iosb;
@@ -450,17 +462,75 @@ static uint64 nt_rw_file(uint64 handle, int writing) {
     if (f->obj == NULL || f->obj->type == NULL) {
         return STATUS_INVALID_HANDLE;
     }
-    if (writing) {
-        if (!(f->access & ACCESS_WRITE) || f->obj->type->write == NULL) {
-            return STATUS_ACCESS_DENIED;
+    if (writing ? (!(f->access & ACCESS_WRITE) || f->obj->type->write == NULL)
+                : (!(f->access & ACCESS_READ) || f->obj->type->read == NULL)) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    /* The asynchronous parts (ROADMAP 16(o), iomgr.h). ByteOffset is
+     * argument eight: a position to use instead of the file pointer -
+     * which an asynchronous file object does not have, and a synchronous
+     * one is moved to. FILE_USE_FILE_POINTER_POSITION (-2) and
+     * FILE_WRITE_TO_END_OF_FILE (-1) are negative and leave it alone. */
+    {
+        uint64 bo_ptr = 0;
+        int async = (f->nt_flags & OF_NT_ASYNC) != 0;
+        uint64 offset = f->offset;
+        int have_offset = 0;
+        io_notify_t n;
+
+        (void)nt_stack_arg(user_rsp, 8, &bo_ptr);
+        if (bo_ptr != 0 && user_range_ok(bo_ptr, 8) &&
+            *(const int64 *)bo_ptr >= 0) {
+            offset = (uint64)*(const int64 *)bo_ptr;
+            have_offset = 1;
         }
-        done = f->obj->type->write(f->obj, (const void *)buffer, length,
-                                   &f->offset);
-    } else {
-        if (!(f->access & ACCESS_READ) || f->obj->type->read == NULL) {
-            return STATUS_ACCESS_DENIED;
+        n.iosb = iosb_ptr;
+        n.event = NULL;
+        n.apc = async ? apc : 0;
+        n.apc_ctx = apc_ctx;
+        if (event != 0) {
+            n.event = nt_object_of(event);
+            if (n.event == NULL || n.event->type == NULL ||
+                n.event->type->klass != OBJ_EVENT) {
+                return STATUS_INVALID_HANDLE;
+            }
+            /* The event says "this operation is done": cleared as it
+             * starts, as NtReadFile does. */
+            (void)n.event->type->signal(n.event, OB_SIG_RESET, 0, NULL);
         }
-        done = f->obj->type->read(f->obj, (void *)buffer, length, &f->offset);
+        if (async && !writing &&
+            !(ob_poll(f->obj, OB_POLLIN) &
+              (OB_POLLIN | OB_POLLHUP | OB_POLLERR))) {
+            return iomgr_queue(f, IRP_READ, buffer, (uint32)length, offset,
+                               &n);
+        }
+        if (async) {
+            /* No file pointer to move: a private position. */
+            done = writing ? f->obj->type->write(f->obj, (const void *)buffer,
+                                                 length, &offset)
+                           : f->obj->type->read(f->obj, (void *)buffer,
+                                                length, &offset);
+        } else {
+            if (have_offset) {
+                f->offset = offset;
+            }
+            done = writing ? f->obj->type->write(f->obj, (const void *)buffer,
+                                                 length, &f->offset)
+                           : f->obj->type->read(f->obj, (void *)buffer,
+                                                length, &f->offset);
+            if (n.event != NULL && done >= 0) {
+                (void)n.event->type->signal(n.event, OB_SIG_SET, 0, NULL);
+            }
+        }
+        if (async && done >= 0 && !(done == 0 && !writing && length > 0)) {
+            iosb->status = STATUS_SUCCESS;
+            iosb->information = (uint64)done;
+            /* Done at once, and still reported the asynchronous way: the
+             * event, the APC, the completion port. */
+            iomgr_complete_now(f, &n, STATUS_SUCCESS, (uint64)done, 1);
+            return STATUS_SUCCESS;
+        }
     }
 
     if (done < 0) {
@@ -1464,7 +1534,7 @@ static uint64 nt_create_named_pipe(uint64 handle_out, uint64 access_mask,
                                    uint64 attrs_ptr, uint64 iosb_ptr) {
     uint64 rsp = syscall_get_user_rsp();
     uint64 disposition = 0, pipe_type = 0, read_mode = 0, completion = 0;
-    uint64 max_inst = 0;
+    uint64 max_inst = 0, create_options = 0;
     nt_object_attributes_t oa;
     char path[NS_PATH_MAX], remainder[NS_PATH_MAX];
     const char *name;
@@ -1477,6 +1547,7 @@ static uint64 nt_create_named_pipe(uint64 handle_out, uint64 access_mask,
         return STATUS_ACCESS_VIOLATION;
     }
     (void)nt_stack_arg(rsp, 6, &disposition);
+    (void)nt_stack_arg(rsp, 7, &create_options);
     (void)nt_stack_arg(rsp, 8, &pipe_type);
     (void)nt_stack_arg(rsp, 9, &read_mode);
     (void)nt_stack_arg(rsp, 10, &completion);
@@ -1531,6 +1602,10 @@ static uint64 nt_create_named_pipe(uint64 handle_out, uint64 access_mask,
     ob_deref(obj);
     if (of == NULL) {
         return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    if (!((uint32)create_options & (FILE_SYNCHRONOUS_IO_ALERT_ |
+                                    FILE_SYNCHRONOUS_IO_NONALERT_))) {
+        of->nt_flags |= OF_NT_ASYNC;
     }
     index = handle_alloc(proc_current()->handles, of,
                          (oa.attributes & 0x2u /*OBJ_INHERIT*/) ? HANDLE_INHERITABLE
@@ -1626,7 +1701,8 @@ static uint64 np_fsctl_peek(object_t *obj, uint64 out, uint64 out_len,
  *   IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength,
  *   OutputBuffer, OutputBufferLength). Synchronous: Event and the APC are
  * accepted and ignored, as NtReadFile does. */
-static uint64 nt_fs_control(uint64 handle) {
+static uint64 nt_fs_control(uint64 handle, uint64 event, uint64 apc,
+                            uint64 apc_ctx) {
     uint64 rsp = syscall_get_user_rsp();
     uint64 iosb_ptr = 0, code = 0, in = 0, in_len = 0, out = 0, out_len = 0;
     uint64 st, info = 0;
@@ -1647,7 +1723,30 @@ static uint64 nt_fs_control(uint64 handle) {
 
     ob_ref(obj);                 /* a listen blocks; the handle may close */
     switch ((uint32)code) {
-    case FSCTL_PIPE_LISTEN:
+    case FSCTL_PIPE_LISTEN: {
+        open_file_t *f = handle_get(proc_current()->handles,
+                                    nt_handle_index(handle));
+
+        /* An asynchronous instance does not wait: the listen becomes a
+         * pending request (an overlapped ConnectNamedPipe). */
+        if (f != NULL && (f->nt_flags & OF_NT_ASYNC) &&
+            npfs_listen_poll(obj) == -11) {
+            io_notify_t n;
+
+            n.iosb = iosb_ptr;
+            n.event = event != 0 ? nt_object_of(event) : NULL;
+            n.apc = apc;
+            n.apc_ctx = apc_ctx;
+            if (n.event != NULL && n.event->type->klass != OBJ_EVENT) {
+                n.event = NULL;
+            }
+            if (n.event != NULL) {
+                (void)n.event->type->signal(n.event, OB_SIG_RESET, 0, NULL);
+            }
+            ob_deref(obj);
+            return iomgr_queue(f, IRP_LISTEN, 0, 0, 0, &n);
+        }
+    }
         rc = npfs_listen(obj);
         st = rc == 0    ? STATUS_SUCCESS
            : rc == -106 ? STATUS_PIPE_CONNECTED
@@ -1676,6 +1775,111 @@ static uint64 nt_fs_control(uint64 handle) {
         ((nt_io_status_block_t *)iosb_ptr)->information = info;
     }
     return st;
+}
+
+/* --- the I/O manager: file information and cancellation (16(o)) ---------- */
+
+#define FileCompletionInformation              30
+#define FileIoCompletionNotificationInformation 41
+#define FilePositionInformation                14
+
+static open_file_t *nt_file_of(uint64 handle) {
+    int index = nt_handle_index(handle);
+
+    return index < 0 ? NULL : handle_get(proc_current()->handles, index);
+}
+
+static void nt_iosb_set(uint64 iosb_ptr, uint64 status, uint64 info) {
+    if (user_range_ok(iosb_ptr, sizeof(nt_io_status_block_t))) {
+        ((nt_io_status_block_t *)iosb_ptr)->status = status;
+        ((nt_io_status_block_t *)iosb_ptr)->information = info;
+    }
+}
+
+/* NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+ *                      FileInformationClass) */
+static uint64 nt_set_information_file(uint64 handle, uint64 iosb_ptr,
+                                      uint64 info, uint64 len,
+                                      uint64 klass) {
+    open_file_t *f = nt_file_of(handle);
+
+    if (f == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    len &= 0xFFFFFFFFULL;
+    switch ((uint32)klass) {
+    case FileCompletionInformation: {
+        object_t *port;
+
+        /* { HANDLE Port; PVOID Key } - once per file object, as on NT. */
+        if (len < 16 || !user_range_ok(info, 16)) {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        port = nt_object_of(*(const uint64 *)info);
+        if (port == NULL || port->type == NULL ||
+            port->type->klass != OBJ_IO_COMPLETION) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if (f->port != NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        ob_ref(port);
+        f->port = port;
+        f->port_key = *(const uint64 *)(info + 8);
+        break;
+    }
+    case FileIoCompletionNotificationInformation: {
+        uint32 flags;
+
+        if (len < 4 || !user_range_ok(info, 4)) {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        flags = *(const uint32 *)info;
+        if (flags & ~3u) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (flags & 1u) {
+            f->nt_flags |= OF_NT_SKIP_PORT_SUCCESS;
+        }
+        if (flags & 2u) {
+            f->nt_flags |= OF_NT_SKIP_SET_EVENT;
+        }
+        break;
+    }
+    case FilePositionInformation:
+        if (len < 8 || !user_range_ok(info, 8)) {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if (*(const int64 *)info < 0) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        f->offset = (uint64)*(const int64 *)info;
+        break;
+    default:
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    nt_iosb_set(iosb_ptr, STATUS_SUCCESS, 0);
+    return STATUS_SUCCESS;
+}
+
+/* NtCancelIoFile(FileHandle, IoStatusBlock): every request this process
+ * has pending on the file. NtCancelIoFileEx(FileHandle, IoRequestToCancel,
+ * IoStatusBlock): the one whose IO_STATUS_BLOCK is IoRequestToCancel, or
+ * all of them for NULL - STATUS_NOT_FOUND when there was nothing. */
+static uint64 nt_cancel_io(uint64 handle, uint64 request, uint64 iosb_ptr,
+                           int ex) {
+    open_file_t *f = nt_file_of(handle);
+    int n;
+
+    if (f == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    n = iomgr_cancel(f, request, ex && request != 0);
+    nt_iosb_set(iosb_ptr, STATUS_SUCCESS, 0);
+    if (ex && n == 0) {
+        return STATUS_NOT_FOUND;
+    }
+    return STATUS_SUCCESS;
 }
 
 static object_t *make_keyed_event(uint32 unused) {
@@ -2832,18 +3036,25 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
              * stack, and are ignored: there is no sharing enforcement to
              * apply them to yet, and refusing them would refuse every
              * ordinary open. */
+        {
+            uint64 options = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 6, &options);
             return nt_trace(frame->rax,
                             nt_open_file(frame->r10, frame->rdx,
-                                         frame->r8, frame->r9));
+                                         frame->r8, frame->r9, options));
+        }
 
         case NT_SYS_CLOSE:
             return nt_trace(frame->rax, nt_close(frame->r10));
 
         case NT_SYS_READ_FILE:
-            return nt_trace(frame->rax, nt_rw_file(frame->r10, 0));
+            return nt_trace(frame->rax, nt_rw_file(frame->r10, 0, frame->rdx,
+                                                   frame->r8, frame->r9));
 
         case NT_SYS_WRITE_FILE:
-            return nt_trace(frame->rax, nt_rw_file(frame->r10, 1));
+            return nt_trace(frame->rax, nt_rw_file(frame->r10, 1, frame->rdx,
+                                                   frame->r8, frame->r9));
 
         case NT_SYS_ALLOCATE_VIRTUAL: {
             uint64 type = 0, protect = 0;
@@ -3063,7 +3274,27 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
                                                  frame->r8, frame->r9));
 
         case NT_SYS_FS_CONTROL_FILE:
-            return nt_trace(frame->rax, nt_fs_control(frame->r10));
+            return nt_trace(frame->rax, nt_fs_control(frame->r10, frame->rdx,
+                                                      frame->r8, frame->r9));
+
+        case NT_SYS_SET_INFORMATION_FILE: {
+            uint64 klass = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &klass);
+            return nt_trace(frame->rax,
+                            nt_set_information_file(frame->r10, frame->rdx,
+                                                    frame->r8, frame->r9,
+                                                    klass));
+        }
+
+        case NT_SYS_CANCEL_IO_FILE:
+            return nt_trace(frame->rax,
+                            nt_cancel_io(frame->r10, 0, frame->rdx, 0));
+
+        case NT_SYS_CANCEL_IO_FILE_EX:
+            return nt_trace(frame->rax,
+                            nt_cancel_io(frame->r10, frame->rdx, frame->r8,
+                                         1));
 
         case NT_SYS_FLUSH_KEY:
             /* Nothing is persistent yet, so everything is already "on disk"

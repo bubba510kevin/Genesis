@@ -258,6 +258,23 @@ int npfs_listen(object_t *srv) {
     return 0;
 }
 
+int npfs_listen_poll(object_t *srv) {
+    np_instance_t *in;
+
+    if (srv == NULL || srv->type != &np_server_type || srv->body == NULL) {
+        return -22;
+    }
+    in = (np_instance_t *)srv->body;
+    if (in->state == NP_STATE_DISCONNECTED) {
+        in->state = NP_STATE_LISTENING;
+        waitq_wake_all(&free_q);
+    }
+    if (in->state == NP_STATE_LISTENING) {
+        return -11;
+    }
+    return 0;
+}
+
 int npfs_disconnect(object_t *srv) {
     np_instance_t *in;
 

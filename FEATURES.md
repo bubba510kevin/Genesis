@@ -443,8 +443,15 @@ rendezvous per key, the NULL handle being the global one) and completion
 ports (`NtCreateIoCompletion`, `NtSetIoCompletion`,
 `NtRemoveIoCompletion(Ex)`, `NtQueryIoCompletion`; kernel32's
 `CreateIoCompletionPort`/`PostQueuedCompletionStatus`/
-`GetQueuedCompletionStatus(Ex)`, alertable included). Not yet: a file
-associated with a port (needs overlapped I/O), the concurrency limit.
+`GetQueuedCompletionStatus(Ex)`, alertable included), files associated
+with a port (overlapped I/O, below). Not yet: the concurrency limit.
+
+**Overlapped I/O ✅** (2026-10-03, ROADMAP 16(o)): `FILE_FLAG_OVERLAPPED`
+handles whose reads (and named-pipe connects) pend with
+`ERROR_IO_PENDING` and complete later through the event, a completion
+routine (`ReadFileEx`/`WriteFileEx`) or the completion port the file is
+associated with (`CreateIoCompletionPort` on a file); `GetOverlappedResult`,
+`CancelIo`/`CancelIoEx`, `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`.
 
 **Access tokens ✅ (first slice)** (2026-10-03, ROADMAP 16(n)):
 `NtOpenProcessToken`, `NtQueryInformationToken` (user, groups,

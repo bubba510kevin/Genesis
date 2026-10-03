@@ -41,6 +41,11 @@ int npfs_is_root(const struct object *obj);
 int npfs_listen(struct object *srv);
 int npfs_disconnect(struct object *srv);
 
+/* The listen without the wait, for an asynchronous ConnectNamedPipe: 0
+ * connected, -11 not yet (the instance is now listening), -106, -32 or -22
+ * as npfs_listen. */
+int npfs_listen_poll(struct object *srv);
+
 /* Wait until an instance of `name` is free to connect to: 0, -2 no such
  * pipe, -110 timed out (deadline in ticks, 0 forever), -4 interrupted. */
 int npfs_wait(const char *name, uint64 deadline);
