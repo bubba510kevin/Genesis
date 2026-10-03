@@ -1,3 +1,4 @@
+#include "kusd.h"
 #include "elfso.h"
 #include "fs.h"
 #include "nt.h"
@@ -134,6 +135,13 @@ static int nt_attach(process_t *p) {
     if (rc != 0) {
         return attach_err("cannot build the TEB and PEB", rc);
     }
+    /* A Linux process loading DLLs gets the shared page too: the DLLs read
+     * it exactly as they would in a Windows process. Already mapped (a
+     * second attach) is not an error. */
+    if (vmm_get_phys_in(p->space, KUSD_USER_VA) == 0) {
+        (void)kusd_map(p->space);
+    }
+    kusd_fill_peb(p->space);
 
     /* What GetStdHandle reads: the descriptors this process already has, as
      * the PE exec path hands them over (see sys_execve). */

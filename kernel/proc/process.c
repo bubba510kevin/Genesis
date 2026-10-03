@@ -9,6 +9,7 @@
 #include "sched.h"
 #include "screen.h"
 #include "signal.h"
+#include "timer.h"
 #include "syscall.h"
 #include "waitq.h"
 #include "process.h"
@@ -123,6 +124,8 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current = &table[0];
     current->pid         = next_pid++;
     current->ppid        = 0;
+    current->image_name[0] = '\0';
+    current->start_tick  = 0;
     current->state       = PROC_RUNNING;
     current->space       = vmm_kernel_space();
     current->brk_base    = 0;
@@ -510,6 +513,8 @@ process_t *proc_alloc(int ppid) {
             }
             p->pid         = next_pid++;
             p->ppid        = ppid;
+            p->image_name[0] = '\0';
+            p->start_tick  = timer_ticks_now();
             p->state       = PROC_READY;
             p->space       = NULL;
             p->brk_base    = 0;

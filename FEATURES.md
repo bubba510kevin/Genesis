@@ -406,6 +406,13 @@ and one spinning in ring 3 on another CPU.
 wherever it is: running on another CPU, blocked in a wait, or suspended.
 Mutexes it held are abandoned.
 
+**KUSER_SHARED_DATA and the version ✅** (2026-10-03, ROADMAP 16(s)): the
+shared page at `0x7FFE0000` (time, tick count, NT 10.0.19045, processor
+features), the PEB's version fields, `GetVersion(Ex)`, `RtlGetVersion`,
+`IsProcessorFeaturePresent`; `GetTickCount` reads the page.
+`NtQuerySystemInformation` gained the time of day and the process list
+(`SystemProcessInformation`).
+
 **Keyed events and I/O completion ports ✅** (2026-10-03, ROADMAP 16(k)):
 `NtCreateKeyedEvent`/`NtWaitForKeyedEvent`/`NtReleaseKeyedEvent` (a
 rendezvous per key, the NULL handle being the global one) and completion

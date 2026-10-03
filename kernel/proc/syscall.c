@@ -1,3 +1,4 @@
+#include "kusd.h"
 #include "syscall.h"
 #include "io.h"
 #include "cpu.h"
@@ -2278,6 +2279,13 @@ static uint64 sys_vfork(struct syscall_frame *frame) {
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    {
+        int k;
+
+        for (k = 0; k < (int)sizeof(child->image_name); k++) {
+            child->image_name[k] = parent->image_name[k];
+        }
+    }
     child->trace        = parent->trace;
     rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
@@ -2387,6 +2395,13 @@ static uint64 sys_fork(struct syscall_frame *frame) {
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    {
+        int k;
+
+        for (k = 0; k < (int)sizeof(child->image_name); k++) {
+            child->image_name[k] = parent->image_name[k];
+        }
+    }
     child->trace        = parent->trace;
     rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
@@ -2501,6 +2516,13 @@ static process_t *spawn_thread(process_t *parent,
     child->gid          = parent->gid;
     child->sid          = parent->sid;
     child->umask        = parent->umask;
+    {
+        int k;
+
+        for (k = 0; k < (int)sizeof(child->image_name); k++) {
+            child->image_name[k] = parent->image_name[k];
+        }
+    }
     child->trace        = parent->trace;
     rlimit_copy(child, parent);
     child->ngroups      = parent->ngroups;
@@ -3369,6 +3391,11 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
         rc = nt_process_init(new_space, pe.image_base,
                              USER_STACK_TOP, USER_STACK_SIZE,
                              p->pid, p->thread.tid);
+        if (rc == 0) {
+            /* The shared page and the PEB's version fields (kusd.h). */
+            rc = kusd_map(new_space);
+            kusd_fill_peb(new_space);
+        }
         if (rc != 0) {
             vmm_space_destroy(new_space);
             kfree(image);
@@ -3579,6 +3606,22 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
     kill_thread_group(p, 0);
 
     old_space = p->space;
+    {
+        /* The name a process list shows: the path's last component. */
+        const char *base = resolved;
+        int k;
+
+        for (k = 0; resolved[k] != '\0'; k++) {
+            if (resolved[k] == '/') {
+                base = &resolved[k + 1];
+            }
+        }
+        for (k = 0; base[k] != '\0' && k < (int)sizeof(p->image_name) - 1;
+             k++) {
+            p->image_name[k] = base[k];
+        }
+        p->image_name[k] = '\0';
+    }
     vmm_switch_to(new_space);
     p->space = new_space;
 

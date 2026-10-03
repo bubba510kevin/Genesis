@@ -1,3 +1,4 @@
+#include "kusd.h"
 #include "ahci.h"
 #include "ata.h"
 #include "bcache.h"
@@ -1003,6 +1004,11 @@ void flk(void) {
      * the selftests below depend on. */
     smp_start_scheduling();
     print_string("Interrupts enabled\n", 0x0F);
+
+    /* KUSER_SHARED_DATA (kusd.h): after SMP bring-up, which settles the CPU
+     * count and calibrates the TSC whose rate the page publishes, and long
+     * before the first Windows process can be started. */
+    kusd_init();
 
     /* After sti, and it has to be: the callout selftest waits on real timer
      * ticks rather than driving the wheel by hand, which is what makes it a

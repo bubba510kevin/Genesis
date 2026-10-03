@@ -322,10 +322,10 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
 | `systest` | 561 passed | 558 passed |
 | `thr` (`thr.exe`) | 47 passed | 47 passed |
-| `smp` (`smp.exe`) | 61 passed | 57 passed |
+| `smp` (`smp.exe`) | 70 passed | |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
 | `wait` (`wait.exe`) | 60 passed | 60 passed |
-| `sync` (`sync.exe`) | 44 passed | |
+| `sync` (`sync.exe`) | 51 passed | |
 | `ntsync` (`ntsync.exe`) | 34 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |

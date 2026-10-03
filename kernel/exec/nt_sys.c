@@ -67,6 +67,7 @@ static uint64 ticks_to_100ns(uint64 t) {
 #define SystemBasicInformation                    0
 #define SystemProcessorInformation                1
 #define SystemTimeOfDayInformation                3
+#define SystemProcessInformation                  5
 #define SystemProcessorPerformanceInformation     8
 #define SystemLogicalProcessorInformation         73
 #define SystemLogicalProcessorAndGroupInformation 107
@@ -352,6 +353,222 @@ static uint64 query_lpi_ex(uint32 wanted, uint64 buf, uint64 len, uint64 retlen)
     return STATUS_SUCCESS;
 }
 
+/* --- time of day and the process list (ROADMAP 16(s)) ---------------------- */
+
+#define SYS_EPOCH_DELTA_100NS 116444736000000000ULL   /* 1601 -> 1970 */
+
+static uint64 sys_now_100ns(void) {
+    return timer_realtime_ns() / 100 + SYS_EPOCH_DELTA_100NS;
+}
+
+/* The boot time, in 1601-based 100ns units: now minus the uptime. */
+static uint64 sys_boot_100ns(void) {
+    return sys_now_100ns() - ticks_to_100ns(timer_ticks_now());
+}
+
+/* SYSTEM_TIMEOFDAY_INFORMATION: BootTime, CurrentTime, TimeZoneBias,
+ * TimeZoneId, Reserved, BootTimeBias, SleepTimeBias - 48 bytes. The clock
+ * is UTC, so the bias is zero. A shorter buffer gets the prefix that fits,
+ * which is what NT does for this class. */
+static uint64 query_time_of_day(uint64 buf, uint64 len, uint64 retlen) {
+    uint64 t[6];
+    uint32 n = (uint32)len, i;
+
+    if (n > sizeof(t)) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (n != 0 && !range_ok(buf, n)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    t[0] = sys_boot_100ns();
+    t[1] = sys_now_100ns();
+    t[2] = 0;
+    t[3] = 0;                /* TimeZoneId (TIME_ZONE_ID_UNKNOWN), Reserved */
+    t[4] = 0;
+    t[5] = 0;
+    for (i = 0; i < n; i++) {
+        ((uint8 *)buf)[i] = ((const uint8 *)t)[i];
+    }
+    put_retlen(retlen, n);
+    return STATUS_SUCCESS;
+}
+
+/* SYSTEM_PROCESS_INFORMATION, one per process, each followed by one
+ * SYSTEM_THREAD_INFORMATION per thread and then the image name, which the
+ * entry's UNICODE_STRING points at - inside the CALLER's buffer, so the
+ * pointer is a user address computed from `buf`. NextEntryOffset chains
+ * them; the last is 0.
+ *
+ * The first entry is the Idle process (pid 0, no name), its threads the
+ * per-CPU idle threads, as on NT. Then every thread group on the machine,
+ * Linux and Windows alike - one process table serves both personalities.
+ * Kernel threads are not listed (there is no System process yet), and
+ * neither are zombies. Times: all CPU time is reported as user time (the
+ * kernel does not split it), creation times are real. Sizes the memory
+ * manager cannot answer yet (working set, pagefile) are zero. */
+#define SPI_SIZE   0x100
+#define STI_SIZE   0x50
+
+static int spi_is_leader(const process_t *p) {
+    return p != NULL && !p->is_kthread && !p->is_idle &&
+           p->pid == p->tgid && p->state != PROC_ZOMBIE;
+}
+
+static int spi_in_group(const process_t *t, int tgid) {
+    return t != NULL && !t->is_kthread && !t->is_idle &&
+           t->tgid == tgid && t->state != PROC_ZOMBIE;
+}
+
+static uint32 spi_name_bytes(const char *name) {
+    uint32 n = 0;
+
+    while (name[n] != '\0') {
+        n++;
+    }
+    return n == 0 ? 0 : (n + 1) * 2;          /* UTF-16 with terminator */
+}
+
+static uint32 spi_entry_size(uint32 threads, const char *name) {
+    return (SPI_SIZE + threads * STI_SIZE + spi_name_bytes(name) + 7) & ~7u;
+}
+
+static uint32 sti_state(const process_t *t) {
+    switch (t->state) {
+    case PROC_RUNNING: return 2;              /* Running */
+    case PROC_READY:   return 1;              /* Ready   */
+    default:           return 5;              /* Waiting */
+    }
+}
+
+static void sti_write(uint8 *e, const process_t *t, uint64 boot) {
+    *(uint64 *)(e + 0x00) = 0;                                  /* KernelTime */
+    *(uint64 *)(e + 0x08) = ticks_to_100ns(t->cpu_ticks);       /* UserTime   */
+    *(uint64 *)(e + 0x10) = boot + ticks_to_100ns(t->start_tick);
+    *(uint32 *)(e + 0x18) = 0;                                  /* WaitTime   */
+    *(uint64 *)(e + 0x20) = 0;                                  /* StartAddress */
+    *(uint64 *)(e + 0x28) = (uint64)(t->is_idle ? 0 : t->tgid);
+    *(uint64 *)(e + 0x30) = (uint64)t->pid;
+    *(int32  *)(e + 0x38) = 8;                                  /* Priority */
+    *(int32  *)(e + 0x3C) = 8;                                  /* BasePriority */
+    *(uint32 *)(e + 0x40) = 0;                                  /* ContextSwitches */
+    *(uint32 *)(e + 0x44) = sti_state(t);
+    *(uint32 *)(e + 0x48) = 0;                                  /* WaitReason */
+}
+
+static uint64 query_process_list(uint64 buf, uint64 len, uint64 retlen) {
+    uint64 need = 0, boot = sys_boot_100ns();
+    uint8 *out = (uint8 *)buf, *prev = NULL;
+    int n = proc_slots_used(), i, j;
+    uint32 idle_threads = 0;
+
+    /* Pass one: the size. */
+    for (i = 0; i < n; i++) {
+        process_t *t = proc_at(i);
+
+        if (t != NULL && t->is_idle) {
+            idle_threads++;
+        }
+    }
+    need += spi_entry_size(idle_threads, "");
+    for (i = 0; i < n; i++) {
+        process_t *p = proc_at(i);
+        uint32 threads = 0;
+
+        if (!spi_is_leader(p)) {
+            continue;
+        }
+        for (j = 0; j < n; j++) {
+            threads += spi_in_group(proc_at(j), p->pid) ? 1 : 0;
+        }
+        need += spi_entry_size(threads, p->image_name);
+    }
+    put_retlen(retlen, (uint32)need);
+    if (len < need) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!range_ok(buf, need)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    /* Pass two: the entries. Index -1 is the Idle process. Nothing between
+     * the passes can block, so the table cannot change under us. */
+    for (i = -1; i < n; i++) {
+        process_t *p = i < 0 ? NULL : proc_at(i);
+        const char *name = p != NULL ? p->image_name : "";
+        uint32 threads = 0, size, nb, k;
+        uint8 *th;
+
+        if (i >= 0 && !spi_is_leader(p)) {
+            continue;
+        }
+        for (j = 0; j < n; j++) {
+            process_t *t = proc_at(j);
+
+            threads += (p == NULL) ? (t != NULL && t->is_idle)
+                                   : spi_in_group(t, p->pid);
+        }
+        size = spi_entry_size(threads, name);
+        for (k = 0; k < size; k++) {
+            out[k] = 0;
+        }
+        if (prev != NULL) {
+            *(uint32 *)prev = (uint32)(out - prev);   /* NextEntryOffset */
+        }
+        *(uint32 *)(out + 0x04) = threads;
+        *(uint32 *)(out + 0x14) = threads;            /* high watermark */
+        nb = spi_name_bytes(name);
+        if (nb != 0) {
+            uint16 *w = (uint16 *)(out + SPI_SIZE + threads * STI_SIZE);
+
+            for (k = 0; name[k] != '\0'; k++) {
+                w[k] = (uint8)name[k];
+            }
+            w[k] = 0;
+            *(uint16 *)(out + 0x38) = (uint16)(nb - 2);   /* Length        */
+            *(uint16 *)(out + 0x3A) = (uint16)nb;         /* MaximumLength */
+            *(uint64 *)(out + 0x40) = (uint64)w;          /* Buffer        */
+        }
+        *(int32  *)(out + 0x48) = 8;                      /* BasePriority  */
+        if (p != NULL) {
+            uint64 cpu = 0;
+            uint32 handles = 0;
+
+            for (j = 0; j < n; j++) {
+                process_t *t = proc_at(j);
+
+                if (spi_in_group(t, p->pid)) {
+                    cpu += t->cpu_ticks;
+                }
+            }
+            if (p->handles != NULL) {
+                for (j = 0; j < MAX_HANDLES; j++) {
+                    handles += p->handles[j].file != NULL;
+                }
+            }
+            *(uint64 *)(out + 0x20) = boot + ticks_to_100ns(p->start_tick);
+            *(uint64 *)(out + 0x28) = ticks_to_100ns(cpu);    /* UserTime */
+            *(uint64 *)(out + 0x50) = (uint64)p->pid;         /* UniqueProcessId */
+            *(uint64 *)(out + 0x58) = (uint64)p->ppid;        /* InheritedFrom */
+            *(uint32 *)(out + 0x60) = handles;
+            *(uint32 *)(out + 0x64) = 1;                      /* SessionId */
+            *(uint64 *)(out + 0x68) = (uint64)p->pid;         /* UniqueProcessKey */
+        }
+        th = out + SPI_SIZE;
+        for (j = 0; j < n; j++) {
+            process_t *t = proc_at(j);
+
+            if ((p == NULL) ? (t != NULL && t->is_idle)
+                            : spi_in_group(t, p->pid)) {
+                sti_write(th, t, boot);
+                th += STI_SIZE;
+            }
+        }
+        prev = out;
+        out += size;
+    }
+    return STATUS_SUCCESS;
+}
+
 static uint64 nt_query_system_information(uint64 cls, uint64 buf, uint64 len,
                                           uint64 retlen) {
     switch ((uint32)cls) {
@@ -359,6 +576,10 @@ static uint64 nt_query_system_information(uint64 cls, uint64 buf, uint64 len,
         return query_system_basic(buf, (uint32)len, retlen);
     case SystemProcessorInformation:
         return query_processor_info(buf, (uint32)len, retlen);
+    case SystemTimeOfDayInformation:
+        return query_time_of_day(buf, len, retlen);
+    case SystemProcessInformation:
+        return query_process_list(buf, len, retlen);
     case SystemProcessorPerformanceInformation:
         return query_processor_performance(buf, (uint32)len, retlen);
     case SystemLogicalProcessorInformation:

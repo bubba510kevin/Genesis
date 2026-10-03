@@ -1,3 +1,4 @@
+#include "kusd.h"
 #include "backtrace.h"
 #include "idt.h"
 #include "interrupt.h"
@@ -254,6 +255,7 @@ static void interrupt_dispatch_locked(struct interrupt_frame *frame) {
             /* ticks itself already advanced, before the lock - see
              * interrupt_dispatch. This is the rest of the tick. */
             timer_tick();
+            kusd_tick();        /* the clock fields user mode reads */
             /* Only flags a pending switch. Switching here would unwind an
              * interrupt frame from underneath the handler that is still
              * running on it; the actual switch happens on the way out to

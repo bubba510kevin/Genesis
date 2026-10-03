@@ -305,6 +305,13 @@ typedef struct process {
     void           *karg;
     const char     *kname;
 
+    /* The last component of the image this process last exec'd ("bash",
+     * "thr.exe"), inherited across fork and clone - what a process list
+     * shows (NtQuerySystemInformation's SystemProcessInformation, 16(s)) -
+     * and the tick the slot was taken, its creation time. */
+    char            image_name[32];
+    uint64          start_tick;
+
     /* --- suspension ------------------------------------------------------
      * A process is only ever suspended inside a syscall, so its whole
      * resumable state is the frame it entered with plus the user stack
