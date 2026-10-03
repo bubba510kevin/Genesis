@@ -159,7 +159,11 @@ typedef enum {
     OBJ_EPOLL,
 
     /* An NT timer (NtCreateTimer): a dispatcher object the tick sets. */
-    OBJ_TIMER
+    OBJ_TIMER,
+
+    /* Linux's signalfd and pidfd (kernel/proc/sigfd.c). */
+    OBJ_SIGNALFD,
+    OBJ_PIDFD
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

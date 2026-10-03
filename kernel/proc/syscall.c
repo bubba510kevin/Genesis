@@ -22,6 +22,8 @@
 #include "eventfd.h"
 #include "epoll.h"
 #include "timerfd.h"
+#include "sigfd.h"
+#include "pmm.h"
 #include "socketfd.h"
 #include "socketpair.h"
 #include "process.h"
@@ -3405,6 +3407,17 @@ static uint64 sys_waitid(uint64 idtype, uint64 id, uint64 info_ptr,
     if (p == NULL) {
         return (uint64)-22;
     }
+    /* P_PIDFD (Linux 5.4): the process a pidfd names, as P_PID. */
+    if (idtype == 3) {
+        open_file_t *pf = handle_get(p->handles, (int)id);
+        int pid = (pf != NULL) ? pidfd_pid(pf->obj) : -1;
+
+        if (pid < 0) {
+            return (uint64)-9;               /* -EBADF */
+        }
+        idtype = P_PID;
+        id = (uint64)pid;
+    }
     if (idtype != P_ALL && idtype != P_PID && idtype != P_PGID) {
         return (uint64)-22;
     }
@@ -5452,7 +5465,7 @@ static uint64 sys_uname(char *buf) {
  * reporting stdout as a character device is what makes libc pick unbuffered
  * output, so a write() actually reaches the screen instead of sitting in a
  * buffer until an exit that never flushes. */
-static uint64 sys_newfstatat(uint64 fd, uint64 statbuf) {
+static uint64 stat_chardev(uint64 fd, uint64 statbuf) {
     uint8 *st = (uint8 *)statbuf;
 
     fill(st, 0, 144);
@@ -5482,7 +5495,7 @@ static uint64 sys_fstat(uint64 fd, uint64 statbuf) {
      * libc treat it as unbuffered. Anything else reports from its entry. */
     if (f->obj == NULL || f->obj->type == NULL ||
         f->obj->type->klass == OBJ_CONSOLE) {
-        return sys_newfstatat(fd, statbuf);
+        return stat_chardev(fd, statbuf);
     }
 
     /* S_IFIFO, before anything reaches for a FAT body a pipe does not have.
@@ -5629,6 +5642,373 @@ static uint64 sys_stat_path(uint64 path_ptr, uint64 statbuf) {
     *(uint64 *)(st + 56) = node.vol->block_size;
     *(uint64 *)(st + 64) = (node.size + 511) / 512;  /* st_blocks, 512B units */
     return 0;
+}
+
+/* --- fstatat and statx (ROADMAP 16(a)) -----------------------------------
+ *
+ * newfstatat used to ignore its path and describe every name as a character
+ * device - harmless while musl's stat() went through SYS_stat, wrong for
+ * everything that calls fstatat, and statx is the same question in a newer
+ * shape. Both now resolve: an empty path with AT_EMPTY_PATH is fstat of the
+ * descriptor; an absolute path ignores the descriptor, as on Linux; a
+ * relative one resolves against the working directory when the descriptor
+ * is AT_FDCWD (and is -EINVAL otherwise, like every other *at call here -
+ * an open file stores an entry, not the path a relative lookup needs).
+ * AT_SYMLINK_NOFOLLOW is accepted: lstat and stat already agree here. */
+#define AT_SYMLINK_NOFOLLOW_  0x100
+#define AT_NO_AUTOMOUNT_      0x800
+#define AT_EMPTY_PATH_        0x1000
+#define AT_STATX_SYNC_MASK_   0x6000
+
+static uint64 stat_at(uint64 dirfd, uint64 path_ptr, uint64 statbuf,
+                      uint64 flags) {
+    const char *path = (const char *)path_ptr;
+
+    if (!user_ptr_ok(path_ptr) || !user_range_ok(statbuf, 144)) {
+        return (uint64)-14;
+    }
+    if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH_)) {
+            return (uint64)-2;               /* -ENOENT */
+        }
+        if ((int64)dirfd == AT_FDCWD) {
+            return (uint64)-22;
+        }
+        return sys_fstat(dirfd, statbuf);
+    }
+    if (path[0] != '/' && (int64)dirfd != AT_FDCWD) {
+        return (uint64)-22;
+    }
+    return sys_stat_path(path_ptr, statbuf);
+}
+
+static uint64 sys_fstatat(uint64 dirfd, uint64 path_ptr, uint64 statbuf,
+                          uint64 flags) {
+    if (flags & ~(uint64)(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ |
+                          AT_EMPTY_PATH_)) {
+        return (uint64)-22;
+    }
+    return stat_at(dirfd, path_ptr, statbuf, flags);
+}
+
+/* statx: a stat into the caller's 256-byte buffer, then rewritten in place
+ * as a struct statx. Everything this kernel's stat knows is in
+ * STATX_BASIC_STATS (0x7ff); birth time and the newer fields are not
+ * reported, and stx_mask says so. */
+static uint64 sys_statx(uint64 dirfd, uint64 path_ptr, uint64 flags,
+                        uint64 mask, uint64 buf) {
+    uint8 *b = (uint8 *)buf;
+    uint64 rc, dev, ino, nlink, size, blocks, rdev;
+    uint32 mode, uid, gid, blksize;
+    int64 at, an, mt, mn, ct, cn;
+    int i;
+
+    if ((uint32)mask & 0x80000000u) {
+        return (uint64)-22;                  /* STATX__RESERVED */
+    }
+    if (flags & ~(uint64)(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ |
+                          AT_EMPTY_PATH_ | AT_STATX_SYNC_MASK_)) {
+        return (uint64)-22;
+    }
+    if ((flags & AT_STATX_SYNC_MASK_) == AT_STATX_SYNC_MASK_) {
+        return (uint64)-22;                  /* both FORCE and DONT_SYNC */
+    }
+    if (!user_range_ok(buf, 256)) {
+        return (uint64)-14;
+    }
+    rc = stat_at(dirfd, path_ptr, buf, flags);
+    if (rc != 0) {
+        return rc;
+    }
+    dev = *(uint64 *)(b + 0);
+    ino = *(uint64 *)(b + 8);
+    nlink = *(uint64 *)(b + 16);
+    mode = *(uint32 *)(b + 24);
+    uid = *(uint32 *)(b + 28);
+    gid = *(uint32 *)(b + 32);
+    rdev = *(uint64 *)(b + 40);
+    size = *(uint64 *)(b + 48);
+    blksize = (uint32)*(uint64 *)(b + 56);
+    blocks = *(uint64 *)(b + 64);
+    at = *(int64 *)(b + 72);  an = *(int64 *)(b + 80);
+    mt = *(int64 *)(b + 88);  mn = *(int64 *)(b + 96);
+    ct = *(int64 *)(b + 104); cn = *(int64 *)(b + 112);
+
+    for (i = 0; i < 256; i++) {
+        b[i] = 0;
+    }
+    *(uint32 *)(b + 0) = 0x7ffu;             /* stx_mask: BASIC_STATS   */
+    *(uint32 *)(b + 4) = blksize;
+    *(uint32 *)(b + 16) = (uint32)nlink;
+    *(uint32 *)(b + 20) = uid;
+    *(uint32 *)(b + 24) = gid;
+    *(uint16 *)(b + 28) = (uint16)mode;
+    *(uint64 *)(b + 32) = ino;
+    *(uint64 *)(b + 40) = size;
+    *(uint64 *)(b + 48) = blocks;
+    *(int64 *)(b + 64) = at;   *(uint32 *)(b + 72) = (uint32)an;
+    *(int64 *)(b + 96) = ct;   *(uint32 *)(b + 104) = (uint32)cn;
+    *(int64 *)(b + 112) = mt;  *(uint32 *)(b + 120) = (uint32)mn;
+    *(uint32 *)(b + 128) = (uint32)(rdev >> 8) & 0xFFFu;   /* major */
+    *(uint32 *)(b + 132) = (uint32)(rdev & 0xFFu);          /* minor */
+    *(uint32 *)(b + 136) = (uint32)(dev >> 8) & 0xFFFu;
+    *(uint32 *)(b + 140) = (uint32)(dev & 0xFFu);
+    return 0;
+}
+
+/* close_range(2): close (or, with CLOSE_RANGE_CLOEXEC, mark close-on-exec)
+ * every descriptor in [first, last]. CLOSE_RANGE_UNSHARE is refused: a
+ * descriptor table here is shared by the threads of a process only as
+ * clone(CLONE_FILES) left it, and unsharing it is not implemented. */
+#define CLOSE_RANGE_UNSHARE_  (1u << 1)
+#define CLOSE_RANGE_CLOEXEC_  (1u << 2)
+
+static uint64 sys_close_range(uint64 first, uint64 last, uint64 flags) {
+    process_t *p = proc_current();
+    uint32 lo = (uint32)first, hi = (uint32)last, fd;
+
+    if (flags & ~(uint64)CLOSE_RANGE_CLOEXEC_) {
+        return (uint64)-22;
+    }
+    if (lo > hi) {
+        return (uint64)-22;
+    }
+    if (hi >= MAX_HANDLES) {
+        hi = MAX_HANDLES - 1;
+    }
+    for (fd = lo; fd <= hi && fd < MAX_HANDLES; fd++) {
+        if (handle_get(p->handles, (int)fd) == NULL) {
+            continue;
+        }
+        if (flags & CLOSE_RANGE_CLOEXEC_) {
+            (void)handle_set_flags(p->handles, (int)fd, HANDLE_CLOEXEC);
+        } else {
+            (void)handle_close(p->handles, (int)fd);
+        }
+    }
+    return 0;
+}
+
+/* sysinfo(2). Loads are 0 (there is no load average yet), swap is 0
+ * (there is no swap), sizes are in bytes (mem_unit 1). */
+static uint64 sys_sysinfo(uint64 buf) {
+    uint8 *b = (uint8 *)buf;
+    int i, procs = 0;
+
+    if (!user_range_ok(buf, 112)) {
+        return (uint64)-14;
+    }
+    for (i = 0; i < 112; i++) {
+        b[i] = 0;
+    }
+    for (i = 0; i < proc_slots_used(); i++) {
+        process_t *t = proc_at(i);
+
+        if (t != NULL && t->state != PROC_UNUSED) {
+            procs++;
+        }
+    }
+    *(int64 *)(b + 0) = (int64)(timer_ticks_now() / timer_hz());
+    *(uint64 *)(b + 32) = pmm_total_frames() * PMM_PAGE_SIZE;
+    *(uint64 *)(b + 40) = pmm_free_frames() * PMM_PAGE_SIZE;
+    *(uint16 *)(b + 80) = (uint16)procs;
+    *(uint32 *)(b + 104) = 1;
+    return 0;
+}
+
+/* sendfile and copy_file_range: a kernel-buffered copy from one descriptor
+ * to another, through the same read and write every descriptor has. With
+ * an offset pointer the input is read there and the pointer advanced, and
+ * the descriptor's own position left alone (as pread); without, the
+ * position moves. A short write moves the input back by what was not
+ * written, so nothing is lost or repeated. */
+#define XFER_CHUNK 4096
+
+static int64 xfer(int in_fd, uint64 off_in_ptr, int out_fd,
+                  uint64 off_out_ptr, uint64 count) {
+    process_t *p = proc_current();
+    open_file_t *fi = handle_get(p->handles, in_fd);
+    open_file_t *fo = handle_get(p->handles, out_fd);
+    uint8 *kbuf;
+    int64 total = 0;
+
+    if (fi == NULL || fo == NULL) {
+        return -9;
+    }
+    if ((off_in_ptr != 0 && !user_range_ok(off_in_ptr, 8)) ||
+        (off_out_ptr != 0 && !user_range_ok(off_out_ptr, 8))) {
+        return -14;
+    }
+    kbuf = (uint8 *)kmalloc(XFER_CHUNK);
+    if (kbuf == NULL) {
+        return -12;
+    }
+    while ((uint64)total < count) {
+        uint64 want = count - (uint64)total;
+        uint64 saved_in = fi->offset, saved_out = fo->offset;
+        int64 got, put;
+
+        if (want > XFER_CHUNK) {
+            want = XFER_CHUNK;
+        }
+        if (off_in_ptr != 0) {
+            fi->offset = *(uint64 *)off_in_ptr;
+        }
+        got = do_read(in_fd, kbuf, want);
+        if (off_in_ptr != 0) {
+            fi->offset = saved_in;
+        }
+        if (got <= 0) {
+            if (total == 0 && got < 0) {
+                total = got;
+            }
+            break;
+        }
+        if (off_out_ptr != 0) {
+            fo->offset = *(uint64 *)off_out_ptr;
+        }
+        put = do_write(out_fd, kbuf, (uint64)got);
+        if (off_out_ptr != 0) {
+            fo->offset = saved_out;
+        }
+        if (put < 0) {
+            /* Nothing of this chunk went out: undo its read. */
+            if (off_in_ptr == 0) {
+                fi->offset -= (uint64)got;
+            }
+            if (total == 0) {
+                total = put;
+            }
+            break;
+        }
+        if (off_in_ptr != 0) {
+            *(uint64 *)off_in_ptr += (uint64)put;
+        } else if (put < got) {
+            fi->offset -= (uint64)(got - put);
+        }
+        if (off_out_ptr != 0) {
+            *(uint64 *)off_out_ptr += (uint64)put;
+        }
+        total += put;
+        if (put < got || got < (int64)want) {
+            break;
+        }
+    }
+    kfree(kbuf);
+    return total;
+}
+
+static uint64 sys_sendfile(uint64 out_fd, uint64 in_fd, uint64 off_ptr,
+                           uint64 count) {
+    return (uint64)xfer((int)in_fd, off_ptr, (int)out_fd, 0, count);
+}
+
+/* copy_file_range: regular files on both sides (Linux 5.19's rule), no
+ * flags. */
+static uint64 sys_copy_file_range(uint64 fd_in, uint64 off_in, uint64 fd_out,
+                                  uint64 off_out, uint64 len, uint64 flags) {
+    process_t *p = proc_current();
+    open_file_t *fi = handle_get(p->handles, (int)fd_in);
+    open_file_t *fo = handle_get(p->handles, (int)fd_out);
+
+    if (flags != 0) {
+        return (uint64)-22;
+    }
+    if (fi == NULL || fo == NULL) {
+        return (uint64)-9;
+    }
+    if (!(fi->access & ACCESS_READ) || !(fo->access & ACCESS_WRITE)) {
+        return (uint64)-9;
+    }
+    if (fi->obj == NULL || fo->obj == NULL ||
+        fi->obj->type->klass != OBJ_FILE || fo->obj->type->klass != OBJ_FILE) {
+        return (uint64)-22;
+    }
+    return (uint64)xfer((int)fd_in, off_in, (int)fd_out, off_out, len);
+}
+
+/* signalfd4(2). fd -1 makes one; an existing signalfd gets the new mask. */
+#define SFD_NONBLOCK_  0x00000800UL
+#define SFD_CLOEXEC_   0x00080000UL
+
+static uint64 sys_signalfd4(uint64 fd, uint64 mask_ptr, uint64 sizemask,
+                            uint64 flags) {
+    object_t *obj = NULL;
+    uint64 mask;
+    int rc;
+
+    if (sizemask != 8 || (flags & ~(SFD_NONBLOCK_ | SFD_CLOEXEC_)) != 0) {
+        return (uint64)-22;
+    }
+    if (!user_range_ok(mask_ptr, 8)) {
+        return (uint64)-14;
+    }
+    mask = *(const uint64 *)mask_ptr;
+    if ((int)fd != -1) {
+        open_file_t *f = handle_get(proc_current()->handles, (int)fd);
+
+        if (f == NULL) {
+            return (uint64)-9;
+        }
+        rc = signalfd_set_mask(f->obj, mask);
+        return (rc != 0) ? (uint64)(int64)rc : fd;
+    }
+    rc = signalfd_create(&obj, mask);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    return object_fd(obj, ACCESS_READ, (flags & SFD_NONBLOCK_) != 0,
+                     (flags & SFD_CLOEXEC_) != 0);
+}
+
+/* pidfd_open(2): a descriptor for a process (a thread-group leader). */
+static uint64 sys_pidfd_open(uint64 pid, uint64 flags) {
+    process_t *t;
+    object_t *obj = NULL;
+    int rc;
+
+    if ((flags & ~(uint64)O_NONBLOCK) != 0) {
+        return (uint64)-22;
+    }
+    if ((int)pid <= 0) {
+        return (uint64)-22;
+    }
+    t = proc_find((int)pid);
+    if (t == NULL || t->state == PROC_UNUSED || t->is_kthread) {
+        return (uint64)-3;                   /* -ESRCH */
+    }
+    if (t->tgid != t->pid) {
+        return (uint64)-22;                  /* a thread, not a process */
+    }
+    rc = pidfd_create(&obj, t);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    return object_fd(obj, ACCESS_READ, (flags & O_NONBLOCK) != 0, 1);
+}
+
+/* pidfd_send_signal(2): kill(2) by pidfd. No siginfo, no flags. */
+static uint64 sys_pidfd_send_signal(uint64 pidfd, uint64 sig, uint64 info,
+                                    uint64 flags) {
+    open_file_t *f = handle_get(proc_current()->handles, (int)pidfd);
+    process_t *t;
+    int pid;
+
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    pid = pidfd_pid(f->obj);
+    if (pid < 0) {
+        return (uint64)-9;                   /* not a pidfd */
+    }
+    if (info != 0 || flags != 0) {
+        return (uint64)-22;
+    }
+    t = proc_find(pid);
+    if (t == NULL || t->state == PROC_UNUSED || t->group_finished) {
+        return (uint64)-3;
+    }
+    return sys_kill((uint64)pid, sig);
 }
 
 /* --- time ---------------------------------------------------------------
@@ -6657,6 +7037,15 @@ static const char *syscall_name(uint64 nr) {
         case SYS_arch_prctl:      return "arch_prctl";
         case SYS_uname:           return "uname";
         case SYS_newfstatat:      return "newfstatat";
+        case SYS_statx:           return "statx";
+        case SYS_close_range:     return "close_range";
+        case SYS_sysinfo:         return "sysinfo";
+        case SYS_sendfile:        return "sendfile";
+        case SYS_copy_file_range: return "copy_file_range";
+        case SYS_signalfd:        return "signalfd";
+        case SYS_signalfd4:       return "signalfd4";
+        case SYS_pidfd_open:      return "pidfd_open";
+        case SYS_pidfd_send_signal: return "pidfd_send_signal";
         case SYS_clock_gettime:   return "clock_gettime";
         case SYS_gettimeofday:    return "gettimeofday";
         case SYS_nanosleep:       return "nanosleep";
@@ -7046,7 +7435,31 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
             return sys_uname((char *)frame->rdi);
 
         case SYS_newfstatat:
-            return sys_newfstatat(frame->rdi, frame->rdx);
+            return sys_fstatat(frame->rdi, frame->rsi, frame->rdx,
+                               frame->r10);
+        case SYS_statx:
+            return sys_statx(frame->rdi, frame->rsi, frame->rdx, frame->r10,
+                             frame->r8);
+        case SYS_close_range:
+            return sys_close_range(frame->rdi, frame->rsi, frame->rdx);
+        case SYS_sysinfo:
+            return sys_sysinfo(frame->rdi);
+        case SYS_sendfile:
+            return sys_sendfile(frame->rdi, frame->rsi, frame->rdx,
+                                frame->r10);
+        case SYS_copy_file_range:
+            return sys_copy_file_range(frame->rdi, frame->rsi, frame->rdx,
+                                       frame->r10, frame->r8, frame->r9);
+        case SYS_signalfd:
+            return sys_signalfd4(frame->rdi, frame->rsi, frame->rdx, 0);
+        case SYS_signalfd4:
+            return sys_signalfd4(frame->rdi, frame->rsi, frame->rdx,
+                                 frame->r10);
+        case SYS_pidfd_open:
+            return sys_pidfd_open(frame->rdi, frame->rsi);
+        case SYS_pidfd_send_signal:
+            return sys_pidfd_send_signal(frame->rdi, frame->rsi, frame->rdx,
+                                         frame->r10);
 
         case SYS_clock_gettime:
             return sys_clock_gettime(frame->rdi, frame->rsi);

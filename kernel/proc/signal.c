@@ -6,6 +6,7 @@
 #include "signal.h"
 #include "syscall.h"
 #include "typesk.h"
+#include "waitq.h"
 
 /* What happens to a signal nobody handles.
  *
@@ -187,6 +188,13 @@ void signal_send(struct process *p, int signo) {
         return;
     }
     p->sig_pending |= bit;
+
+    /* A BLOCKED signal may be what a signalfd is waiting for, and the
+     * thread polling that signalfd need not be the target: tell every
+     * readiness waiter to look again (waitq.h). */
+    if (p->sig_blocked & bit) {
+        waitq_wake_all(waitq_readiness());
+    }
 
     /* Waking a blocked process is what makes a signal interrupt a read.
      * Delivery does not happen here - this may be an interrupt handler, and

@@ -236,6 +236,17 @@
 #define SYS_timerfd_settime 286
 #define SYS_timerfd_gettime 287
 
+/* --- ROADMAP 16(a): the modern file and process calls -------------------- */
+#define SYS_statx           332
+#define SYS_close_range     436
+#define SYS_sysinfo          99
+#define SYS_sendfile         40
+#define SYS_copy_file_range 326
+#define SYS_signalfd        282
+#define SYS_signalfd4       289
+#define SYS_pidfd_open      434
+#define SYS_pidfd_send_signal 424
+
 /* --- ROADMAP item 6: sockets as descriptors ------------------------------ */
 #define SYS_socket          41
 #define SYS_connect         42

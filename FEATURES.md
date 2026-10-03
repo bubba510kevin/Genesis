@@ -501,14 +501,14 @@ point. About **130** syscall numbers are dispatched, in these groups:
 
 | Group | Calls |
 |---|---|
-| Files & I/O | `open`, `openat` (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_CLOEXEC`), `read`, `write`, `readv`, `writev`, `pread64`, `pwrite64`, `lseek`, `close`, `dup`/`dup2`/`dup3`, `fcntl`, `ioctl`, `fsync`, `fdatasync`, `msync` |
-| Metadata | `stat`, `fstat`, `lstat`, `newfstatat`, `statfs`, `fstatfs`, `access`, `faccessat`, `faccessat2`, `getdents64`, `readlinkat` |
+| Files & I/O | `open`, `openat` (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_CLOEXEC`), `read`, `write`, `readv`, `writev`, `pread64`, `pwrite64`, `lseek`, `close`, `close_range`, `dup`/`dup2`/`dup3`, `sendfile`, `copy_file_range`, `fcntl`, `ioctl`, `fsync`, `fdatasync`, `msync` |
+| Metadata | `stat`, `fstat`, `lstat`, `newfstatat`, `statx`, `statfs`, `fstatfs`, `access`, `faccessat`, `faccessat2`, `getdents64`, `readlinkat` |
 | Namespace | `mkdir`, `mkdirat`, `rmdir`, `unlink`, `unlinkat` (incl. `AT_REMOVEDIR`), `rename`, `renameat`, `truncate`, `ftruncate`, `chdir`, `fchdir`, `getcwd` |
 | Permissions | `chmod`, `fchmod`, `chown`, `fchown`, `umask` |
-| Processes | `fork`, `vfork`, `clone`, `execve`, `execveat`, `exit`, `exit_group`, `wait4`, `waitid`, `getpid`, `getppid`, `gettid`, `kill`, `tgkill` |
+| Processes | `fork`, `vfork`, `clone`, `execve`, `execveat`, `exit`, `exit_group`, `wait4`, `waitid`, `getpid`, `getppid`, `gettid`, `kill`, `tgkill`, `pidfd_open`, `pidfd_send_signal` (and `waitid(P_PIDFD)`), `sysinfo` |
 | Identity | `getuid`/`geteuid`/`getgid`/`getegid`, `setuid`, `setgid`, `setresuid`/`getresuid`, `setresgid`/`getresgid`, `getgroups`/`setgroups`, `setpgid`/`getpgid`/`getpgrp`, `setsid`/`getsid` |
 | Memory | `brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise` |
-| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`, `rt_sigpending`, `sigaltstack`, `pause` |
+| Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`, `rt_sigpending`, `sigaltstack`, `pause`, `signalfd`, `signalfd4` |
 | Time | `clock_gettime`, `clock_getres`, `clock_nanosleep`, `nanosleep`, `gettimeofday`, `times` |
 | Waiting | `poll`, `ppoll` (with a signal mask), `select`, `pselect6`, `epoll_create`/`epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`/`epoll_pwait2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
 | Limits & usage | `getrlimit`, `setrlimit`, `prlimit64` (per process, inherited; `RLIMIT_NOFILE` enforced, `RLIMIT_STACK` is the real stack), `getrusage`, `times` (with reaped children's time) |

@@ -185,6 +185,9 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **statx, close_range, sysinfo, sendfile, copy_file_range, signalfd,
+  pidfd — DONE 2026-10-03** (16(a)): and `newfstatat` now resolves its
+  path (it described every name as a character device). systest 704.
 - **NT waitable timers — DONE 2026-10-03** (16(k), `timer_create` in
   `kernel/obj/dispatch.c`, NT calls `0x90`-`0x94`), on the kernel timers;
   ntsync.exe 67 (was 34), in the Genesis-userland patch with kernel32's
@@ -339,7 +342,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
-| `systest` | 634 passed | 558 passed |
+| `systest` | 704 passed | 558 passed |
 | `thr` (`thr.exe`) | 47 passed | 47 passed |
 | `smp` (`smp.exe`) | 70 passed | |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
