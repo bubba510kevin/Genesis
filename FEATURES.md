@@ -226,7 +226,11 @@ on). Clock resolution is **one tick** and is reported honestly.
   `TIOC[GS]PGRP`, `TIOCSCTTY`/`TIOCNOTTY`/`TIOCGSID`, `TIOC[GS]WINSZ` (a new
   size sends SIGWINCH). A background process group reading the terminal gets
   **SIGTTIN**. PS/2 arrow and navigation keys send the VT100 sequences
-  (`ESC [ A`...). The console draws into the **framebuffer** when there is one
+  (`ESC [ A`...). The screen side is a **terminal**, a Linux-console
+  subset (new 2026-09-29): `\r \b \t`, cursor movement, erase line/screen,
+  insert/delete characters, save/restore, SGR colours - what readline's
+  line editing sends (checked at boot: `console: terminal selftest passed`).
+  The console draws into the **framebuffer** when there is one
   (8x16 BIOS font, 16 VGA colours, 128x48 at 1024x768, repainting only the
   cells that changed) and into **VGA text** otherwise. `TIOCGWINSZ` reports
   the real grid. A program that draws to the screen takes it with Linux's
@@ -715,7 +719,8 @@ same object.
 | Auxiliary vector | ✅ | `AT_PHDR`, `AT_ENTRY`, `AT_PAGESZ`, … |
 | TLS (initial-exec) | ✅ | Through `arch_prctl`/FS base |
 | **musl** C library | ✅ | `mhello` and `ls` are ordinary C programs linked against real musl |
-| Shell | 🟡 | **GNTbash** (GNU bash 5.3 + a switchable Windows layer; Genesis-userland's `third_party/GNTbash`, static musl) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. Not yet the login shell (BusyBox ash is), and there are no utilities to run (no `cat`/`head`) - ROADMAP item 15 |
+| Shell | 🟡 | **GNTbash** (GNU bash 5.3 + a switchable Windows layer; Genesis-userland's `third_party/GNTbash`, static musl) runs interactively as `/bin/bash`: readline editing, history, tab completion, Ctrl-C. It is the **login shell**: process 1 is `/sbin/init` (Genesis-userland `src/init`), which starts bash and restarts it when it exits (BusyBox `sh` if there is no init). There are no utilities to run yet (no `cat`/`head`) - ROADMAP item 15 |
+| Process 1 | ✅ | `/sbin/init`: login shell with its own session and controlling terminal, respawned on exit, reaps orphans; the kernel reparents a dead process's children to pid 1 |
 | vDSO | ❌ | |
 
 Programs in `/bin`: `bash` (GNU bash), `busybox` (shell), `ls` (musl),

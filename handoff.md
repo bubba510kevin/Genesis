@@ -132,6 +132,17 @@ by default) used to be made pending, so another child's exit made a
 blocking `wait4(pid)` return -EINTR. `signal_send` now discards ignored,
 unblocked signals, as Linux does.
 
+**bash is the login shell (2026-09-29).** Process 1 is `/sbin/init`
+(Genesis-userland `src/init`): it starts `/bin/bash` as a login shell in its
+own session with the console as controlling terminal, starts a new one when
+it exits (BusyBox's ash used to be process 1 and `exit` left the machine
+dead), and reaps orphans - the kernel now reparents a dead process's
+children to pid 1 (`proc_retire`). The kernel falls back to BusyBox `sh`
+when a root has no `/sbin/init`. `guest_run.py` and friends wait for
+`SHELL_READY` (bash's prompt or ash's banner, `tools/guest_run.py`), and
+every suite now runs under bash with job control. bash starts with
+`--noprofile --norc` until `/` has long names (15(i)).
+
 **Next, in order:**
 1. (j) Something to run: BusyBox with its applets (needs links — see 2/h) or
    coreutils built the way bash is. Without it `ls | head` fails.

@@ -18,7 +18,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build                                   # noqa: E402
-from guest_run import wait_for, wait_quiet     # noqa: E402
+from guest_run import SHELL_READY, SHELL_TIMEOUT, wait_for, wait_quiet     # noqa: E402
 
 
 def main():
@@ -31,7 +31,7 @@ def main():
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=logf,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     try:
-        if wait_for(log, r"built-in shell \(ash\)", 180) < 0:
+        if wait_for(log, SHELL_READY, SHELL_TIMEOUT) < 0:
             print("guest_dump: the shell never came up", file=sys.stderr)
             return 2
         time.sleep(2)

@@ -694,6 +694,37 @@ void proc_retire(process_t *p, int exit_status) {
         handle_close_all(p->handles);
     }
 
+    /* ORPHANS GO TO PROCESS 1, as on every Unix. Without this a process that
+     * exits before its children leaves them pointing at a parent that no
+     * longer exists: nobody can wait for them, so each one that exits is a
+     * zombie holding a slot of MAX_PROCESSES for the life of the machine.
+     * /sbin/init reaps whatever it inherits. Only for a whole process (not a
+     * thread of one - its siblings are not its children), and never for
+     * process 1 itself, which has nowhere to send them. */
+    if (p->tgid == p->pid && p->pid != 1) {
+        process_t *init = NULL;
+        int orphan_zombie = 0, i;
+
+        for (i = 0; i < MAX_PROCESSES; i++) {
+            process_t *c = &table[i];
+
+            if (c->state == PROC_UNUSED || c->ppid != p->pid ||
+                c->tgid == p->tgid || is_kernel_thread(c)) {
+                continue;
+            }
+            c->ppid = 1;
+            if (c->state == PROC_ZOMBIE) {
+                orphan_zombie = 1;
+            }
+        }
+        if (orphan_zombie && (init = proc_find(1)) != NULL) {
+            signal_send(init, SIGCHLD);
+            if (init->waiting_for_child) {
+                sched_wake(init);
+            }
+        }
+    }
+
     parent = proc_find(p->ppid);
 
     /* A vfork parent is suspended in a way only its child's clean syscall

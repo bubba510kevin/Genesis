@@ -42,4 +42,9 @@ int screen_graphics_owner(void);
  * framebuffer console at all). Called by fb_selftest. */
 int screen_fb_selftest(void);
 
+/* The console's terminal interpreter (control characters, CSI sequences),
+ * checked on the bottom row without showing anything. 0 if it behaved like
+ * the Linux console. */
+int screen_term_selftest(void);
+
 #endif

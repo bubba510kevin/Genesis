@@ -22,7 +22,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build                                   # noqa: E402
-from guest_run import wait_for, wait_quiet     # noqa: E402
+from guest_run import SHELL_READY, SHELL_TIMEOUT, wait_for, wait_quiet     # noqa: E402
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     start = 0
     try:
-        start = wait_for(log, r"built-in shell \(ash\)", 180)
+        start = wait_for(log, SHELL_READY, SHELL_TIMEOUT)
         if start < 0:
             print("guest_sh: the shell never came up", file=sys.stderr)
             return 2
@@ -76,8 +76,11 @@ def main():
         logf.close()
     with open(log, "r", errors="replace") as f:
         data = f.read()
-    i = data.find("built-in shell (ash)")
-    sys.stdout.write(data[i:] if i >= 0 else data[-4000:])
+    # From where userland starts: init's first line, or ash's banner when
+    # there is no init.
+    starts = [j for j in (data.find("init: starting"),
+                          data.find("built-in shell (ash)")) if j >= 0]
+    sys.stdout.write(data[min(starts):] if starts else data[-4000:])
     return 0
 
 

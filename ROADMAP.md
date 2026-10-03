@@ -923,8 +923,22 @@ BusyBox's shell it runs
 interactively: prompt, readline editing, history recall with the arrow keys,
 tab completion of commands, command substitution, pipelines, here-documents,
 functions, `ulimit`, `read -t`, `times`, Ctrl-C at the prompt and Ctrl-C of a
-running loop. It is not yet the login shell and there is nothing for it to run
-(no cat, no head) - (j) below.
+running loop. There is still nothing for it to run (no cat, no head) - (j)
+below.
+
+IT IS THE LOGIN SHELL since 2026-09-29. BusyBox's ash was process 1 itself,
+so `exit` - the first thing a person tries - ended the only shell and left
+the machine echoing keystrokes nothing read. Process 1 is now /sbin/init
+(Genesis-userland src/init): the login shell in its own session with the
+console as its controlling terminal (setsid, TIOCSCTTY), a new one when it
+exits, and every other child reaped. That last part needed a kernel change
+it had silently done without: ORPHANS WERE NEVER REPARENTED. A process
+exiting before its children left them pointing at a dead parent; each one
+that later exited was a zombie nobody could wait for, holding one of
+MAX_PROCESSES's 64 slots for good. proc_retire now hands them to pid 1. The
+kernel falls back to BusyBox sh when a root has no /sbin/init. bash starts
+with --noprofile --norc for now: on the 8.3 root .bash_profile cannot exist
+and the lookup's -ENAMETOOLONG is printed on every login - (i).
 
 HOW THE LIST BELOW WAS WORKED, and the method is the reusable part: run bash
 and watch what it does. /bin/gtrace CMD turns on the kernel's syscall trace
