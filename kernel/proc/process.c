@@ -4,6 +4,7 @@
 #include "io.h"
 #include "kprintf.h"
 #include "kstack.h"
+#include "ntsync.h"
 #include "object.h"
 #include "sched.h"
 #include "screen.h"
@@ -697,6 +698,7 @@ void proc_retire(process_t *p, int exit_status) {
      * a zombie is still on a queue is exactly the window something can wake
      * it. */
     waitq_leave(p);
+    keyed_event_forget(p);
 
     /* The status is still wanted, so the slot stays - but nothing holding a
      * resource should wait for a parent that may never call wait4.

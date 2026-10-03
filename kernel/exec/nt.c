@@ -7,6 +7,7 @@
 #include "nt_context.h"
 #include "ntmix.h"
 #include "ntsec.h"
+#include "ntsync.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -1096,6 +1097,243 @@ static uint64 nt_release_mutant(uint64 handle, uint64 prev_ptr) {
     return STATUS_SUCCESS;
 }
 
+/* --- keyed events and I/O completion ports (ROADMAP 16(k)) ----------------
+ *
+ * The objects are kernel/obj/ntsync.c; this is the marshalling. Both kinds
+ * are named, opened, open-or-created and given temporary names exactly as
+ * the dispatcher objects above are. */
+
+/* The create half shared by both: open-or-create, name, handle. `obj` is the
+ * new object or NULL (no memory); it is destroyed unused when OBJ_OPENIF
+ * found an existing one. */
+static uint64 nt_create_simple(uint64 handle_out, uint64 attrs_ptr,
+                               obj_class_t klass,
+                               object_t *(*make)(uint32), uint32 arg) {
+    char path[NS_PATH_MAX];
+    object_t *obj;
+    uint64 st;
+    uint32 attributes = 0;
+    int named = 0;
+
+    if (!user_ptr_ok(handle_out)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &attributes)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    st = nt_open_if(path, named, attributes, klass, handle_out);
+    if (st != STATUS_OBJECT_NAME_NOT_FOUND) {
+        return st;
+    }
+    obj = make(arg);
+    if (obj == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    st = nt_name_new(obj, path, named);
+    if (st != STATUS_SUCCESS) {
+        ob_deref(obj);
+        return st;
+    }
+    return nt_handle_out_new(obj, handle_out, named);
+}
+
+static object_t *make_keyed_event(uint32 unused) {
+    (void)unused;
+    return keyed_event_create();
+}
+
+/* NtReleaseKeyedEvent / NtWaitForKeyedEvent */
+static uint64 nt_keyed_event(uint64 handle, uint64 key, uint64 timeout_ptr,
+                             int kind) {
+    object_t *obj;
+    uint64 deadline = 0, st;
+    int rc;
+
+    if (handle == 0) {
+        obj = keyed_event_global();
+    } else {
+        obj = nt_object_of(handle);
+        if (obj == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+    }
+    if (obj == NULL || obj->type == NULL ||
+        obj->type->klass != OBJ_KEYED_EVENT) {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    if (key & 1) {
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    st = nt_wait_deadline(timeout_ptr, &deadline);
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    rc = keyed_event_rendezvous(obj, key, kind, deadline);
+    if (rc == 0) {
+        return STATUS_SUCCESS;
+    }
+    if (rc == -110) {
+        return STATUS_TIMEOUT;
+    }
+    return rc == -4 ? STATUS_ALERTED : STATUS_OBJECT_TYPE_MISMATCH;
+}
+
+static object_t *make_io_completion(uint32 concurrency) {
+    return io_completion_create(concurrency);
+}
+
+/* NtSetIoCompletion(HANDLE, KeyContext, ApcContext, IoStatus, Information) */
+static uint64 nt_set_io_completion(uint64 handle, uint64 key, uint64 apc_ctx,
+                                   uint64 status, uint64 information) {
+    object_t *obj = nt_object_of(handle);
+    io_packet_t pk;
+    int rc;
+
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    pk.key         = key;
+    pk.apc_context = apc_ctx;
+    pk.status      = (uint32)status;    /* an NTSTATUS: 32 bits */
+    pk.information = information;
+    rc = io_completion_post(obj, &pk);
+    if (rc == -12) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    return rc == 0 ? STATUS_SUCCESS : STATUS_OBJECT_TYPE_MISMATCH;
+}
+
+static uint64 nt_remove_status(int rc) {
+    if (rc == -110) {
+        return STATUS_TIMEOUT;
+    }
+    if (rc == IO_REMOVE_APC) {
+        return STATUS_USER_APC;
+    }
+    if (rc == -4) {
+        return STATUS_ALERTED;
+    }
+    return STATUS_OBJECT_TYPE_MISMATCH;
+}
+
+/* NtRemoveIoCompletion(HANDLE, PVOID *Key, PVOID *ApcContext,
+ *                      PIO_STATUS_BLOCK, PLARGE_INTEGER Timeout) */
+static uint64 nt_remove_io_completion(uint64 handle, uint64 key_ptr,
+                                      uint64 apc_ptr, uint64 iosb_ptr,
+                                      uint64 timeout_ptr) {
+    object_t *obj = nt_object_of(handle);
+    io_packet_t pk;
+    uint64 deadline = 0, st;
+    int rc;
+
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!user_range_ok(key_ptr, 8) || !user_range_ok(apc_ptr, 8) ||
+        !user_range_ok(iosb_ptr, sizeof(nt_io_status_block_t))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = nt_wait_deadline(timeout_ptr, &deadline);
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    ob_ref(obj);                      /* a close meanwhile must not free it */
+    rc = io_completion_remove(obj, &pk, 1, deadline, 0);
+    ob_deref(obj);
+    if (rc < 1) {
+        return nt_remove_status(rc);
+    }
+    *(uint64 *)key_ptr = pk.key;
+    *(uint64 *)apc_ptr = pk.apc_context;
+    ((nt_io_status_block_t *)iosb_ptr)->status      = pk.status;
+    ((nt_io_status_block_t *)iosb_ptr)->information = pk.information;
+    return STATUS_SUCCESS;
+}
+
+/* NtRemoveIoCompletionEx(HANDLE, PFILE_IO_COMPLETION_INFORMATION, ULONG Count,
+ *                        PULONG Removed, PLARGE_INTEGER Timeout, BOOLEAN) */
+#define NT_IO_REMOVE_MAX 64
+static uint64 nt_remove_io_completion_ex(uint64 handle, uint64 info_ptr,
+                                         uint64 count, uint64 removed_ptr,
+                                         uint64 timeout_ptr,
+                                         uint64 alertable) {
+    object_t *obj = nt_object_of(handle);
+    io_packet_t pk[NT_IO_REMOVE_MAX];
+    uint64 deadline = 0, st;
+    uint32 n = (uint32)count;
+    int rc, i;
+
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (n == 0) {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+    /* More than this many per call is legal on NT; it is clipped rather
+     * than refused, and the caller simply calls again for the rest. */
+    if (n > NT_IO_REMOVE_MAX) {
+        n = NT_IO_REMOVE_MAX;
+    }
+    if (!user_range_ok(info_ptr, (uint64)n * 32) ||
+        !user_range_ok(removed_ptr, 4)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = nt_wait_deadline(timeout_ptr, &deadline);
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    ob_ref(obj);
+    rc = io_completion_remove(obj, pk, (int)n, deadline,
+                              (uint8)alertable != 0);
+    ob_deref(obj);
+    if (rc < 1) {
+        *(uint32 *)removed_ptr = 0;
+        return nt_remove_status(rc);
+    }
+    for (i = 0; i < rc; i++) {
+        nt_file_io_completion_info_t *e =
+            &((nt_file_io_completion_info_t *)info_ptr)[i];
+
+        e->key_context = pk[i].key;
+        e->apc_context = pk[i].apc_context;
+        e->status      = pk[i].status;
+        e->information = pk[i].information;
+    }
+    *(uint32 *)removed_ptr = (uint32)rc;
+    return STATUS_SUCCESS;
+}
+
+/* NtQueryIoCompletion(HANDLE, Class, PVOID, ULONG Length, PULONG RetLen) */
+static uint64 nt_query_io_completion(uint64 handle, uint64 klass,
+                                     uint64 buf, uint64 length,
+                                     uint64 retlen_ptr) {
+    object_t *obj = nt_object_of(handle);
+    int depth;
+
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if ((uint32)klass != 0) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if ((uint32)length < 4) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_range_ok(buf, 4) ||
+        (retlen_ptr != 0 && !user_range_ok(retlen_ptr, 4))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    depth = io_completion_depth(obj);
+    if (depth < 0) {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    *(int32 *)buf = depth;
+    if (retlen_ptr != 0) {
+        *(uint32 *)retlen_ptr = 4;
+    }
+    return STATUS_SUCCESS;
+}
+
 /* --- threads (ROADMAP item 14(a)) -------------------------------------------
  *
  * See NT_SYS_CREATE_THREAD in nt.h for the contract and the one register
@@ -1504,6 +1742,85 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
             return nt_trace(frame->rax,
                             nt_open_named(frame->r10, frame->r8,
                                           OBJ_SEMAPHORE));
+
+        case NT_SYS_CREATE_KEYED_EVENT:
+            return nt_trace(frame->rax,
+                            nt_create_simple(frame->r10, frame->r8,
+                                             OBJ_KEYED_EVENT,
+                                             make_keyed_event, 0));
+
+        case NT_SYS_OPEN_KEYED_EVENT:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8,
+                                          OBJ_KEYED_EVENT));
+
+        case NT_SYS_RELEASE_KEYED_EVENT:
+            return nt_trace(frame->rax,
+                            nt_keyed_event(frame->r10, frame->rdx, frame->r9,
+                                           KEYED_RELEASE));
+
+        case NT_SYS_WAIT_KEYED_EVENT:
+            return nt_trace(frame->rax,
+                            nt_keyed_event(frame->r10, frame->rdx, frame->r9,
+                                           KEYED_WAIT));
+
+        case NT_SYS_CREATE_IO_COMPLETION:
+            return nt_trace(frame->rax,
+                            nt_create_simple(frame->r10, frame->r8,
+                                             OBJ_IO_COMPLETION,
+                                             make_io_completion,
+                                             (uint32)frame->r9));
+
+        case NT_SYS_OPEN_IO_COMPLETION:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8,
+                                          OBJ_IO_COMPLETION));
+
+        case NT_SYS_SET_IO_COMPLETION: {
+            uint64 info = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &info)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_set_io_completion(frame->r10, frame->rdx,
+                                                 frame->r8, frame->r9, info));
+        }
+
+        case NT_SYS_REMOVE_IO_COMPLETION: {
+            uint64 timeout = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &timeout)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_remove_io_completion(frame->r10, frame->rdx,
+                                                    frame->r8, frame->r9,
+                                                    timeout));
+        }
+
+        case NT_SYS_REMOVE_IO_COMPLETION_EX: {
+            uint64 timeout = 0, alertable = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &timeout) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 6, &alertable)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_remove_io_completion_ex(frame->r10, frame->rdx,
+                                                       frame->r8, frame->r9,
+                                                       timeout, alertable));
+        }
+
+        case NT_SYS_QUERY_IO_COMPLETION: {
+            uint64 retlen = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &retlen);
+            return nt_trace(frame->rax,
+                            nt_query_io_completion(frame->r10, frame->rdx,
+                                                   frame->r8, frame->r9,
+                                                   retlen));
+        }
 
         case NT_SYS_SET_EVENT:
             return nt_trace(frame->rax,

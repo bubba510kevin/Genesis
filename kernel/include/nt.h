@@ -254,6 +254,49 @@ struct syscall_frame;
  * OpenMutexW and OpenSemaphoreW are built on them. */
 #define NT_SYS_OPEN_MUTANT           0x2A
 #define NT_SYS_OPEN_SEMAPHORE        0x2B
+
+/* --- keyed events and I/O completion ports (ROADMAP 16(k)) -----------------
+ * kernel/include/ntsync.h has what each object is.
+ *
+ * NtCreateKeyedEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Flags)
+ * NtOpenKeyedEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)
+ * NtReleaseKeyedEvent / NtWaitForKeyedEvent
+ *     (HANDLE, PVOID Key, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+ *   A NULL handle is the one global keyed event. Key must be even
+ *   (STATUS_INVALID_PARAMETER_1): NT reserves the low bit. Alertable is
+ *   accepted and not honoured - neither call ends early for an APC.
+ *
+ * NtCreateIoCompletion(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+ *                      ULONG NumberOfConcurrentThreads)
+ * NtOpenIoCompletion(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)
+ * NtSetIoCompletion(HANDLE, PVOID KeyContext, PVOID ApcContext,
+ *                   NTSTATUS IoStatus, ULONG_PTR IoStatusInformation)
+ * NtRemoveIoCompletion(HANDLE, PVOID *KeyContext, PVOID *ApcContext,
+ *                      PIO_STATUS_BLOCK, PLARGE_INTEGER Timeout)
+ * NtRemoveIoCompletionEx(HANDLE, PFILE_IO_COMPLETION_INFORMATION, ULONG Count,
+ *                        PULONG NumEntriesRemoved, PLARGE_INTEGER Timeout,
+ *                        BOOLEAN Alertable)
+ * NtQueryIoCompletion(HANDLE, IO_COMPLETION_INFORMATION_CLASS, PVOID,
+ *                     ULONG Length, PULONG ResultLength)
+ *   Class 0 (IoCompletionBasicInformation) is a LONG: packets queued. */
+#define NT_SYS_CREATE_KEYED_EVENT    0x2C
+#define NT_SYS_OPEN_KEYED_EVENT      0x2D
+#define NT_SYS_RELEASE_KEYED_EVENT   0x2E
+#define NT_SYS_WAIT_KEYED_EVENT      0x2F
+#define NT_SYS_CREATE_IO_COMPLETION  0x30
+#define NT_SYS_OPEN_IO_COMPLETION    0x31
+#define NT_SYS_SET_IO_COMPLETION     0x32
+#define NT_SYS_REMOVE_IO_COMPLETION  0x33
+#define NT_SYS_REMOVE_IO_COMPLETION_EX 0x34
+#define NT_SYS_QUERY_IO_COMPLETION   0x35
+
+/* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
+typedef struct __attribute__((packed)) {
+    uint64 key_context;
+    uint64 apc_context;
+    uint64 status;              /* IO_STATUS_BLOCK */
+    uint64 information;
+} nt_file_io_completion_info_t;
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 

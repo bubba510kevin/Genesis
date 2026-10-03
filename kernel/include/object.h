@@ -133,7 +133,12 @@ typedef enum {
      * process_t); it is what WaitForSingleObject on a thread handle waits on
      * and what GetExitCodeThread reads, and it outlives the thread for as
      * long as anyone holds a handle to it. */
-    OBJ_THREAD
+    OBJ_THREAD,
+
+    /* NT's keyed event and I/O completion port (kernel/include/ntsync.h):
+     * blocked on through their own calls, never through a wait. */
+    OBJ_KEYED_EVENT,
+    OBJ_IO_COMPLETION
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

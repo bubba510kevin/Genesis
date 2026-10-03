@@ -406,6 +406,15 @@ and one spinning in ring 3 on another CPU.
 wherever it is: running on another CPU, blocked in a wait, or suspended.
 Mutexes it held are abandoned.
 
+**Keyed events and I/O completion ports ✅** (2026-10-03, ROADMAP 16(k)):
+`NtCreateKeyedEvent`/`NtWaitForKeyedEvent`/`NtReleaseKeyedEvent` (a
+rendezvous per key, the NULL handle being the global one) and completion
+ports (`NtCreateIoCompletion`, `NtSetIoCompletion`,
+`NtRemoveIoCompletion(Ex)`, `NtQueryIoCompletion`; kernel32's
+`CreateIoCompletionPort`/`PostQueuedCompletionStatus`/
+`GetQueuedCompletionStatus(Ex)`, alertable included). Not yet: a file
+associated with a port (needs overlapped I/O), the concurrency limit.
+
 **Named objects ✅** (2026-10-03, phase 2 / ROADMAP 16(k)): events,
 semaphores and mutexes by name in `\BaseNamedObjects`. The kernel honours
 `OBJ_OPENIF` on `NtCreateEvent`/`NtCreateSemaphore`/`NtCreateMutant` (the
