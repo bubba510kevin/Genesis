@@ -158,10 +158,17 @@ The pieces already queued from earlier work belong here:
   `OpenEventW` / `OpenSemaphoreW`, sync.exe and wait.exe checks); land it,
   then add `/bin/sync.exe` to `guest_run.py`'s default list (it prints a
   tally only from that commit on).
-- **MAX_PROCESSES = 64** (`kernel/include/process.h`) is shared by processes,
-  threads, kthreads and idle threads. Real Win32 programs with thread pools
-  will hit it; the table is scanned linearly by the scheduler, so raising it
-  far means a run queue.
+- **Table sizes — DONE 2026-10-03**: `MAX_PROCESSES` 64 -> 256 (kernel
+  stacks to match), Windows threads per process 64 -> 128, `MAX_HANDLES`
+  32 -> 256, the object and open-instance pools 64 -> 1024, dispatcher
+  objects 64 -> 512. The scheduling-path scans stop at `proc_slots_used()`
+  (the high-water slot), and a wait queue is now a slot bitmap (32 bytes,
+  was 2KB at 256 slots). ROADMAP 16(k) has the detail. thr.exe runs 100
+  threads at once. **Userland must move with it**: systest and bashtest
+  pin `RLIMIT_NOFILE` (now 256), and the 100-thread check is in thr.exe -
+  all in the same Genesis-userland patch as the named objects. A real run
+  queue is still not needed: the scans are priced by threads alive, not by
+  the table.
 
 **Loose ends of 14(b)/(c)**
 See the STILL OPEN note under item 14(c) in `ROADMAP.md`: MinGW C++
@@ -308,16 +315,17 @@ subset, e.g. `python3 tools/guest_run.py /bin/smp.exe`. The log is
 monitor on a free TCP port when the program prints `MOUSE-WAIT-n`, so run
 fbtest through guest_run (by hand it asks you to move and click).
 `GENESIS_VBE=WxH` or `GENESIS_VBE=off` at build time picks the graphics mode
-or keeps text mode. Expected as of 2026-09-27 (after the phase 1 work):
+or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the userland patch):
 
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
-| `systest` | 557 passed | 554 passed |
-| `thr` (`thr.exe`) | 45 passed | 45 passed |
+| `systest` | 561 passed | 558 passed |
+| `thr` (`thr.exe`) | 47 passed | 47 passed |
 | `smp` (`smp.exe`) | 61 passed | 57 passed |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
-| `wait` (`wait.exe`) | 46 passed | 46 passed |
+| `wait` (`wait.exe`) | 60 passed | 60 passed |
+| `sync` (`sync.exe`) | 44 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
 | `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |

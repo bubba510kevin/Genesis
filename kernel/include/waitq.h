@@ -4,6 +4,8 @@
 #include "process.h"
 #include "typesk.h"
 
+#define WAITQ_WORDS ((MAX_PROCESSES + 63) / 64)
+
 /* A list of processes blocked on one condition, and the loop that blocks on
  * it correctly.
  *
@@ -35,13 +37,22 @@
  * entirely and hangs the rest. */
 
 typedef struct wait_queue {
-    /* One slot per process, because that is the hard ceiling on how many can
-     * be blocked here at once, and it makes add and remove branchless-simple
-     * with no allocation on a path that runs with interrupts off. A single
-     * pointer was the earlier design and it was a silent hang the moment two
-     * processes waited: the second overwrote the slot and the first was never
-     * woken again. */
-    process_t *waiters[MAX_PROCESSES];
+    /* One BIT per process-table slot: bit i set means proc_at(i) waits here.
+     * Every process can be on the queue at once, add and remove need no
+     * allocation on a path that runs with interrupts off, and a queue costs
+     * MAX_PROCESSES/8 bytes. A single pointer was the earliest design and it
+     * was a silent hang the moment two processes waited: the second
+     * overwrote the slot and the first was never woken again.
+     *
+     * It was an array of MAX_PROCESSES pointers until 2026-10-03, which is
+     * the same set - a process was only ever in it once, and the pointer was
+     * always &table[slot] - at 64 times the size. That mattered when the
+     * table went from 64 slots to 256: every pipe, eventfd, dispatcher object
+     * and LinuxKPI task embeds one of these, and at 2KB each they were most
+     * of what the larger table cost (ROADMAP 16(k)). A slot recycled while
+     * its bit is set gets a spurious wake, exactly as the stale pointer did,
+     * and every waiter re-tests its condition after waking. */
+    uint64 waiters[WAITQ_WORDS];
 } wait_queue_t;
 
 /* Empty the queue. For a fresh queue only - it does not wake anybody. */

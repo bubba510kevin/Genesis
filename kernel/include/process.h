@@ -22,9 +22,12 @@
  * when address space and execution context need separate lifetimes, and
  * nothing here needs that yet. */
 
-/* 64: each CPU also needs an idle thread, and a machine with several CPUs
- * runs several threads of one program at once, which is the point of it. */
-#define MAX_PROCESSES  64
+/* Processes, threads, kernel threads and idle threads, all of them: each is
+ * a process_t (about 3KB) and a kernel stack slot (KSTACK_SLOTS, which must
+ * match). 64 until 2026-10-03; a Win32 program with a thread pool runs more
+ * threads than that by itself. The scans over this table stop at
+ * proc_slots_used(), so its size costs memory and nothing per switch. */
+#define MAX_PROCESSES  256
 
 /* Resource limits: Linux's numbering (asm-generic/resource.h). */
 #define RLIMIT_CPU         0
@@ -670,6 +673,14 @@ void proc_reap_threads(void);
  * for an unused slot. */
 process_t *proc_at(int index);
 int proc_index(const process_t *p);
+
+/* One past the highest table slot EVER allocated: every live entry has an
+ * index below it, so a scan may stop there. It only grows. proc_alloc takes
+ * the lowest free slot, so it settles at the most threads ever alive at once
+ * rather than at MAX_PROCESSES - which is what keeps the scans on the
+ * scheduling path (pick, reap, the per-tick passes) priced by the machine's
+ * actual load and not by the size of the table (ROADMAP 16(k)). */
+int proc_slots_used(void);
 
 /* Make `p` current without touching stacks or CR3 - the scheduler does those
  * itself, in an order it controls. Current is PER CPU: this sets it for the

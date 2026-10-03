@@ -182,7 +182,11 @@ int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc);
  * Fixed regions rather than the mmap allocator because mmap_next is a bump
  * pointer that never comes back down: a program that creates and joins a
  * thread in a loop would walk it off the end of the region. */
-#define NT_THREAD_SLOTS          64
+/* 128 since 2026-10-03 (64 before): stacks then run to 0x58000000, TEBs to
+ * 0x21100000, TLS areas (one more, for the main thread) to 0x4E810000. The
+ * whole machine has MAX_PROCESSES = 256 threads, so one process is not meant
+ * to be able to take every one. */
+#define NT_THREAD_SLOTS          128
 #define NT_THREAD_TEB_BASE       0x0000000021000000ULL
 #define NT_THREAD_TEB_STRIDE     (NT_TEB_PAGES * 0x1000ULL)
 #define NT_THREAD_STACK_BASE     0x0000000050000000ULL
@@ -255,7 +259,18 @@ typedef struct {
  * one thread's implicit TLS - a program needing more is refused at exec. */
 #define NT_TLS_AREA_BASE        0x000000004E000000ULL
 #define NT_TLS_AREA_STRIDE      0x0000000000010000ULL
-#define NT_TLS_MAIN_SLOT        64
+#define NT_TLS_MAIN_SLOT        NT_THREAD_SLOTS
+
+/* The three per-thread regions must not reach the next thing up. */
+typedef char nt_thread_tebs_fit[
+    (NT_THREAD_TEB_BASE + NT_THREAD_SLOTS * NT_THREAD_TEB_STRIDE
+     <= 0x0000000030000000ULL) ? 1 : -1];   /* USER_MMAP_BASE */
+typedef char nt_tls_areas_fit[
+    (NT_TLS_AREA_BASE + (NT_TLS_MAIN_SLOT + 1) * NT_TLS_AREA_STRIDE
+     <= NT_THREAD_STACK_BASE) ? 1 : -1];
+typedef char nt_thread_stacks_fit[
+    (NT_THREAD_STACK_BASE + NT_THREAD_SLOTS * NT_THREAD_STACK_STRIDE
+     <= 0x0000000140000000ULL) ? 1 : -1];
 
 /* Write `table` into the PEB of the space (called at exec). */
 int nt_tls_publish(address_space_t *as, const nt_tls_table_t *table);

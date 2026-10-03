@@ -112,7 +112,7 @@ static void ule_dequeue(process_t *p) {
 static void ule_decay(void) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = proc_at(i);
 
         if (t == NULL) {
@@ -137,8 +137,10 @@ static process_t *ule_pick_next(int cpu) {
      *
      * That degeneration is a feature and is the reason the existing
      * round-robin behaviour test still passes against this policy. */
-    for (i = 1; i <= MAX_PROCESSES; i++) {
-        process_t *p = proc_at((proc_index(start) + i) % MAX_PROCESSES);
+    int n = proc_slots_used();
+
+    for (i = 1; i <= n; i++) {
+        process_t *p = proc_at((proc_index(start) + i) % n);
         int score;
 
         if (!sched_eligible(p, cpu)) {

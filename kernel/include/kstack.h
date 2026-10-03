@@ -30,7 +30,7 @@
 
 #define KSTACK_SIZE     0x4000ULL   /* 16KB, matching Linux's x86-64 choice */
 #define KSTACK_STRIDE   0x8000ULL   /* 32KB: the stack plus its guard hole  */
-#define KSTACK_SLOTS    64   /* one per process slot - see MAX_PROCESSES */
+#define KSTACK_SLOTS    256  /* one per process slot - MAX_PROCESSES; process.c asserts it */
 
 /* Above the kernel heap (0xFFFFFFFF90000000) and inside the same PDPT entry
  * as the rest of the kernel half. Fallback only now - see kstack_init()

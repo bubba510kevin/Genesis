@@ -47,6 +47,16 @@ static process_t table[MAX_PROCESSES];
 #define current (smp_this_cpu()->current)
 static int next_pid = 1;
 
+/* See proc_slots_used(). Slot 0 is the boot process. */
+static int slots_hiwater = 1;
+
+typedef char kstack_slot_per_process[
+    (KSTACK_SLOTS == MAX_PROCESSES) ? 1 : -1];
+
+int proc_slots_used(void) {
+    return slots_hiwater;
+}
+
 /* Which kstack slot each table entry owns. Tied to the table index rather
  * than allocated separately, so a slot cannot outlive or be orphaned by its
  * process - the two lifetimes are the same lifetime. */
@@ -303,7 +313,7 @@ static int is_kernel_thread(const process_t *t) {
 static int group_has_live_threads(const process_t *leader) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         const process_t *t = &table[i];
 
         if (t == leader || t->state == PROC_UNUSED || is_kernel_thread(t)) {
@@ -325,7 +335,7 @@ static int group_has_live_threads(const process_t *leader) {
 process_t *proc_reap_child(process_t *p) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         if (table[i].state == PROC_ZOMBIE && table[i].ppid == p->pid &&
             !table[i].oncpu &&
             !is_kernel_thread(&table[i]) && !is_thread_of(&table[i], p) &&
@@ -339,7 +349,7 @@ process_t *proc_reap_child(process_t *p) {
 void proc_reap_threads(void) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = &table[i];
 
         /* A non-leader thread that has exited. Its status is nobody's -
@@ -375,7 +385,7 @@ process_t *proc_wait_child(process_t *p, int sel, int want, int *kind,
     int i;
 
     *any_match = 0;
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *c = &table[i];
 
         if (c->state == PROC_UNUSED || c->ppid != p->pid ||
@@ -409,7 +419,7 @@ process_t *proc_wait_child(process_t *p, int sel, int want, int *kind,
 int proc_has_children(const process_t *p) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         if (table[i].state != PROC_UNUSED && table[i].ppid == p->pid &&
             !is_kernel_thread(&table[i]) && !is_thread_of(&table[i], p)) {
             return 1;
@@ -464,7 +474,7 @@ uint64 proc_group_cpu_ticks(const process_t *p) {
     uint64 sum = 0;
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         if (table[i].state != PROC_UNUSED && !is_kernel_thread(&table[i]) &&
             table[i].tgid == p->tgid) {
             sum += table[i].cpu_ticks;
@@ -491,6 +501,12 @@ process_t *proc_alloc(int ppid) {
         if (table[i].state == PROC_UNUSED) {
             process_t *p = &table[i];
 
+            /* Raised BEFORE the slot is marked in use: a scan that sees the
+             * new bound early finds an UNUSED slot, which it skips; one that
+             * saw a live slot past the bound would miss it. */
+            if (i + 1 > slots_hiwater) {
+                slots_hiwater = i + 1;
+            }
             p->pid         = next_pid++;
             p->ppid        = ppid;
             p->state       = PROC_READY;
@@ -674,8 +690,8 @@ void proc_retire(process_t *p, int exit_status) {
      * or on the keyboard - killed by a signal whose default action is to
      * terminate, or by a fault it could not survive - and those paths do not
      * unwind through waitq_wait, which is what would otherwise have removed
-     * it. What is left behind is a pointer to a retired slot in a waiters[]
-     * array that waitq_wake_all will walk later.
+     * it. What is left behind is a retired slot's bit in a waiters[] bitmap
+     * that waitq_wake_all will walk later, waking whoever reuses the slot.
      *
      * Done first because everything below can schedule, and the window where
      * a zombie is still on a queue is exactly the window something can wake
@@ -900,7 +916,7 @@ void proc_cred(const process_t *p, cred_t *out) {
 process_t *proc_find(int pid) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         if (table[i].state != PROC_UNUSED && table[i].pid == pid) {
             return &table[i];
         }
@@ -956,7 +972,7 @@ void proc_dump(void) {
     int i;
 
     kprintf_c(0x0E, "\n--- tasks ---\n");
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = &table[i];
 
         if (t->state == PROC_UNUSED) {

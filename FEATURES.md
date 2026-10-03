@@ -438,8 +438,11 @@ small policy interface (`sched.c`):
 - CPU-time accounting that never runs backwards (`times(2)`,
   `CLOCK_PROCESS_CPUTIME_ID`).
 
-**Limit:** `MAX_PROCESSES` is **64**, shared by every process, thread,
-kernel thread and per-CPU idle thread.
+**Limits** (raised 2026-10-03): `MAX_PROCESSES` is **256**, shared by every
+process, thread, kernel thread and per-CPU idle thread; a Windows process
+may have **128** threads; a process has **256** handles/descriptors
+(`RLIMIT_NOFILE`). The scheduler's scans stop at the highest slot ever
+used, so the table's size costs memory, not time per switch.
 
 ---
 
@@ -1008,7 +1011,7 @@ and 4):
 
 | Step | What | Status |
 |---|---|---|
-| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads on every CPU, TLS, suspend/resume/terminate, named mutexes; MAX_PROCESSES remains |
+| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads on every CPU, TLS, suspend/resume/terminate, named mutexes, 256 threads machine-wide |
 | (b) | Dispatcher objects completed: waits blocking threads, APCs | ✅ |
 | (c) | Structured exception handling (x64 table-based) | ✅ C `__try`; C++ exceptions and stack overflow remain |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |

@@ -12,7 +12,7 @@
  * and checked against the kernel's in lkpi_smp.c. */
 struct completion {
     volatile unsigned int done;
-    unsigned long         wq_opaque[65];   /* a Genesis wait_queue_t */
+    unsigned long         wq_opaque[8];    /* a Genesis wait_queue_t: a bitmap of up to 512 slots */
 };
 
 #define COMPLETION_ALL_DONE 0x7FFFFFFFu

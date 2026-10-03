@@ -22,7 +22,7 @@
  * whether a signal means "set" or "release".
  */
 
-#define DISPATCH_MAX 64   /* events, semaphores, mutants AND one per NT thread */
+#define DISPATCH_MAX 512  /* events, semaphores, mutants AND one per NT thread */
 
 typedef enum {
     D_EVENT = 0,

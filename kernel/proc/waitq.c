@@ -16,39 +16,36 @@
 void waitq_init(wait_queue_t *q) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
-        q->waiters[i] = NULL;
+    for (i = 0; i < WAITQ_WORDS; i++) {
+        q->waiters[i] = 0;
     }
 }
 
 void waitq_add(wait_queue_t *q, process_t *p) {
-    int i, free_slot = -1;
+    int slot;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
-        if (q->waiters[i] == p) {
-            return;                        /* already queued */
-        }
-        if (q->waiters[i] == NULL && free_slot < 0) {
-            free_slot = i;
-        }
+    if (p == NULL) {
+        return;
     }
-    if (free_slot >= 0) {
-        q->waiters[free_slot] = p;
-        /* The back pointer is set from the same branch that fills the slot,
-         * and only from there. Two pieces of state describing one fact can
-         * only stay in agreement if one place writes both. */
-        p->blocked_on = q;
+    slot = proc_index(p);
+    if (q->waiters[slot / 64] & (1ULL << (slot % 64))) {
+        return;                            /* already queued */
     }
+    q->waiters[slot / 64] |= 1ULL << (slot % 64);
+    /* The back pointer is set from the same branch that fills the slot,
+     * and only from there. Two pieces of state describing one fact can
+     * only stay in agreement if one place writes both. */
+    p->blocked_on = q;
 }
 
 void waitq_remove(wait_queue_t *q, process_t *p) {
-    int i;
+    int slot;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
-        if (q->waiters[i] == p) {
-            q->waiters[i] = NULL;
-        }
+    if (p == NULL) {
+        return;
     }
+    slot = proc_index(p);
+    q->waiters[slot / 64] &= ~(1ULL << (slot % 64));
     /* Cleared only if this really is the queue it was on. Clearing
      * unconditionally would let a remove from an unrelated queue erase the
      * record of a wait that is still live, and the process would then be left
@@ -72,11 +69,21 @@ wait_queue_t *waitq_readiness(void) {
 }
 
 static void wake_list(wait_queue_t *q) {
-    int i;
+    int w;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
-        if (q->waiters[i] != NULL) {
-            sched_wake(q->waiters[i]);
+    for (w = 0; w < WAITQ_WORDS; w++) {
+        uint64 bits = q->waiters[w];     /* a snapshot: wakes may re-queue */
+
+        while (bits != 0) {
+            int b = __builtin_ctzll(bits);
+            /* NULL for a slot freed since it was queued - the old array
+             * would have woken the retired process_t; this skips it. */
+            process_t *p = proc_at(w * 64 + b);
+
+            bits &= bits - 1;
+            if (p != NULL) {
+                sched_wake(p);
+            }
         }
     }
 }

@@ -66,10 +66,12 @@ static process_t *rr_pick_next(int cpu) {
 
     /* Begin AFTER the current process so a runnable peer is preferred over
      * running the same one again - that is the whole of round-robin's
-     * fairness. The current one is reached last (i == MAX_PROCESSES), so it
+     * fairness. The current one is reached last (i == n), so it
      * keeps the CPU only when nothing else here can have it. */
-    for (i = 1; i <= MAX_PROCESSES; i++) {
-        p = proc_at((proc_index(start) + i) % MAX_PROCESSES);
+    int n = proc_slots_used();
+
+    for (i = 1; i <= n; i++) {
+        p = proc_at((proc_index(start) + i) % n);
         if (sched_eligible(p, cpu)) {
             return p;
         }
@@ -136,7 +138,7 @@ void sched_tick_global(void) {
     int i;
 
     sched_wake_sleepers(timer_ticks_now());
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = proc_at(i);
 
         if (t != NULL && t->state == PROC_BLOCKED && !t->is_idle) {
@@ -197,7 +199,7 @@ static void zombie_left_cpu(process_t *z) {
     int i;
 
     (void)z;
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = proc_at(i);
 
         if (t != NULL && t->waiting_for_child && t->state == PROC_BLOCKED) {
@@ -396,7 +398,7 @@ void sched_sleep_until(process_t *p, uint64 tick) {
 void sched_wake_sleepers(uint64 now) {
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *p = proc_at(i);
 
         if (p != NULL && p->state == PROC_BLOCKED && p->wake_tick != 0 &&
@@ -522,7 +524,7 @@ static int cpu_has_work(int cpu) {
     process_t *cur = smp_cpu(cpu)->current;
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *p = proc_at(i);
 
         if (p != NULL && p != cur && sched_eligible(p, cpu)) {

@@ -34,9 +34,15 @@
  * Lowest free index, always. POSIX guarantees it and shell redirection
  * depends on it; NT promises nothing, so the stricter rule satisfies both. */
 
-#define MAX_HANDLES      32
-#define MAX_OBJECTS      64
-#define MAX_OPEN_FILES   64
+/* Raised 2026-10-03 (ROADMAP 16(k)) from 32/64/64: every NT thread is a
+ * handle, an open instance and an object, so a 100-thread program ran the
+ * handle table out at 28 threads and the global pools soon after. 256
+ * handles is also what lets bash put its script on fd 255. The pools are
+ * kernel-wide and cheap (an object is 40 bytes, an open instance 32);
+ * MAX_HANDLES is per process, 16 bytes a handle in every process_t. */
+#define MAX_HANDLES      256
+#define MAX_OBJECTS      1024
+#define MAX_OPEN_FILES   1024
 
 /* Access modes, matching POSIX O_RDONLY/O_WRONLY/O_RDWR in value so the
  * Linux personality can pass them through unchanged. */

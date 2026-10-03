@@ -77,7 +77,7 @@ static void notify_parent_job(struct process *leader) {
     if (!(parent->sig_handlers[SIGCHLD].flags & SA_NOCLDSTOP)) {
         signal_send(parent, SIGCHLD);
     }
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         struct process *t = proc_at(i);
 
         if (t != NULL && t->state == PROC_BLOCKED && t->waiting_for_child &&
@@ -91,7 +91,7 @@ static void job_stop(struct process *p, int signo) {
     struct process *leader = leader_of(p);
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         struct process *t = proc_at(i);
 
         if (t == NULL || t->state == PROC_UNUSED || t->state == PROC_ZOMBIE ||
@@ -116,7 +116,7 @@ static void job_stop(struct process *p, int signo) {
 static void job_continue(struct process *p) {
     int i, was_stopped = 0;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         struct process *t = proc_at(i);
 
         if (t == NULL || t->state == PROC_UNUSED || t->tgid != p->tgid) {
@@ -158,7 +158,7 @@ void signal_send(struct process *p, int signo) {
          * of its stop so every thread reaches the kill. */
         int i;
 
-        for (i = 0; i < MAX_PROCESSES; i++) {
+        for (i = 0; i < proc_slots_used(); i++) {
             struct process *t = proc_at(i);
 
             if (t != NULL && t->state != PROC_UNUSED && t->tgid == p->tgid &&
@@ -211,7 +211,7 @@ void signal_send_group(int pgid, int signo) {
     if (pgid <= 0) {
         return;
     }
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         struct process *p = proc_at(i);
         if (p != NULL && p->pgid == pgid) {
             signal_send(p, signo);

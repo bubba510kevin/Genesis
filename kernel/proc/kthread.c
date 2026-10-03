@@ -278,7 +278,7 @@ void kthread_reap(void) {
     process_t *me = proc_current();
     int i;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *p = proc_at(i);
 
         if (p == NULL || p == me) {
@@ -333,7 +333,7 @@ void kthread_report(uint8 color) {
     int i;
     int shown = 0;
 
-    for (i = 0; i < MAX_PROCESSES; i++) {
+    for (i = 0; i < proc_slots_used(); i++) {
         process_t *p = proc_at(i);
 
         if (p == NULL || !p->is_kthread) {

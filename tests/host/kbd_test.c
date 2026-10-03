@@ -42,7 +42,23 @@ void print_backspace(uint8 color) {
 int screen_width_chars(void)  { return 80; }
 int screen_height_chars(void) { return 25; }
 uint32 timer_hz(void)         { return 100; }
-process_t *proc_at(int index) { (void)index; return NULL; }
+
+/* A process table of two, live only while test_waitq runs: a wait queue is a
+ * bitmap of table slots, so proc_index and proc_at have to agree on where
+ * its processes are. Everywhere else the harness has no processes at all. */
+static process_t stub_table[2];
+static int       stub_table_live;
+
+process_t *proc_at(int index) {
+    if (!stub_table_live || index < 0 || index >= 2) {
+        return NULL;
+    }
+    return &stub_table[index];
+}
+
+int proc_index(const process_t *p) {
+    return (int)(p - stub_table);
+}
 
 /* The terminal blocks through the scheduler. The harness has no processes,
  * and every test queues its input before reading, so these stubs are never
@@ -575,9 +591,12 @@ static void test_waitq(void) {
      * cast turned a one-byte object into a structure and the store went off
      * the end of it. Nothing failed - the bytes after a static char belong to
      * something, and that something was not being checked. */
-    static process_t a, b;
+    process_t *pa = &stub_table[0], *pb = &stub_table[1];
+#define a (*pa)
+#define b (*pb)
 
     printf("\nwaitq: the list keyboard.c used to own\n");
+    stub_table_live = 1;
 
     waitq_init(&q);
     waitq_init(&other);
@@ -627,6 +646,18 @@ static void test_waitq(void) {
     waitq_leave(&b);
     check(b.blocked_on == NULL, "leaving twice is harmless");
     waitq_leave(NULL);
+
+    /* A slot freed while still queued (a process killed mid-wait whose
+     * teardown missed the queue) is skipped, not woken as a dead entry. */
+    waitq_add(&q, &a);
+    stub_table_live = 0;
+    before = sched_stub_calls;
+    waitq_wake_all(&q);
+    check(sched_stub_calls == before,
+          "a slot that is no longer in use is not woken");
+    waitq_init(&q);
+#undef a
+#undef b
 }
 
 int kbd_run_tests(void) {
