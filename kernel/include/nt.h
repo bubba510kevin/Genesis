@@ -246,6 +246,14 @@ struct syscall_frame;
  * yet (ROADMAP items 14(e) and 19; kernel/exec/ntmix.c). kernel32's
  * LoadLibrary is built on it. */
 #define NT_SYS_GENESIS_LOAD_IMAGE    0x29
+
+/* NtOpenMutant / NtOpenSemaphore(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES) -
+ * NtOpenEvent's two siblings (ROADMAP item 16(k), the named half of 14(a)).
+ * The name must already exist and name an object of that type:
+ * STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_TYPE_MISMATCH otherwise.
+ * OpenMutexW and OpenSemaphoreW are built on them. */
+#define NT_SYS_OPEN_MUTANT           0x2A
+#define NT_SYS_OPEN_SEMAPHORE        0x2B
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001u
 #define ThreadBasicInformation    0
 
@@ -348,11 +356,14 @@ struct syscall_frame;
  *
  * STATUS_OBJECT_NAME_COLLISION is what a named create hits when the name is
  * taken. STATUS_OBJECT_NAME_EXISTS is the SUCCESS-shaped warning that comes
- * back when an OPEN-or-create found an existing one; only the first is used
- * here, because these creates do not open. */
+ * back when an open-or-create (OBJ_OPENIF in the attributes) found an
+ * existing object of the right type and opened it instead: NT_SUCCESS is
+ * true for it and the handle is valid, and it is the whole of how
+ * CreateMutexW comes to set ERROR_ALREADY_EXISTS. */
 #define STATUS_TIMEOUT            0x00000102u
 #define STATUS_ALERTED            0x00000101u
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035u
+#define STATUS_OBJECT_NAME_EXISTS    0x40000000u
 #define STATUS_OBJECT_TYPE_MISMATCH  0xC0000024u
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
 #define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
@@ -420,6 +431,11 @@ typedef struct __attribute__((packed)) {
 } nt_object_attributes_t;
 
 #define OBJ_CASE_INSENSITIVE  0x00000040u
+/* Open-or-create: a create whose name is taken by an object of the same type
+ * opens that one and answers STATUS_OBJECT_NAME_EXISTS, rather than failing
+ * with STATUS_OBJECT_NAME_COLLISION. What every named Create* in kernel32
+ * passes. */
+#define OBJ_OPENIF            0x00000080u
 
 /* IO_STATUS_BLOCK. Information is the byte count for a read or a write, and
  * it is the ONLY place that count is reported - the return value is a status,

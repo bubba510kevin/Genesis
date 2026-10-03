@@ -531,10 +531,12 @@ object_t *nt_object_of(uint64 handle) {
  * ObjectName is not an error - it is how an unnamed object is asked for -
  * which is why "no name" and "a name that would not convert" have to be
  * distinguishable here rather than both being falsey. */
-static int nt_attrs_name(uint64 attrs_ptr, char *path, uint64 cap, int *named) {
+static int nt_attrs_name(uint64 attrs_ptr, char *path, uint64 cap, int *named,
+                         uint32 *attributes) {
     nt_object_attributes_t oa;
 
     *named = 0;
+    *attributes = 0;
     if (attrs_ptr == 0) {
         return 1;                     /* no attributes at all: unnamed */
     }
@@ -545,6 +547,7 @@ static int nt_attrs_name(uint64 attrs_ptr, char *path, uint64 cap, int *named) {
     if (oa.length < sizeof(nt_object_attributes_t)) {
         return 0;
     }
+    *attributes = oa.attributes;
     if (oa.root_directory != 0) {
         return 0;                     /* relative names: same gap as opens */
     }
@@ -577,7 +580,76 @@ static uint64 nt_name_new(object_t *obj, const char *path, int named) {
     if (rc != 0) {
         return status_from_ns(rc);
     }
+    /* NT's default for a name a program gives an object: it lasts as long as
+     * a handle to the object does (object.h, OB_FLAG_TEMPORARY). */
+    ob_make_temporary(obj);
     return STATUS_SUCCESS;
+}
+
+/* Hand the creator its handle to a just-created (and maybe just-named)
+ * object. If that fails after the name went in, the name is taken back out:
+ * nobody holds a handle, so nothing would ever close one and remove it, and
+ * the namespace's reference would keep a dead object and its name forever. */
+static uint64 nt_handle_out_new(object_t *obj, uint64 handle_out, int named) {
+    uint64 st;
+
+    if (named) {
+        ob_ref(obj);                  /* survive nt_handle_out's deref */
+    }
+    st = nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
+    if (named) {
+        if (st != STATUS_SUCCESS) {
+            (void)ns_remove_object(obj);
+        }
+        ob_deref(obj);
+    }
+    return st;
+}
+
+/* Open the object a name already names, if it is of class `klass`.
+ * NtOpenEvent, NtOpenMutant and NtOpenSemaphore, and the open half of an
+ * OBJ_OPENIF create.
+ *
+ * The TYPE is checked. Opening a semaphore as an event would otherwise hand
+ * back a handle whose SetEvent silently means ReleaseSemaphore - which is the
+ * failure the type registry exists to make impossible to write by accident. */
+static uint64 nt_open_by_name(const char *path, obj_class_t klass,
+                              uint64 handle_out) {
+    ns_entry_t *e = ns_lookup_entry(path);
+
+    if (e == NULL || e->kind != NS_OBJECT || e->object == NULL) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (e->object->type == NULL || e->object->type->klass != klass) {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    ob_ref(e->object);
+    return nt_handle_out(e->object, handle_out, ACCESS_READ | ACCESS_WRITE);
+}
+
+/* The open half of open-or-create. Returns STATUS_OBJECT_NAME_NOT_FOUND
+ * when the caller should go on and create; anything else is the answer.
+ *
+ * Looking before creating rather than creating and catching the collision
+ * matters for one type: a mutant created with InitialOwner is owned the
+ * moment it exists, and tearing down an owned mutant is an abandonment.
+ * There is no window between the look and the insert - NT syscalls run under
+ * the big kernel lock and nothing between them blocks. When the name exists,
+ * the create's other arguments (InitialOwner, InitialState, the counts) are
+ * IGNORED, as on NT: CreateMutexW(..., TRUE, name) on an existing mutex does
+ * not take it, which is why ERROR_ALREADY_EXISTS has to be checked. */
+static uint64 nt_open_if(const char *path, int named, uint32 attributes,
+                         obj_class_t klass, uint64 handle_out) {
+    uint64 st;
+
+    if (!named || !(attributes & OBJ_OPENIF)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    st = nt_open_by_name(path, klass, handle_out);
+    if (st == STATUS_SUCCESS) {
+        return STATUS_OBJECT_NAME_EXISTS;
+    }
+    return st;
 }
 
 /* NtQuerySecurityObject(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
@@ -661,13 +733,18 @@ static uint64 nt_create_event(uint64 handle_out, uint64 attrs_ptr,
     char path[NS_PATH_MAX];
     object_t *obj;
     uint64 st;
+    uint32 attributes = 0;
     int named = 0;
 
     if (!user_ptr_ok(handle_out)) {
         return STATUS_ACCESS_VIOLATION;
     }
-    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named)) {
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &attributes)) {
         return STATUS_INVALID_PARAMETER;
+    }
+    st = nt_open_if(path, named, attributes, OBJ_EVENT, handle_out);
+    if (st != STATUS_OBJECT_NAME_NOT_FOUND) {
+        return st;
     }
     /* NotificationEvent is manual-reset. The argument is a 32-bit enum
      * arriving in a 64-bit register, so it is masked - see nt_stack_arg on
@@ -682,34 +759,25 @@ static uint64 nt_create_event(uint64 handle_out, uint64 attrs_ptr,
         ob_deref(obj);
         return st;
     }
-    return nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
+    return nt_handle_out_new(obj, handle_out, named);
 }
 
-/* NtOpenEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES) */
-static uint64 nt_open_event(uint64 handle_out, uint64 attrs_ptr) {
+/* NtOpenEvent / NtOpenMutant / NtOpenSemaphore
+ * (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES) */
+static uint64 nt_open_named(uint64 handle_out, uint64 attrs_ptr,
+                            obj_class_t klass) {
     char path[NS_PATH_MAX];
-    ns_entry_t *e;
+    uint32 attributes = 0;
     int named = 0;
 
     if (!user_ptr_ok(handle_out)) {
         return STATUS_ACCESS_VIOLATION;
     }
-    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named) || !named) {
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &attributes) ||
+        !named) {
         return STATUS_INVALID_PARAMETER;
     }
-    e = ns_lookup_entry(path);
-    if (e == NULL || e->kind != NS_OBJECT || e->object == NULL) {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    /* The TYPE is checked. Opening a semaphore as an event would otherwise
-     * hand back a handle whose SetEvent silently means ReleaseSemaphore -
-     * which is the failure the type registry exists to make impossible to
-     * write by accident. */
-    if (e->object->type == NULL || e->object->type->klass != OBJ_EVENT) {
-        return STATUS_OBJECT_TYPE_MISMATCH;
-    }
-    ob_ref(e->object);
-    return nt_handle_out(e->object, handle_out, ACCESS_READ | ACCESS_WRITE);
+    return nt_open_by_name(path, klass, handle_out);
 }
 
 /* NtSetEvent / NtResetEvent (HANDLE, PLONG PreviousState) */
@@ -913,13 +981,18 @@ static uint64 nt_create_semaphore(uint64 handle_out, uint64 attrs_ptr,
     char path[NS_PATH_MAX];
     object_t *obj;
     uint64 st;
+    uint32 attributes = 0;
     int named = 0;
 
     if (!user_ptr_ok(handle_out)) {
         return STATUS_ACCESS_VIOLATION;
     }
-    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named)) {
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &attributes)) {
         return STATUS_INVALID_PARAMETER;
+    }
+    st = nt_open_if(path, named, attributes, OBJ_SEMAPHORE, handle_out);
+    if (st != STATUS_OBJECT_NAME_NOT_FOUND) {
+        return st;
     }
     obj = semaphore_create((int32)initial, (int32)maximum);
     if (obj == NULL) {
@@ -934,7 +1007,7 @@ static uint64 nt_create_semaphore(uint64 handle_out, uint64 attrs_ptr,
         ob_deref(obj);
         return st;
     }
-    return nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
+    return nt_handle_out_new(obj, handle_out, named);
 }
 
 /* NtReleaseSemaphore(HANDLE, LONG ReleaseCount, PLONG PreviousCount) */
@@ -970,13 +1043,18 @@ static uint64 nt_create_mutant(uint64 handle_out, uint64 attrs_ptr,
     char path[NS_PATH_MAX];
     object_t *obj;
     uint64 st;
+    uint32 attributes = 0;
     int named = 0;
 
     if (!user_ptr_ok(handle_out)) {
         return STATUS_ACCESS_VIOLATION;
     }
-    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named)) {
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &attributes)) {
         return STATUS_INVALID_PARAMETER;
+    }
+    st = nt_open_if(path, named, attributes, OBJ_MUTANT, handle_out);
+    if (st != STATUS_OBJECT_NAME_NOT_FOUND) {
+        return st;
     }
     obj = mutant_create((uint32)owned != 0);
     if (obj == NULL) {
@@ -987,7 +1065,7 @@ static uint64 nt_create_mutant(uint64 handle_out, uint64 attrs_ptr,
         ob_deref(obj);
         return st;
     }
-    return nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
+    return nt_handle_out_new(obj, handle_out, named);
 }
 
 /* NtReleaseMutant(HANDLE, PLONG PreviousCount) */
@@ -1416,7 +1494,16 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
 
         case NT_SYS_OPEN_EVENT:
             return nt_trace(frame->rax,
-                            nt_open_event(frame->r10, frame->r8));
+                            nt_open_named(frame->r10, frame->r8, OBJ_EVENT));
+
+        case NT_SYS_OPEN_MUTANT:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8, OBJ_MUTANT));
+
+        case NT_SYS_OPEN_SEMAPHORE:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8,
+                                          OBJ_SEMAPHORE));
 
         case NT_SYS_SET_EVENT:
             return nt_trace(frame->rax,

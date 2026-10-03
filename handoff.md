@@ -4,7 +4,7 @@
 see `FEATURES.md`; for why each decision was made, `ROADMAP.md` (item numbers
 are never renumbered — source comments cite them).*
 
-Last updated 2026-09-28 (phase 1 started). Repository: https://github.com/bubba510kevin/Genesis
+Last updated 2026-10-03 (phase 2 started: named NT objects). Repository: https://github.com/bubba510kevin/Genesis
 (branch `main`).
 
 ## What Genesis is, in one paragraph
@@ -149,10 +149,15 @@ A gap inventory, worked in the order phases 3-4 and real programs need it.
 The pieces already queued from earlier work belong here:
 
 **Finish item 14(a) — threads**
-- **Named mutexes**: `CreateMutexW` refuses a name today, because the other
-  half of the named form (opening the existing one, `ERROR_ALREADY_EXISTS`,
-  `OpenMutexW`) has no kernel path. `NtOpenEvent` in `kernel/exec/nt.c` is
-  the pattern for an `NtOpenMutant`.
+- **Named mutexes — DONE 2026-10-03** (kernel side, this repo): `OBJ_OPENIF`
+  on the three creates (`STATUS_OBJECT_NAME_EXISTS`), `NtOpenMutant` `0x2A`,
+  `NtOpenSemaphore` `0x2B`, and **temporary names** (a name goes with the
+  last handle - `OB_FLAG_TEMPORARY` in `object.h`). ROADMAP 16(k) has the
+  detail. **The userland half is a separate commit in Genesis-userland**
+  (ntdll stubs, kernel32 `CreateMutexW` with names / `OpenMutexW` /
+  `OpenEventW` / `OpenSemaphoreW`, sync.exe and wait.exe checks); land it,
+  then add `/bin/sync.exe` to `guest_run.py`'s default list (it prints a
+  tally only from that commit on).
 - **MAX_PROCESSES = 64** (`kernel/include/process.h`) is shared by processes,
   threads, kthreads and idle threads. Real Win32 programs with thread pools
   will hit it; the table is scanned linearly by the scheduler, so raising it
@@ -259,7 +264,7 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x28`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x2B`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick

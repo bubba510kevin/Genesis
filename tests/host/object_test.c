@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ns.h"
 #include "object.h"
 #include "typesk.h"
 
@@ -294,6 +295,62 @@ static void test_exhaustion(void) {
     ob_deref(o);
 }
 
+/* A temporary name (OB_FLAG_TEMPORARY, NT's default for a named object a
+ * program creates) lasts exactly as long as an open instance of the object:
+ * not the creator's reference, not a kernel reference, an OPEN. */
+static void test_temporary_name(void) {
+    const char *name = "\\BaseNamedObjects\\HostTempTest";
+    const char *keep = "\\BaseNamedObjects\\HostKeepTest";
+    object_t *o, *k, *found = NULL;
+    open_file_t *a, *b, *kf;
+
+    printf("\nobject: a temporary name lasts as long as an open instance\n");
+    ns_init();
+    (void)ns_mkdir("\\BaseNamedObjects");
+    destroy_calls = 0;
+
+    o = ob_create(&test_type, NULL);
+    check(ns_insert(name, o) == 0, "the name goes in");
+    ob_make_temporary(o);
+    a = of_open(o, ACCESS_READ);
+    ob_deref(o);                       /* the creator's handle holds it now */
+    check(o->handle_count == 1, "one open instance is counted");
+
+    /* A kernel reference - a waiter, say - is not a handle. */
+    ob_ref(o);
+    b = of_open(o, ACCESS_READ);       /* a second program opens it by name */
+    check(o->handle_count == 2, "a second open is counted");
+
+    of_deref(a);
+    check(ns_lookup(name, &found, NULL, 0) == 0 && found == o,
+          "the name survives while one instance is still open");
+    ob_deref(found);                   /* ns_lookup's reference */
+
+    of_deref(b);
+    check(ns_lookup_entry(name) == NULL,
+          "the last close removes the name");
+    check(destroy_calls == 0,
+          "and the object outlives it while a kernel reference remains");
+    ob_deref(o);
+    check(destroy_calls == 1, "then dies with that reference");
+
+    /* The same name is free for a new object, which is the point. */
+    o = ob_create(&test_type, NULL);
+    check(ns_insert(name, o) == 0, "the freed name can be taken again");
+    ns_remove(name);
+    ob_deref(o);
+
+    /* Without the flag a name is permanent - devices, \\ObjectTypes. */
+    k = ob_create(&test_type, NULL);
+    check(ns_insert(keep, k) == 0, "a permanent name goes in");
+    kf = of_open(k, ACCESS_READ);
+    ob_deref(k);
+    of_deref(kf);
+    check(ns_lookup_entry(keep) != NULL,
+          "and stays when its last instance closes");
+    ns_remove(keep);
+}
+
 int object_run_tests(void) {
     test_object_refcounts();
     test_open_instance_holds_object();
@@ -304,5 +361,6 @@ int object_run_tests(void) {
     test_clone_semantics();
     test_bad_indices();
     test_exhaustion();
+    test_temporary_name();
     return obj_failures;
 }

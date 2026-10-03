@@ -394,7 +394,7 @@ them - `SleepEx`, `WaitForSingleObjectEx`, `WaitForMultipleObjectsEx`
 (`WAIT_IO_COMPLETION`). Underneath, the kernel can hand a thread a full
 `CONTEXT` on its own stack and `NtContinue` puts every register back.
 
-**Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` (unnamed) and
+**Mutexes ✅** (2026-09-27): `CreateMutexW`/`CreateMutexA` and
 `ReleaseMutex`. A mutex whose owner thread dies holding it is **abandoned**:
 released, and the next `WaitForSingleObject` gets `WAIT_ABANDONED` once.
 
@@ -406,7 +406,18 @@ and one spinning in ring 3 on another CPU.
 wherever it is: running on another CPU, blocked in a wait, or suspended.
 Mutexes it held are abandoned.
 
-**Not yet:** named mutexes (`OpenMutex`).
+**Named objects ✅** (2026-10-03, phase 2 / ROADMAP 16(k)): events,
+semaphores and mutexes by name in `\BaseNamedObjects`. The kernel honours
+`OBJ_OPENIF` on `NtCreateEvent`/`NtCreateSemaphore`/`NtCreateMutant` (the
+existing object of the same type is opened, its create arguments ignored,
+`STATUS_OBJECT_NAME_EXISTS`; another type's name is
+`STATUS_OBJECT_TYPE_MISMATCH`) and has `NtOpenMutant`/`NtOpenSemaphore`
+(NT syscalls `0x2A`/`0x2B`) beside `NtOpenEvent`. Names are NT's
+**temporary** kind: the namespace entry goes when the last open instance
+closes (`OB_FLAG_TEMPORARY` and `handle_count` in `kernel/include/object.h`),
+so a single-instance program's mutex does not outlive it. The kernel32 side
+(`CreateMutexW` with a name and `ERROR_ALREADY_EXISTS`, `OpenMutexW`,
+`OpenEventW`, `OpenSemaphoreW`, A forms) is in Genesis-userland.
 
 ### Kernel threads ✅
 `kernel/proc/kthread.c`: schedulable threads that run only in the kernel, used
@@ -997,7 +1008,7 @@ and 4):
 
 | Step | What | Status |
 |---|---|---|
-| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads on every CPU, TLS, suspend/resume/terminate; named mutexes remain |
+| (a) | **Full multithreading** | 🟡 POSIX and Win32 threads on every CPU, TLS, suspend/resume/terminate, named mutexes; MAX_PROCESSES remains |
 | (b) | Dispatcher objects completed: waits blocking threads, APCs | ✅ |
 | (c) | Structured exception handling (x64 table-based) | ✅ C `__try`; C++ exceptions and stack overflow remain |
 | (d) | NT memory model: VirtualAlloc states, Section objects, a full PEB | ❌ |

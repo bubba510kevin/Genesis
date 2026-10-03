@@ -226,7 +226,23 @@ typedef struct object {
     const object_type_t *type;
     uint32 refcount;
     void  *body;        /* type-specific state */
+
+    /* Open instances (open_file_t) on this object - NT's HandleCount, as
+     * against refcount, which is its PointerCount. The two differ by every
+     * reference the kernel holds for itself: a waiter, the namespace entry.
+     * Only the first decides when a temporary name goes away. */
+    uint32 handle_count;
+    uint32 ob_flags;    /* OB_FLAG_* */
 } object_t;
+
+/* The object's name in the namespace is TEMPORARY, NT's default for a named
+ * object a program creates: when the last open instance closes, every name
+ * that reaches it is removed (and with it the namespace's reference). Without
+ * it a named mutex outlives the process that made it until reboot, and the
+ * next run of a single-instance program finds "another copy is running" -
+ * ERROR_ALREADY_EXISTS from a mutex nobody holds a handle to. Objects the
+ * kernel names for itself (devices, \ObjectTypes) stay permanent. */
+#define OB_FLAG_TEMPORARY   0x1u
 
 /* One open instance: position, access mode and status flags. Refcounted
  * because dup shares it and close must not tear it down while another
@@ -272,6 +288,12 @@ void ob_ref(object_t *obj);
 
 /* Drop a reference; destroys at zero. */
 void ob_deref(object_t *obj);
+
+/* Mark obj's namespace name(s) temporary - see OB_FLAG_TEMPORARY. Called
+ * after the name is inserted and before the creator's handle is opened;
+ * an object with no open instance when it is marked keeps its name until
+ * one is opened and closed. */
+void ob_make_temporary(object_t *obj);
 
 /* Is this object a directory?
  *
