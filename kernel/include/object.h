@@ -138,7 +138,11 @@ typedef enum {
     /* NT's keyed event and I/O completion port (kernel/include/ntsync.h):
      * blocked on through their own calls, never through a wait. */
     OBJ_KEYED_EVENT,
-    OBJ_IO_COMPLETION
+    OBJ_IO_COMPLETION,
+
+    /* An NT section: memory that can be mapped as views, backed by the
+     * pagefile or by a file (kernel/include/section.h). */
+    OBJ_SECTION
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

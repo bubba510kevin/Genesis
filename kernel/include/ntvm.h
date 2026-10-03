@@ -1,6 +1,7 @@
 #ifndef NTVM_H
 #define NTVM_H
 
+#include "object.h"
 #include "paging.h"
 #include "typesk.h"
 
@@ -75,6 +76,18 @@ uint32 ntvm_query(address_space_t *as, uint64 addr, ntvm_mbi_t *out,
  * guard page - the guard is now cleared, and the caller raises
  * STATUS_GUARD_PAGE_VIOLATION - and 0 otherwise. */
 int ntvm_guard_fault(address_space_t *as, uint64 addr);
+
+/* Map a view of `section` (section.h): `offset` 64KB aligned, *view_size 0
+ * for the rest of the section, *base 0 to let ntvm place it (MEM_TOP_DOWN
+ * in `type` from the top). The view's protection must be one the section
+ * allows. NtUnmapViewOfSection takes any address inside the view. */
+uint32 ntvm_map_view(address_space_t *as, object_t *section, uint64 *base,
+                     uint64 offset, uint64 *view_size, uint32 protect,
+                     uint32 type);
+uint32 ntvm_unmap_view(address_space_t *as, uint64 addr);
+/* FlushViewOfFile: write the range of a view of a file-backed section back
+ * to its file. *size 0 for the rest of the view. */
+uint32 ntvm_flush(address_space_t *as, uint64 *base, uint64 *size);
 
 /* Drop the run list (the frames go with the address space itself). */
 void ntvm_destroy(address_space_t *as);

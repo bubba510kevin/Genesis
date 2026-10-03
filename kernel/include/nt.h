@@ -303,6 +303,26 @@ struct syscall_frame;
 #define NT_SYS_PROTECT_VIRTUAL       0x37
 #define NT_SYS_QUERY_VIRTUAL         0x38
 
+/* --- sections and views (ROADMAP 16(l), kernel/include/section.h) ---------
+ * NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+ *                 PLARGE_INTEGER MaximumSize, ULONG PageProtection,
+ *                 ULONG AllocationAttributes, HANDLE FileHandle)
+ * NtOpenSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)
+ * NtMapViewOfSection(HANDLE Section, HANDLE Process, PVOID *Base,
+ *                    ULONG_PTR ZeroBits, SIZE_T CommitSize,
+ *                    PLARGE_INTEGER Offset, PSIZE_T ViewSize, ULONG Inherit,
+ *                    ULONG AllocationType, ULONG Protect)
+ * NtUnmapViewOfSection(HANDLE Process, PVOID Base)
+ * NtFlushVirtualMemory(HANDLE Process, PVOID *Base, PSIZE_T Size,
+ *                      PIO_STATUS_BLOCK)
+ * 0x3E and 0x3F are kept for NtSuspendProcess/NtResumeProcess; 0x40 up is
+ * the display/input range, so the next core call after those is 0x80. */
+#define NT_SYS_CREATE_SECTION        0x39
+#define NT_SYS_OPEN_SECTION          0x3A
+#define NT_SYS_MAP_VIEW              0x3B
+#define NT_SYS_UNMAP_VIEW            0x3C
+#define NT_SYS_FLUSH_VIRTUAL         0x3D
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -396,6 +416,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004u
 #define STATUS_INVALID_INFO_CLASS 0xC0000003u
 #define STATUS_NOT_SUPPORTED      0xC00000BBu
+#define STATUS_INVALID_PARAMETER_4 0xC00000F2u
 #define STATUS_INSUFFICIENT_RESOURCES 0xC000009Au
 #define STATUS_NO_YIELD_PERFORMED 0x40000024u
 #define STATUS_ALERTED            0x00000101u

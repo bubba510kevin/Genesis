@@ -2,7 +2,9 @@
 #include "nt.h"
 #include "ntvm.h"
 #include "paging.h"
+#include "object.h"
 #include "pmm.h"
+#include "section.h"
 #include "typesk.h"
 
 /* See ntvm.h. Everything runs under the big kernel lock. */
@@ -18,6 +20,9 @@ typedef struct {
     uint32 protect;          /* PAGE_* without PAGE_GUARD; 0 when reserved   */
     uint8  committed;
     uint8  guard;
+    uint32 type;             /* MEM_PRIVATE, or MEM_MAPPED for a view        */
+    object_t *section;       /* a view's section (one reference per view)    */
+    uint64 view_offset;      /* where the view's first page is in it          */
 } run_t;
 
 typedef struct {
@@ -53,6 +58,14 @@ void ntvm_destroy(address_space_t *as) {
 
     if (vm == NULL) {
         return;
+    }
+    /* Each view holds one reference on its section: dropped here, once per
+     * view (at the run that starts it), before the space's frames go. */
+    for (int i = 0; i < vm->n; i++) {
+        if (vm->runs[i].type == MEM_MAPPED &&
+            vm->runs[i].start == vm->runs[i].alloc_base) {
+            ob_deref(vm->runs[i].section);
+        }
     }
     if (vm->runs != NULL) {
         kfree(vm->runs);
@@ -148,7 +161,8 @@ static int split_at(ntvm_t *vm, uint64 addr) {
 static int same(const run_t *a, const run_t *b) {
     return run_end(a) == b->start && a->alloc_base == b->alloc_base &&
            a->committed == b->committed && a->protect == b->protect &&
-           a->guard == b->guard;
+           a->guard == b->guard && a->type == b->type &&
+           a->section == b->section;
 }
 
 static void coalesce(ntvm_t *vm) {
@@ -207,6 +221,23 @@ static int valid_protect(uint32 p, int allow_noaccess_guard) {
 
 /* The PTE for a committed page. NOACCESS and guard pages stay present for
  * the kernel and invisible to ring 3 - see ntvm.h. */
+static uint64 pte_flags(uint32 protect, int guard);
+
+/* ...for a page of a VIEW: the same, except that WRITECOPY means what it
+ * says. The section's frame is mapped read-only with PAGE_COW, and the
+ * first write takes a private copy through the ordinary copy-on-write fault
+ * (vmm_handle_write_fault) - the frame has the section's reference as well
+ * as this one, so it is always shared and always copied. */
+static uint64 view_pte_flags(uint32 protect, int guard) {
+    uint64 f = pte_flags(protect, guard);
+
+    if ((protect & 0xFFu) == PAGE_WRITECOPY ||
+        (protect & 0xFFu) == PAGE_EXECUTE_WRITECOPY) {
+        f = (f & ~(uint64)PAGE_RW) | PAGE_COW;
+    }
+    return f;
+}
+
 static uint64 pte_flags(uint32 protect, int guard) {
     uint64 f = PAGE_PRESENT;
 
@@ -248,6 +279,29 @@ static uint32 protect_of_pte(uint64 flags) {
         return w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
     }
     return w ? PAGE_READWRITE : PAGE_READONLY;
+}
+
+/* Can a view of `section` have `protect`? Writing needs a writable
+ * section, executing an executable one; copy-on-write needs only read. */
+static int view_protect_ok(object_t *section, uint32 protect) {
+    uint64 size;
+    uint32 sp, p = protect & 0xFFu;
+    int s_write, s_exec;
+
+    if (section_info(section, &size, &sp) != 0) {
+        return 0;
+    }
+    s_write = sp == PAGE_READWRITE || sp == PAGE_EXECUTE_READWRITE;
+    s_exec  = sp == PAGE_EXECUTE_READ || sp == PAGE_EXECUTE_READWRITE ||
+              sp == PAGE_EXECUTE_WRITECOPY;
+    if ((p == PAGE_READWRITE || p == PAGE_EXECUTE_READWRITE) && !s_write) {
+        return 0;
+    }
+    if ((p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+              PAGE_EXECUTE_WRITECOPY)) && !s_exec) {
+        return 0;
+    }
+    return 1;
 }
 
 /* --- commit and decommit ------------------------------------------------------ */
@@ -468,6 +522,9 @@ uint32 ntvm_allocate(address_space_t *as, uint64 *base, uint64 *size,
         r.protect = 0;
         r.committed = 0;
         r.guard = 0;
+        r.type = MEM_PRIVATE;
+        r.section = NULL;
+        r.view_offset = 0;
         for (i = 0; i < vm->n && vm->runs[i].start < start; i++) {
         }
         if (!insert_at(vm, i, &r)) {
@@ -523,6 +580,9 @@ uint32 ntvm_free(address_space_t *as, uint64 *base, uint64 *size,
     i = find(vm, *base);
     if (i < 0) {
         return STATUS_MEMORY_NOT_ALLOCATED;
+    }
+    if (vm->runs[i].type == MEM_MAPPED) {
+        return 0xC000001Bu;          /* STATUS_UNABLE_TO_DELETE_SECTION */
     }
 
     if (type == MEM_RELEASE) {
@@ -605,6 +665,10 @@ uint32 ntvm_protect(address_space_t *as, uint64 *base, uint64 *size,
     }
     i = find(vm, start);
     *old_protect = vm->runs[i].protect | (vm->runs[i].guard ? PAGE_GUARD : 0);
+    if (vm->runs[i].type == MEM_MAPPED &&
+        !view_protect_ok(vm->runs[i].section, new_protect)) {
+        return 0xC000004Eu;          /* STATUS_SECTION_PROTECTION */
+    }
 
     if (!split_at(vm, start) || !split_at(vm, end)) {
         return STATUS_NO_MEMORY;
@@ -618,13 +682,18 @@ uint32 ntvm_protect(address_space_t *as, uint64 *base, uint64 *size,
         }
     }
     /* The same frames, new flags. */
-    for (a = start; a < end; a += PAGE) {
-        phys_addr_t f = vmm_get_phys_in(as, a);
+    {
+        int mapped = vm->runs[find(vm, start)].type == MEM_MAPPED;
 
-        if (f != 0) {
-            (void)vmm_map_page_in(as, a, f & ~0xFFFULL,
-                                  pte_flags(new_protect,
-                                            (new_protect & PAGE_GUARD) != 0));
+        for (a = start; a < end; a += PAGE) {
+            phys_addr_t f = vmm_get_phys_in(as, a);
+            int guard = (new_protect & PAGE_GUARD) != 0;
+
+            if (f != 0) {
+                (void)vmm_map_page_in(as, a, f & ~0xFFFULL,
+                                      mapped ? view_pte_flags(new_protect, guard)
+                                             : pte_flags(new_protect, guard));
+            }
         }
     }
     coalesce(vm);
@@ -657,7 +726,7 @@ uint32 ntvm_query(address_space_t *as, uint64 addr, ntvm_mbi_t *out,
         out->state = r->committed ? MEM_COMMIT : MEM_RESERVE;
         out->protect = r->committed ? (r->protect | (r->guard ? PAGE_GUARD : 0))
                                     : 0;
-        out->type = MEM_PRIVATE;
+        out->type = r->type;
         return STATUS_SUCCESS;
     }
 
@@ -755,8 +824,142 @@ int ntvm_guard_fault(address_space_t *as, uint64 addr) {
     f = vmm_get_phys_in(as, page);
     if (f != 0) {
         (void)vmm_map_page_in(as, page, f & ~0xFFFULL,
-                              pte_flags(vm->runs[i].protect, 0));
+                              vm->runs[i].type == MEM_MAPPED
+                                  ? view_pte_flags(vm->runs[i].protect, 0)
+                                  : pte_flags(vm->runs[i].protect, 0));
     }
     coalesce(vm);
     return 1;
+}
+
+/* --- views of sections ------------------------------------------------------------ */
+
+uint32 ntvm_map_view(address_space_t *as, object_t *section, uint64 *base,
+                     uint64 offset, uint64 *view_size, uint32 protect,
+                     uint32 type) {
+    ntvm_t *vm = vm_of(as, 1);
+    uint64 sec_size, size, start, k;
+    uint32 sec_protect;
+    run_t r;
+    int i;
+
+    if (vm == NULL) {
+        return STATUS_NO_MEMORY;
+    }
+    if (section_info(section, &sec_size, &sec_protect) != 0) {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    if ((offset & (NTVM_GRANULARITY - 1)) != 0 || offset >= sec_size) {
+        return 0xC0000041u;            /* STATUS_MAPPED_ALIGNMENT */
+    }
+    if (!valid_protect(protect, 0)) {
+        return STATUS_INVALID_PAGE_PROTECTION;
+    }
+    if (!view_protect_ok(section, protect)) {
+        return 0xC000004Eu;            /* STATUS_SECTION_PROTECTION */
+    }
+    size = *view_size != 0 ? *view_size : sec_size - offset;
+    if (offset + size > sec_size) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    size = (size + PAGE - 1) & ~(PAGE - 1);
+
+    if (*base != 0) {
+        start = *base & ~(NTVM_GRANULARITY - 1);
+        if (start + size > NTVM_USER_TOP || !range_free(as, vm, start,
+                                                         start + size)) {
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
+    } else {
+        start = place(as, vm, size, (type & MEM_TOP_DOWN) != 0);
+        if (start == 0) {
+            return STATUS_NO_MEMORY;
+        }
+    }
+
+    for (k = 0; k < size / PAGE; k++) {
+        phys_addr_t f = section_frame(section, offset / PAGE + k);
+
+        pmm_ref_frame(f);
+        if (f == 0 || !vmm_map_page_in(as, start + k * PAGE, f,
+                                       view_pte_flags(protect,
+                                                      (protect & PAGE_GUARD) != 0))) {
+            if (f != 0) {
+                pmm_free_frame(f);
+            }
+            while (k-- > 0) {
+                vmm_unmap_page_in(as, start + k * PAGE, VMM_FREE_FRAME);
+            }
+            return STATUS_NO_MEMORY;
+        }
+    }
+    r.start = start;
+    r.pages = size / PAGE;
+    r.alloc_base = start;
+    r.alloc_size = size;
+    r.alloc_protect = protect;
+    r.protect = protect & ~PAGE_GUARD;
+    r.committed = 1;
+    r.guard = (protect & PAGE_GUARD) != 0;
+    r.type = MEM_MAPPED;
+    r.section = section;
+    r.view_offset = offset;
+    for (i = 0; i < vm->n && vm->runs[i].start < start; i++) {
+    }
+    if (!insert_at(vm, i, &r)) {
+        unmap_range(as, start, size / PAGE);
+        return STATUS_NO_MEMORY;
+    }
+    ob_ref(section);                    /* the view's reference */
+    *base = start;
+    *view_size = size;
+    return STATUS_SUCCESS;
+}
+
+uint32 ntvm_unmap_view(address_space_t *as, uint64 addr) {
+    ntvm_t *vm = vm_of(as, 0);
+    object_t *section;
+    uint64 ab;
+    int i = find(vm, addr);
+
+    if (i < 0 || vm->runs[i].type != MEM_MAPPED) {
+        return 0xC0000019u;            /* STATUS_NOT_MAPPED_VIEW */
+    }
+    ab = vm->runs[i].alloc_base;
+    section = vm->runs[i].section;
+    for (i = 0; i < vm->n; ) {
+        if (vm->runs[i].alloc_base == ab) {
+            unmap_range(as, vm->runs[i].start, vm->runs[i].pages);
+            remove_at(vm, i);
+        } else {
+            i++;
+        }
+    }
+    ob_deref(section);
+    return STATUS_SUCCESS;
+}
+
+uint32 ntvm_flush(address_space_t *as, uint64 *base, uint64 *size) {
+    ntvm_t *vm = vm_of(as, 0);
+    uint64 start, end, sec_off;
+    int i = find(vm, *base);
+
+    if (i < 0 || vm->runs[i].type != MEM_MAPPED) {
+        return 0xC0000019u;            /* STATUS_NOT_MAPPED_VIEW */
+    }
+    start = *base & ~(PAGE - 1);
+    end = *size == 0 ? vm->runs[i].alloc_base + vm->runs[i].alloc_size
+                     : (*base + *size + PAGE - 1) & ~(PAGE - 1);
+    if (end > vm->runs[i].alloc_base + vm->runs[i].alloc_size) {
+        end = vm->runs[i].alloc_base + vm->runs[i].alloc_size;
+    }
+    sec_off = vm->runs[i].view_offset;
+    if (section_flush(vm->runs[i].section,
+                      sec_off + (start - vm->runs[i].alloc_base),
+                      end - start) != 0) {
+        return 0xC0000185u;            /* STATUS_IO_DEVICE_ERROR */
+    }
+    *base = start;
+    *size = end - start;
+    return STATUS_SUCCESS;
 }

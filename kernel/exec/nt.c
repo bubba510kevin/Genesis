@@ -9,6 +9,7 @@
 #include "ntsec.h"
 #include "ntsync.h"
 #include "ntvm.h"
+#include "section.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -1433,6 +1434,136 @@ static uint64 nt_query_io_completion(uint64 handle, uint64 klass,
     return STATUS_SUCCESS;
 }
 
+/* --- sections and views (ROADMAP 16(l)) --------------------------------------
+ *
+ * The object is kernel/mm/section.c, the views kernel/mm/ntvm.c. */
+
+/* NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+ *                 PLARGE_INTEGER MaximumSize, ULONG SectionPageProtection,
+ *                 ULONG AllocationAttributes, HANDLE FileHandle) */
+static uint64 nt_create_section(uint64 handle_out, uint64 attrs_ptr,
+                                uint64 size_ptr, uint64 protect,
+                                uint64 attributes, uint64 file_handle) {
+    process_t *p = proc_current();
+    char path[NS_PATH_MAX];
+    object_t *file = NULL, *obj;
+    uint64 size = 0, st;
+    uint32 oattr = 0, status = 0;
+    int named = 0, writable = 0;
+
+    if (!user_ptr_ok(handle_out)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!nt_attrs_name(attrs_ptr, path, sizeof(path), &named, &oattr)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((uint32)attributes & SEC_IMAGE) {
+        return STATUS_NOT_SUPPORTED;    /* the PE loader maps images itself */
+    }
+    if (size_ptr != 0) {
+        if (!user_range_ok(size_ptr, 8)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        size = *(const uint64 *)size_ptr;
+    }
+    if (file_handle != 0) {
+        int index = nt_handle_index(file_handle);
+        open_file_t *of = index >= 0 ? handle_get(p->handles, index) : NULL;
+
+        if (of == NULL || of->obj == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+        file = of->obj;
+        writable = (of->access & ACCESS_WRITE) != 0;
+    } else if (size == 0) {
+        return STATUS_INVALID_PARAMETER_4;   /* a pagefile section needs one */
+    }
+    st = nt_open_if(path, named, oattr, OBJ_SECTION, handle_out);
+    if (st != STATUS_OBJECT_NAME_NOT_FOUND) {
+        return st;
+    }
+    obj = section_create(size, (uint32)protect, file, writable, &status);
+    if (obj == NULL) {
+        return status;
+    }
+    st = nt_name_new(obj, path, named);
+    if (st != STATUS_SUCCESS) {
+        ob_deref(obj);
+        return st;
+    }
+    return nt_handle_out_new(obj, handle_out, named);
+}
+
+/* NtMapViewOfSection(HANDLE Section, HANDLE Process, PVOID *Base,
+ *                    ULONG_PTR ZeroBits, SIZE_T CommitSize,
+ *                    PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize,
+ *                    SECTION_INHERIT, ULONG AllocationType, ULONG Protect) */
+static uint64 nt_map_view(uint64 section, uint64 process, uint64 base_ptr,
+                          uint64 offset_ptr, uint64 size_ptr, uint64 type,
+                          uint64 protect) {
+    object_t *obj = nt_object_of(section);
+    uint64 base, offset = 0, size;
+    uint32 st;
+
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (obj->type == NULL || obj->type->klass != OBJ_SECTION) {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    if (!user_range_ok(base_ptr, 8) || !user_range_ok(size_ptr, 8) ||
+        (offset_ptr != 0 && !user_range_ok(offset_ptr, 8))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    base = *(const uint64 *)base_ptr;
+    size = *(const uint64 *)size_ptr;
+    if (offset_ptr != 0) {
+        offset = *(const uint64 *)offset_ptr;
+    }
+    st = ntvm_map_view(proc_current()->space, obj, &base, offset, &size,
+                       (uint32)protect, (uint32)type);
+    if (st == STATUS_SUCCESS) {
+        *(uint64 *)base_ptr = base;
+        *(uint64 *)size_ptr = size;
+    }
+    return st;
+}
+
+static uint64 nt_unmap_view(uint64 process, uint64 base) {
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    return ntvm_unmap_view(proc_current()->space, base);
+}
+
+/* NtFlushVirtualMemory(HANDLE, PVOID *Base, PSIZE_T Size, PIO_STATUS_BLOCK) */
+static uint64 nt_flush_virtual(uint64 process, uint64 base_ptr,
+                               uint64 size_ptr, uint64 iosb_ptr) {
+    uint64 base, size;
+    uint32 st;
+
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!user_range_ok(base_ptr, 8) || !user_range_ok(size_ptr, 8) ||
+        !user_range_ok(iosb_ptr, sizeof(nt_io_status_block_t))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    base = *(const uint64 *)base_ptr;
+    size = *(const uint64 *)size_ptr;
+    st = ntvm_flush(proc_current()->space, &base, &size);
+    ((nt_io_status_block_t *)iosb_ptr)->status = st;
+    ((nt_io_status_block_t *)iosb_ptr)->information = 0;
+    if (st == STATUS_SUCCESS) {
+        *(uint64 *)base_ptr = base;
+        *(uint64 *)size_ptr = size;
+    }
+    return st;
+}
+
 /* --- threads (ROADMAP item 14(a)) -------------------------------------------
  *
  * See NT_SYS_CREATE_THREAD in nt.h for the contract and the one register
@@ -1835,6 +1966,49 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
                             nt_protect_virtual(frame->r10, frame->rdx,
                                                frame->r8, frame->r9, old));
         }
+
+        case NT_SYS_CREATE_SECTION: {
+            uint64 protect = 0, attributes = 0, file = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &protect) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 6, &attributes) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 7, &file)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_create_section(frame->r10, frame->r8, frame->r9,
+                                              protect, attributes, file));
+        }
+
+        case NT_SYS_OPEN_SECTION:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8, OBJ_SECTION));
+
+        case NT_SYS_MAP_VIEW: {
+            uint64 offset = 0, size = 0, type = 0, protect = 0;
+
+            /* Section, Process, *Base, ZeroBits in registers; CommitSize (5)
+             * is not needed - every view is committed - and Inherit (8) has
+             * no meaning without child processes. */
+            if (!nt_stack_arg(syscall_get_user_rsp(), 6, &offset) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 7, &size) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 9, &type) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 10, &protect)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_map_view(frame->r10, frame->rdx, frame->r8,
+                                        offset, size, type, protect));
+        }
+
+        case NT_SYS_UNMAP_VIEW:
+            return nt_trace(frame->rax,
+                            nt_unmap_view(frame->r10, frame->rdx));
+
+        case NT_SYS_FLUSH_VIRTUAL:
+            return nt_trace(frame->rax,
+                            nt_flush_virtual(frame->r10, frame->rdx,
+                                             frame->r8, frame->r9));
 
         case NT_SYS_QUERY_VIRTUAL: {
             uint64 buf = 0, len = 0, retlen = 0;
