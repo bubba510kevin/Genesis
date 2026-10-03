@@ -92,6 +92,18 @@ void process_object_exited(object_t *obj, uint32 exit_code, uint64 cpu_ticks);
 int process_object_query(object_t *obj, int *pid, uint32 *exit_code,
                          uint64 *cpu_ticks);
 
+/* NT timers (NtCreateTimer): `manual` is NotificationTimer (stays signalled
+ * until set again) vs SynchronizationTimer (one waiter per expiry).
+ * timer_set arms for `due_ns` on the monotonic clock (timer_ns), repeating
+ * every `period_ns` if not 0, resets the state, and queues `apc_routine` to
+ * the calling thread at each expiry when it is not 0. All three return 0
+ * or -EINVAL for a non-timer; the state before the call comes back. */
+object_t *timer_create(int manual);
+int timer_set(object_t *obj, uint64 due_ns, uint64 period_ns,
+              uint64 apc_routine, uint64 apc_ctx, int *was_signalled);
+int timer_cancel(object_t *obj, int *was_signalled);
+int timer_query(object_t *obj, uint64 *remaining_ns, int *signalled);
+
 int dispatch_create_named(const char *name, object_t *obj);
 
 /* Thread `pid` has died: every mutant it still owns is released and marked

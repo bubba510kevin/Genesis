@@ -1306,6 +1306,130 @@ static uint64 nt_create_simple(uint64 handle_out, uint64 attrs_ptr,
     return nt_handle_out_new(obj, handle_out, named);
 }
 
+/* --- NT timers -------------------------------------------------------------
+ *
+ * The object is a dispatcher (kernel/obj/dispatch.c, timer_create); this is
+ * the marshalling. Times: a NEGATIVE DueTime is relative, in 100ns units; a
+ * positive one is an absolute system time (100ns since 1601), converted to
+ * the monotonic clock when the timer is set. */
+
+static object_t *make_timer(uint32 type) {
+    return timer_create(type == 0);      /* NotificationTimer is manual */
+}
+
+static uint64 nt_create_timer(uint64 handle_out, uint64 attrs_ptr,
+                              uint64 type) {
+    if (type > 1) {
+        return STATUS_INVALID_PARAMETER_4;
+    }
+    return nt_create_simple(handle_out, attrs_ptr, OBJ_TIMER, make_timer,
+                            (uint32)type);
+}
+
+static object_t *nt_timer_of(uint64 handle, uint64 *st) {
+    object_t *obj = nt_object_of(handle);
+
+    if (obj == NULL) {
+        *st = STATUS_INVALID_HANDLE;
+        return NULL;
+    }
+    if (obj->type == NULL || obj->type->klass != OBJ_TIMER) {
+        *st = STATUS_OBJECT_TYPE_MISMATCH;
+        return NULL;
+    }
+    return obj;
+}
+
+static uint64 nt_set_timer(uint64 handle, uint64 due_ptr, uint64 apc,
+                           uint64 apc_ctx, uint64 period_ms,
+                           uint64 prev_ptr) {
+    uint64 st = STATUS_SUCCESS, now = timer_ns(), due;
+    object_t *obj = nt_timer_of(handle, &st);
+    int64 v;
+    int was = 0;
+
+    if (obj == NULL) {
+        return st;
+    }
+    if (!user_range_ok(due_ptr, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if ((int32)period_ms < 0) {
+        return STATUS_INVALID_PARAMETER_6;
+    }
+    if (prev_ptr != 0 && !user_range_ok(prev_ptr, 1)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    v = *(const int64 *)due_ptr;
+    if (v < 0) {
+        due = now + (uint64)(-v) * 100ULL;
+    } else {
+        /* FILETIME -> ns since 1970 -> monotonic. Anything before boot is
+         * already due. */
+        uint64 epoch = 116444736000000000ULL;
+        uint64 boot = timer_realtime_ns() - now;      /* wall clock at boot */
+        uint64 wall = ((uint64)v > epoch) ? ((uint64)v - epoch) * 100ULL : 0;
+
+        due = (wall > boot) ? wall - boot : 1;
+    }
+    if (timer_set(obj, due, (uint64)(uint32)period_ms * 1000000ULL, apc,
+                  apc_ctx, &was) != 0) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (prev_ptr != 0) {
+        *(uint8 *)prev_ptr = (uint8)(was != 0);
+    }
+    return STATUS_SUCCESS;
+}
+
+static uint64 nt_cancel_timer(uint64 handle, uint64 state_ptr) {
+    uint64 st = STATUS_SUCCESS;
+    object_t *obj = nt_timer_of(handle, &st);
+    int was = 0;
+
+    if (obj == NULL) {
+        return st;
+    }
+    if (state_ptr != 0 && !user_range_ok(state_ptr, 1)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    (void)timer_cancel(obj, &was);
+    if (state_ptr != 0) {
+        *(uint8 *)state_ptr = (uint8)(was != 0);
+    }
+    return STATUS_SUCCESS;
+}
+
+/* NtQueryTimer, TimerBasicInformation (class 0): { LARGE_INTEGER
+ * RemainingTime (100ns); BOOLEAN TimerState } - 16 bytes with padding. */
+static uint64 nt_query_timer(uint64 handle, uint64 klass, uint64 buf,
+                             uint64 len, uint64 ret_ptr) {
+    uint64 st = STATUS_SUCCESS, rem = 0;
+    object_t *obj = nt_timer_of(handle, &st);
+    int sig = 0;
+
+    if (obj == NULL) {
+        return st;
+    }
+    if (klass != 0) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if (len != 16) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_range_ok(buf, 16) ||
+        (ret_ptr != 0 && !user_range_ok(ret_ptr, 4))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    (void)timer_query(obj, &rem, &sig);
+    *(int64 *)buf = (int64)(rem / 100ULL);
+    *(uint64 *)(buf + 8) = (uint64)(sig != 0);
+    if (ret_ptr != 0) {
+        *(uint32 *)ret_ptr = 16;
+    }
+    return STATUS_SUCCESS;
+}
+
 static object_t *make_keyed_event(uint32 unused) {
     (void)unused;
     return keyed_event_create();
@@ -2649,6 +2773,40 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
             return nt_trace(frame->rax,
                             reg_query_key(frame->r10, frame->rdx, frame->r8,
                                           frame->r9, ret));
+        }
+
+        case NT_SYS_CREATE_TIMER:
+            return nt_trace(frame->rax,
+                            nt_create_timer(frame->r10, frame->r8, frame->r9));
+
+        case NT_SYS_OPEN_TIMER:
+            return nt_trace(frame->rax,
+                            nt_open_named(frame->r10, frame->r8, OBJ_TIMER));
+
+        case NT_SYS_SET_TIMER: {
+            /* ResumeTimer (5) is ignored: there is no power management to
+             * wake from. Period (6) and PreviousState (7) are on the
+             * stack. */
+            uint64 period = 0, prev = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 6, &period);
+            (void)nt_stack_arg(syscall_get_user_rsp(), 7, &prev);
+            return nt_trace(frame->rax,
+                            nt_set_timer(frame->r10, frame->rdx, frame->r8,
+                                         frame->r9, period, prev));
+        }
+
+        case NT_SYS_CANCEL_TIMER:
+            return nt_trace(frame->rax,
+                            nt_cancel_timer(frame->r10, frame->rdx));
+
+        case NT_SYS_QUERY_TIMER: {
+            uint64 ret = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &ret);
+            return nt_trace(frame->rax,
+                            nt_query_timer(frame->r10, frame->rdx, frame->r8,
+                                           frame->r9, ret));
         }
 
         case NT_SYS_FLUSH_KEY:

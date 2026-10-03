@@ -446,6 +446,13 @@ ports (`NtCreateIoCompletion`, `NtSetIoCompletion`,
 `GetQueuedCompletionStatus(Ex)`, alertable included). Not yet: a file
 associated with a port (needs overlapped I/O), the concurrency limit.
 
+**Waitable timers ✅** (2026-10-03, ROADMAP 16(k)): `NtCreateTimer`,
+`NtOpenTimer`, `NtSetTimer`, `NtCancelTimer`, `NtQueryTimer`; kernel32's
+`CreateWaitableTimer(Ex)`, `OpenWaitableTimer`, `SetWaitableTimer(Ex)`,
+`CancelWaitableTimer`. Notification and synchronization timers, relative
+and absolute due times, periods, names, and the completion routine as an
+APC to the setting thread. Resolution is one tick (10ms).
+
 **Named objects ✅** (2026-10-03, phase 2 / ROADMAP 16(k)): events,
 semaphores and mutexes by name in `\BaseNamedObjects`. The kernel honours
 `OBJ_OPENIF` on `NtCreateEvent`/`NtCreateSemaphore`/`NtCreateMutant` (the

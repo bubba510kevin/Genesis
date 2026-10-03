@@ -1,5 +1,7 @@
 #include "dispatch.h"
 #include "kprintf.h"
+#include "ktimer.h"
+#include "nt_context.h"
 #include "ns.h"
 #include "object.h"
 #include "process.h"
@@ -29,7 +31,8 @@ typedef enum {
     D_SEMAPHORE,
     D_MUTANT,
     D_THREAD,
-    D_PROCESS            /* the same shape as D_THREAD: tid holds the pid */
+    D_PROCESS,           /* the same shape as D_THREAD: tid holds the pid */
+    D_TIMER              /* an event the tick sets: `manual` is the type */
 } disp_kind_t;
 
 typedef struct dispatcher {
@@ -62,6 +65,16 @@ typedef struct dispatcher {
      * to a finished thread, whose process slot is long gone. */
     uint64       cpu_ticks;
 
+    /* Timer (NtCreateTimer). `kt` fires at the due tick and sets
+     * `signalled`; `period_ns` re-arms it; `due_ns` is monotonic, 0 when not
+     * set. The APC, when SetWaitableTimer gave one, goes to `apc_tid`. */
+    ktimer_t     kt;
+    uint64       due_ns;
+    uint64       period_ns;
+    uint64       apc_routine;
+    uint64       apc_ctx;
+    int          apc_tid;
+
     wait_queue_t q;
 } dispatcher_t;
 
@@ -85,6 +98,14 @@ static dispatcher_t *disp_alloc(disp_kind_t kind) {
             d->abandoned = 0;
             d->tid       = 0;
             d->exit_code = 0;
+            d->due_ns    = 0;
+            d->period_ns = 0;
+            d->apc_routine = 0;
+            d->apc_ctx   = 0;
+            d->apc_tid   = 0;
+            d->kt.armed  = 0;
+            d->kt.next   = 0;
+            d->kt.fired_at = 0;
             waitq_init(&d->q);
             return d;
         }
@@ -109,6 +130,7 @@ static int caller_id(void) {
 static int disp_ready(const dispatcher_t *d, int who) {
     switch (d->kind) {
     case D_EVENT:
+    case D_TIMER:
         return d->signalled;
     case D_SEMAPHORE:
         return d->count > 0;
@@ -137,6 +159,7 @@ static int disp_consume(dispatcher_t *d, int who) {
 
     switch (d->kind) {
     case D_EVENT:
+    case D_TIMER:
         /* A notification event stays set - that is what "notification" means,
          * and it is why every waiter is released by one signal. A
          * synchronisation event auto-resets here, so exactly one waiter gets
@@ -446,6 +469,7 @@ static int disp_signal(object_t *obj, int op, int64 count, int64 *prev) {
 
     case D_THREAD:
     case D_PROCESS:
+    case D_TIMER:
         /* Only the thread's own exit signals it (thread_object_exited),
          * never a caller: NtSetEvent on a thread handle is a type error,
          * and letting it through would release a WaitForSingleObject on a
@@ -488,6 +512,9 @@ static void disp_destroy(object_t *obj) {
          * find the object no longer in use, and get -EINVAL - which is a
          * return rather than a wait on something that no longer exists. */
         waitq_wake_all(&d->q);
+        if (d->kind == D_TIMER) {
+            ktimer_cancel(&d->kt);
+        }
         d->in_use = 0;
     }
 }
@@ -537,10 +564,19 @@ static const object_type_t process_type = {
     .destroy = disp_destroy
 };
 
+static const object_type_t timer_type = {
+    .name    = "Timer",
+    .klass   = OBJ_TIMER,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
 static int is_dispatcher(const object_t *obj) {
     return obj->type == &event_type || obj->type == &semaphore_type ||
            obj->type == &mutant_type || obj->type == &thread_type ||
-           obj->type == &process_type;
+           obj->type == &process_type || obj->type == &timer_type;
 }
 
 /* --- creation ------------------------------------------------------------ */
@@ -869,4 +905,127 @@ void dispatch_init(void) {
      * this is the sweep that publishes everything anybody registered before
      * the directory was there. */
     ob_publish_types();
+}
+
+/* --- timers (NtCreateTimer) ----------------------------------------------
+ *
+ * An event that the tick sets. The ktimer callback runs from IRQ 0 under the
+ * big kernel lock (ktimer.h): it sets the timer, wakes its waiters, queues
+ * the APC SetWaitableTimer asked for to the thread that set it - delivered
+ * when that thread next waits alertably, as on NT - and re-arms a periodic
+ * timer for its next period, skipping periods already missed (NT does not
+ * queue a backlog either). */
+
+static void timer_fire(ktimer_t *kt) {
+    dispatcher_t *d = (dispatcher_t *)((char *)kt -
+                                       __builtin_offsetof(dispatcher_t, kt));
+    uint64 now = timer_ns();
+
+    if (!d->in_use || d->kind != D_TIMER || d->due_ns == 0) {
+        return;
+    }
+    if (now < d->due_ns) {
+        ktimer_arm(&d->kt, ktimer_ns_to_tick(d->due_ns));
+        return;
+    }
+    d->signalled = 1;
+    waitq_wake_all(&d->q);
+    if (d->apc_routine != 0) {
+        process_t *t = proc_find(d->apc_tid);
+
+        /* TimerApcRoutine(Context, TimerLowValue, TimerHighValue): the
+         * time it fired, as a FILETIME. */
+        if (t != NULL) {
+            uint64 ft = timer_realtime_ns() / 100 + 116444736000000000ULL;
+
+            (void)nt_apc_queue(t, d->apc_routine, d->apc_ctx,
+                               ft & 0xFFFFFFFFULL, ft >> 32);
+        }
+    }
+    if (d->period_ns != 0) {
+        d->due_ns += (1 + (now - d->due_ns) / d->period_ns) * d->period_ns;
+        ktimer_arm(&d->kt, ktimer_ns_to_tick(d->due_ns));
+    } else {
+        d->due_ns = 0;
+    }
+}
+
+object_t *timer_create(int manual) {
+    dispatcher_t *d = disp_alloc(D_TIMER);
+    object_t *obj;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    d->manual = manual ? 1 : 0;
+    d->kt.fire = timer_fire;
+    obj = ob_create(&timer_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+static dispatcher_t *timer_body(object_t *obj) {
+    dispatcher_t *d;
+
+    if (obj == NULL || obj->type != &timer_type) {
+        return NULL;
+    }
+    d = (dispatcher_t *)obj->body;
+    return (d != NULL && d->in_use) ? d : NULL;
+}
+
+int timer_set(object_t *obj, uint64 due_ns, uint64 period_ns,
+              uint64 apc_routine, uint64 apc_ctx, int *was_signalled) {
+    dispatcher_t *d = timer_body(obj);
+    process_t *me = proc_current();
+
+    if (d == NULL) {
+        return -22;
+    }
+    ktimer_cancel(&d->kt);
+    if (was_signalled != NULL) {
+        *was_signalled = d->signalled;
+    }
+    /* Setting a timer resets it, as NtSetTimer does: a wait after this
+     * waits for the NEW due time, not for an expiry already seen. */
+    d->signalled = 0;
+    d->period_ns = period_ns;
+    d->apc_routine = apc_routine;
+    d->apc_ctx = apc_ctx;
+    d->apc_tid = (me != NULL) ? me->pid : 0;
+    d->due_ns = (due_ns == 0) ? 1 : due_ns;
+    ktimer_arm(&d->kt, ktimer_ns_to_tick(d->due_ns));
+    return 0;
+}
+
+int timer_cancel(object_t *obj, int *was_signalled) {
+    dispatcher_t *d = timer_body(obj);
+
+    if (d == NULL) {
+        return -22;
+    }
+    ktimer_cancel(&d->kt);
+    /* Cancelling stops it; it does NOT reset the state - a timer that has
+     * already gone off stays signalled (NtCancelTimer's CurrentState). */
+    d->due_ns = 0;
+    d->period_ns = 0;
+    d->apc_routine = 0;
+    if (was_signalled != NULL) {
+        *was_signalled = d->signalled;
+    }
+    return 0;
+}
+
+int timer_query(object_t *obj, uint64 *remaining_ns, int *signalled) {
+    dispatcher_t *d = timer_body(obj);
+    uint64 now = timer_ns();
+
+    if (d == NULL) {
+        return -22;
+    }
+    *signalled = d->signalled;
+    *remaining_ns = (d->due_ns > now) ? d->due_ns - now : 0;
+    return 0;
 }

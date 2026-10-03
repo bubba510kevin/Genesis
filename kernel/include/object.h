@@ -156,7 +156,10 @@ typedef enum {
     /* Linux's timerfd and epoll instances (kernel/fs/timerfd.c, epoll.c):
      * descriptors a poll loop reads or waits on, neither a file nor a pipe. */
     OBJ_TIMERFD,
-    OBJ_EPOLL
+    OBJ_EPOLL,
+
+    /* An NT timer (NtCreateTimer): a dispatcher object the tick sets. */
+    OBJ_TIMER
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

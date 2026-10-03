@@ -185,6 +185,10 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **NT waitable timers — DONE 2026-10-03** (16(k), `timer_create` in
+  `kernel/obj/dispatch.c`, NT calls `0x90`-`0x94`), on the kernel timers;
+  ntsync.exe 67 (was 34), in the Genesis-userland patch with kernel32's
+  waitable-timer API.
 - **epoll and timerfd — DONE 2026-10-03** (16(a), `kernel/fs/epoll.c`,
   `kernel/fs/timerfd.c`): plus **kernel timers** (`ktimer.h`) - callbacks
   run from the tick, the first thing that makes an OBJECT ready at a time
@@ -285,8 +289,8 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x8F`.
-  `0x40`-`0x7F` is the display/input range; the next core call is `0x90`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x94`.
+  `0x40`-`0x7F` is the display/input range; the next core call is `0x95`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
@@ -341,7 +345,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `tls` (`tls.exe`) | 24 passed | 24 passed |
 | `wait` (`wait.exe`) | 60 passed | 60 passed |
 | `sync` (`sync.exe`) | 51 passed | |
-| `ntsync` (`ntsync.exe`) | 34 passed | |
+| `ntsync` (`ntsync.exe`) | 67 passed | |
 | `vm` (`vm.exe`) | 68 passed | |
 | `proc` (`proc.exe`) | 40 passed | |
 | `reg` (`reg.exe`) | 31 passed | |

@@ -373,6 +373,13 @@ struct syscall_frame;
 #define NT_SYS_QUERY_KEY             0x8E
 #define NT_SYS_FLUSH_KEY             0x8F
 
+/* NT timers (ROADMAP 16(k)), on the kernel timers (ktimer.h). */
+#define NT_SYS_CREATE_TIMER          0x90
+#define NT_SYS_OPEN_TIMER            0x91
+#define NT_SYS_SET_TIMER             0x92
+#define NT_SYS_CANCEL_TIMER          0x93
+#define NT_SYS_QUERY_TIMER           0x94
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -469,6 +476,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_INVALID_INFO_CLASS 0xC0000003u
 #define STATUS_NOT_SUPPORTED      0xC00000BBu
 #define STATUS_INVALID_PARAMETER_4 0xC00000F2u
+#define STATUS_INVALID_PARAMETER_6 0xC00000F4u
 #define STATUS_INSUFFICIENT_RESOURCES 0xC000009Au
 #define STATUS_NO_YIELD_PERFORMED 0x40000024u
 #define STATUS_ALERTED            0x00000101u
