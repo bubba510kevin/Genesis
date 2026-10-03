@@ -141,3 +141,10 @@ void kprintf_c(unsigned char color, const char *fmt, ...) {
     vprintf(fmt, ap);
     va_end(ap);
 }
+
+/* object.c's of_deref tells epoll an open instance is gone; the host build
+ * has no epoll instances (kernel/fs/epoll.c needs the kernel heap). */
+struct open_file;
+void epoll_file_released(struct open_file *of) {
+    (void)of;
+}

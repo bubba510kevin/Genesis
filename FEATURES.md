@@ -503,7 +503,7 @@ point. About **130** syscall numbers are dispatched, in these groups:
 | Memory | `brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise` |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigsuspend`, `rt_sigpending`, `sigaltstack`, `pause` |
 | Time | `clock_gettime`, `clock_getres`, `clock_nanosleep`, `nanosleep`, `gettimeofday`, `times` |
-| Waiting | `poll`, `ppoll` (with a signal mask), `select`, `pselect6`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
+| Waiting | `poll`, `ppoll` (with a signal mask), `select`, `pselect6`, `epoll_create`/`epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`/`epoll_pwait2`, `timerfd_create`/`timerfd_settime`/`timerfd_gettime`, `futex`, `sched_yield`, `eventfd2`, `pipe`, `pipe2`, `socketpair` |
 | Limits & usage | `getrlimit`, `setrlimit`, `prlimit64` (per process, inherited; `RLIMIT_NOFILE` enforced, `RLIMIT_STACK` is the real stack), `getrusage`, `times` (with reaped children's time) |
 | CPUs | `sched_setaffinity`, `sched_getaffinity`, `getcpu` |
 | Sockets | `socket`, `bind`, `connect`, `listen`, `accept`, `accept4`, `shutdown`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt` |
@@ -582,9 +582,13 @@ it everywhere, including the ACL test fixtures.)
 - **Limits:** one dataset per volume (no named datasets), no symlinks.
 
 ### Other file-like objects ✅
-**Pipes** (with SIGPIPE/EPIPE), **eventfd**, **socketpair** (two crossed
-pipes), **sockets**, `/dev/console`, `/dev/null`, all behind the same object
-vtable, so `read`/`write`/`poll` work on all of them.
+**Pipes** (with SIGPIPE/EPIPE), **eventfd**, **timerfd**, **epoll**,
+**socketpair** (two crossed pipes), **sockets**, `/dev/console`, `/dev/null`,
+all behind the same object vtable, so `read`/`write`/`poll` work on all of
+them. epoll (2026-10-03, ROADMAP 16(a)) has level-triggered, `EPOLLONESHOT`
+and `EPOLLET` entries, nesting, and entries that follow the open file;
+timerfd has one-shot, periodic and absolute timers on the monotonic and
+wall clocks, at the one-tick (10ms) resolution of every timer here.
 
 ---
 

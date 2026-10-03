@@ -151,7 +151,12 @@ typedef enum {
     OBJ_PROCESS,
 
     /* A registry key, as a handle sees it (kernel/include/registry.h). */
-    OBJ_KEY
+    OBJ_KEY,
+
+    /* Linux's timerfd and epoll instances (kernel/fs/timerfd.c, epoll.c):
+     * descriptors a poll loop reads or waits on, neither a file nor a pipe. */
+    OBJ_TIMERFD,
+    OBJ_EPOLL
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

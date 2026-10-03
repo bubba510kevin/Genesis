@@ -1,5 +1,6 @@
 #include "ns.h"
 #include "object.h"
+#include "epoll.h"
 #include "typesk.h"
 
 /* Static pools rather than the heap.
@@ -270,6 +271,10 @@ void of_deref(open_file_t *f) {
     f->refcount--;
     if (f->refcount == 0) {
         object_t *obj = f->obj;
+
+        /* Out of every epoll interest list first: they key on this open
+         * instance, and the slot is about to be reused for another. */
+        epoll_file_released(f);
 
         /* The last open instance of a temporarily named object takes its
          * name with it. Before the ob_deref below, so the object is still

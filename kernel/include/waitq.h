@@ -118,6 +118,14 @@ wait_queue_t *waitq_readiness(void);
  * on the way back out to user mode. */
 void waitq_wake_all(wait_queue_t *q);
 
+/* A counter bumped by every waitq_wake_all - that is, by every readiness
+ * change in the kernel, for the reason waitq_wake_all gives. epoll's
+ * edge-triggered entries use it: an entry already reported is reported
+ * again only once SOMETHING has changed since, which never misses an edge
+ * (a new one always passes through here) and never re-reports a state
+ * nothing has touched. */
+uint64 waitq_generation(void);
+
 /* Put a process on the queue without blocking it. waitq_wait does this for
  * you and is what callers should use; it is exported because the list is the
  * part of this file that can be tested off-target - the blocking loop halts

@@ -20,6 +20,8 @@
 #include "ns.h"
 #include "object.h"
 #include "eventfd.h"
+#include "epoll.h"
+#include "timerfd.h"
 #include "socketfd.h"
 #include "socketpair.h"
 #include "process.h"
@@ -489,6 +491,14 @@ static int64 do_read(int fd, void *buf, uint64 count) {
      * with POLLHUP, so end of file still arrives as a zero-length read and
      * not as -EAGAIN - which would be a program spinning on a pipe that will
      * never have data again. */
+    /* The counter descriptors refuse a buffer shorter than their 8-byte
+     * count before anything else, as Linux's eventfd_read and timerfd_read
+     * do - a non-blocking one that is not ready must still say EINVAL, not
+     * EAGAIN, or the caller retries a read that can never succeed. */
+    if (count < 8 && (f->obj->type->klass == OBJ_EVENTFD ||
+                      f->obj->type->klass == OBJ_TIMERFD)) {
+        return -22;
+    }
     if ((f->status & O_NONBLOCK) && !(ob_poll(f->obj, OB_POLLIN) & OB_POLLIN)) {
         return -11;                   /* -EAGAIN */
     }
@@ -512,6 +522,9 @@ static int64 do_write(int fd, const void *buf, uint64 count) {
      * POLLOUT alongside POLLERR, so a non-blocking write to it still reaches
      * pipe_write and still gets SIGPIPE and -EPIPE - the error a program
      * needs, rather than -EAGAIN, which would tell it to try again forever. */
+    if (count < 8 && f->obj->type->klass == OBJ_EVENTFD) {
+        return -22;                   /* as in do_read */
+    }
     if ((f->status & O_NONBLOCK) && !(ob_poll(f->obj, OB_POLLOUT) & OB_POLLOUT)) {
         return -11;                   /* -EAGAIN */
     }
@@ -1029,6 +1042,301 @@ static uint64 sys_eventfd2(uint64 initval, uint64 flags) {
         return (uint64)(int64)fd;        /* handle_alloc consumed `of` */
     }
     return (uint64)fd;
+}
+
+/* --- epoll and timerfd (ROADMAP 16(a)) ------------------------------------
+ *
+ * The objects are in kernel/fs/epoll.c and kernel/fs/timerfd.c; this is the
+ * descriptor half, the same shape as eventfd2 above. */
+#define EPOLL_CLOEXEC   0x00080000UL
+#define TFD_NONBLOCK    0x00000800UL
+#define TFD_CLOEXEC     0x00080000UL
+#define TFD_TIMER_CANCEL_ON_SET 2u
+
+/* Wrap a new object in an open instance and a descriptor. */
+static uint64 object_fd(object_t *obj, uint32 access, int nonblock,
+                        int cloexec) {
+    open_file_t *of = of_open(obj, access);
+
+    ob_deref(obj);
+    if (of == NULL) {
+        return (uint64)-23;
+    }
+    if (nonblock) {
+        of->status |= O_NONBLOCK;
+    }
+    return (uint64)(int64)handle_alloc(proc_current()->handles, of,
+                                       cloexec ? HANDLE_CLOEXEC : 0);
+}
+
+static uint64 sys_epoll_create1(uint64 flags) {
+    object_t *obj = NULL;
+    int rc;
+
+    if ((flags & ~EPOLL_CLOEXEC) != 0) {
+        return (uint64)-22;
+    }
+    rc = epoll_create_object(&obj);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    return object_fd(obj, ACCESS_READ, 0, (flags & EPOLL_CLOEXEC) != 0);
+}
+
+/* epoll_create(2): the size is a hint Linux has ignored since 2.6.8, but
+ * it must still be positive. */
+static uint64 sys_epoll_create(uint64 size) {
+    if ((int)size <= 0) {
+        return (uint64)-22;
+    }
+    return sys_epoll_create1(0);
+}
+
+static object_t *epoll_of_fd(int epfd, uint64 *err) {
+    open_file_t *f = handle_get(proc_current()->handles, epfd);
+
+    if (f == NULL) {
+        *err = (uint64)-9;                   /* -EBADF */
+        return NULL;
+    }
+    if (!epoll_is_epoll(f->obj)) {
+        *err = (uint64)-22;                  /* not an epoll: -EINVAL */
+        return NULL;
+    }
+    return f->obj;
+}
+
+static uint64 sys_epoll_ctl(uint64 epfd, uint64 op, uint64 fd,
+                            uint64 event_ptr) {
+    uint64 err = 0;
+    object_t *ep = epoll_of_fd((int)epfd, &err);
+    open_file_t *f;
+    struct epoll_event ev = {0, 0};
+
+    if (ep == NULL) {
+        return err;
+    }
+    f = handle_get(proc_current()->handles, (int)fd);
+    if (f == NULL) {
+        return (uint64)-9;
+    }
+    if ((int)fd == (int)epfd) {
+        return (uint64)-22;
+    }
+    if (op != EPOLL_CTL_DEL) {
+        if (!user_range_ok(event_ptr, sizeof(ev))) {
+            return (uint64)-14;
+        }
+        ev = *(const struct epoll_event *)event_ptr;
+    }
+    return (uint64)(int64)epoll_ctl_object(ep, (int)op, (int)fd, f,
+                                           ev.events, ev.data);
+}
+
+struct epoll_wait_ctx {
+    object_t           *ep;
+    struct epoll_event *out;
+    int                 max;
+    int                 n;
+};
+
+static int epoll_wait_scan(void *ctx) {
+    struct epoll_wait_ctx *c = (struct epoll_wait_ctx *)ctx;
+
+    c->n = epoll_collect(c->ep, c->out, c->max);
+    return c->n;
+}
+
+/* The common body: timeout in ms, -1 forever, 0 a probe - as poll's. */
+static uint64 do_epoll_wait(uint64 epfd, uint64 events_ptr, uint64 maxevents,
+                            int64 timeout_ms) {
+    uint64 err = 0;
+    struct epoll_wait_ctx c;
+    uint64 deadline = 0;
+    int rc;
+
+    c.ep = epoll_of_fd((int)epfd, &err);
+    if (c.ep == NULL) {
+        return err;
+    }
+    if ((int)maxevents <= 0 || maxevents > 0x7FFFFFFFULL / 12) {
+        return (uint64)-22;
+    }
+    if (!user_range_ok(events_ptr, maxevents * sizeof(struct epoll_event))) {
+        return (uint64)-14;
+    }
+    c.out = (struct epoll_event *)events_ptr;
+    c.max = (int)maxevents;
+    c.n = 0;
+    if (timeout_ms == 0) {
+        return (uint64)(int64)epoll_wait_scan(&c);
+    }
+    if (timeout_ms > 0) {
+        deadline = timer_ticks_now() +
+                   (((uint64)timeout_ms * timer_hz() + 999) / 1000) + 1;
+    }
+    rc = waitq_wait_until(waitq_readiness(), epoll_wait_scan, &c, deadline);
+    if (rc == WAITQ_SIGNAL) {
+        return (uint64)-4;
+    }
+    if (rc == WAITQ_TIMEOUT) {
+        return 0;
+    }
+    return (uint64)(int64)c.n;
+}
+
+static uint64 sys_epoll_wait(uint64 epfd, uint64 events_ptr,
+                             uint64 maxevents, uint64 timeout) {
+    return do_epoll_wait(epfd, events_ptr, maxevents, (int64)(int)timeout);
+}
+
+/* epoll_pwait: the signal mask for the wait, as ppoll applies it. */
+static uint64 sys_epoll_pwait(uint64 epfd, uint64 events_ptr,
+                              uint64 maxevents, uint64 timeout,
+                              uint64 sigmask_ptr, uint64 sigsetsize) {
+    if (sigmask_ptr != 0) {
+        if (sigsetsize != 8) {
+            return (uint64)-22;
+        }
+        if (!user_range_ok(sigmask_ptr, 8)) {
+            return (uint64)-14;
+        }
+        signal_set_temp_mask(proc_current(), *(const uint64 *)sigmask_ptr);
+    }
+    return do_epoll_wait(epfd, events_ptr, maxevents, (int64)(int)timeout);
+}
+
+/* epoll_pwait2: a timespec instead of milliseconds (NULL: forever). */
+static uint64 sys_epoll_pwait2(uint64 epfd, uint64 events_ptr,
+                               uint64 maxevents, uint64 ts_ptr,
+                               uint64 sigmask_ptr, uint64 sigsetsize) {
+    int64 timeout_ms = -1;
+
+    if (ts_ptr != 0) {
+        const int64 *ts = (const int64 *)ts_ptr;
+
+        if (!user_range_ok(ts_ptr, 16)) {
+            return (uint64)-14;
+        }
+        if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000LL) {
+            return (uint64)-22;
+        }
+        timeout_ms = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+    }
+    if (sigmask_ptr != 0) {
+        if (sigsetsize != 8) {
+            return (uint64)-22;
+        }
+        if (!user_range_ok(sigmask_ptr, 8)) {
+            return (uint64)-14;
+        }
+        signal_set_temp_mask(proc_current(), *(const uint64 *)sigmask_ptr);
+    }
+    return do_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+}
+
+static uint64 sys_timerfd_create(uint64 clockid, uint64 flags) {
+    object_t *obj = NULL;
+    int rc;
+
+    if ((flags & ~(TFD_NONBLOCK | TFD_CLOEXEC)) != 0) {
+        return (uint64)-22;
+    }
+    rc = timerfd_create(&obj, (int)clockid);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    return object_fd(obj, ACCESS_READ, (flags & TFD_NONBLOCK) != 0,
+                     (flags & TFD_CLOEXEC) != 0);
+}
+
+static object_t *timerfd_of_fd(int fd, uint64 *err) {
+    open_file_t *f = handle_get(proc_current()->handles, fd);
+
+    if (f == NULL) {
+        *err = (uint64)-9;
+        return NULL;
+    }
+    if (!timerfd_is_timerfd(f->obj)) {
+        *err = (uint64)-22;
+        return NULL;
+    }
+    return f->obj;
+}
+
+/* struct itimerspec: { it_interval, it_value }, each { tv_sec, tv_nsec }. */
+static int itimerspec_in(uint64 ptr, uint64 *value_ns, uint64 *interval_ns) {
+    const int64 *t = (const int64 *)ptr;
+    int i;
+
+    if (!user_range_ok(ptr, 32)) {
+        return -14;
+    }
+    for (i = 0; i < 4; i += 2) {
+        if (t[i] < 0 || t[i + 1] < 0 || t[i + 1] >= 1000000000LL) {
+            return -22;
+        }
+    }
+    *interval_ns = (uint64)t[0] * 1000000000ULL + (uint64)t[1];
+    *value_ns    = (uint64)t[2] * 1000000000ULL + (uint64)t[3];
+    return 0;
+}
+
+static void itimerspec_out(uint64 ptr, uint64 value_ns, uint64 interval_ns) {
+    int64 *t = (int64 *)ptr;
+
+    t[0] = (int64)(interval_ns / 1000000000ULL);
+    t[1] = (int64)(interval_ns % 1000000000ULL);
+    t[2] = (int64)(value_ns / 1000000000ULL);
+    t[3] = (int64)(value_ns % 1000000000ULL);
+}
+
+static uint64 sys_timerfd_settime(uint64 fd, uint64 flags, uint64 new_ptr,
+                                  uint64 old_ptr) {
+    uint64 err = 0, v = 0, iv = 0, ov = 0, oiv = 0;
+    object_t *obj = timerfd_of_fd((int)fd, &err);
+    int rc;
+
+    if (obj == NULL) {
+        return err;
+    }
+    /* CANCEL_ON_SET is accepted only with ABSTIME, as on Linux; the wall
+     * clock is never set while a program runs here, so there is nothing
+     * for it to cancel on yet. */
+    if ((flags & ~(uint64)(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 ||
+        ((flags & TFD_TIMER_CANCEL_ON_SET) && !(flags & TFD_TIMER_ABSTIME))) {
+        return (uint64)-22;
+    }
+    rc = itimerspec_in(new_ptr, &v, &iv);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    if (old_ptr != 0 && !user_range_ok(old_ptr, 32)) {
+        return (uint64)-14;
+    }
+    rc = timerfd_settime(obj, (uint32)flags, v, iv, &ov, &oiv);
+    if (rc != 0) {
+        return (uint64)(int64)rc;
+    }
+    if (old_ptr != 0) {
+        itimerspec_out(old_ptr, ov, oiv);
+    }
+    return 0;
+}
+
+static uint64 sys_timerfd_gettime(uint64 fd, uint64 cur_ptr) {
+    uint64 err = 0, v, iv;
+    object_t *obj = timerfd_of_fd((int)fd, &err);
+
+    if (obj == NULL) {
+        return err;
+    }
+    if (!user_range_ok(cur_ptr, 32)) {
+        return (uint64)-14;
+    }
+    timerfd_gettime(obj, &v, &iv);
+    itimerspec_out(cur_ptr, v, iv);
+    return 0;
 }
 
 /* socketpair(2). AF_UNIX/SOCK_STREAM only - see kernel/fs/socketpair.c.
@@ -6335,6 +6643,15 @@ static const char *syscall_name(uint64 nr) {
         case SYS_recvfrom:        return "recvfrom";
         case SYS_getsockname:     return "getsockname";
         case SYS_eventfd2:        return "eventfd2";
+        case SYS_epoll_create:    return "epoll_create";
+        case SYS_epoll_create1:   return "epoll_create1";
+        case SYS_epoll_ctl:       return "epoll_ctl";
+        case SYS_epoll_wait:      return "epoll_wait";
+        case SYS_epoll_pwait:     return "epoll_pwait";
+        case SYS_epoll_pwait2:    return "epoll_pwait2";
+        case SYS_timerfd_create:  return "timerfd_create";
+        case SYS_timerfd_settime: return "timerfd_settime";
+        case SYS_timerfd_gettime: return "timerfd_gettime";
         case SYS_munmap:          return "munmap";
         case SYS_brk:             return "brk";
         case SYS_arch_prctl:      return "arch_prctl";
@@ -6676,6 +6993,30 @@ uint64 linux_syscall_dispatch(struct syscall_frame *frame) {
 
         case SYS_eventfd2:
             return sys_eventfd2(frame->rdi, frame->rsi);
+
+        case SYS_epoll_create:
+            return sys_epoll_create(frame->rdi);
+        case SYS_epoll_create1:
+            return sys_epoll_create1(frame->rdi);
+        case SYS_epoll_ctl:
+            return sys_epoll_ctl(frame->rdi, frame->rsi, frame->rdx,
+                                 frame->r10);
+        case SYS_epoll_wait:
+            return sys_epoll_wait(frame->rdi, frame->rsi, frame->rdx,
+                                  frame->r10);
+        case SYS_epoll_pwait:
+            return sys_epoll_pwait(frame->rdi, frame->rsi, frame->rdx,
+                                   frame->r10, frame->r8, frame->r9);
+        case SYS_epoll_pwait2:
+            return sys_epoll_pwait2(frame->rdi, frame->rsi, frame->rdx,
+                                    frame->r10, frame->r8, frame->r9);
+        case SYS_timerfd_create:
+            return sys_timerfd_create(frame->rdi, frame->rsi);
+        case SYS_timerfd_settime:
+            return sys_timerfd_settime(frame->rdi, frame->rsi, frame->rdx,
+                                       frame->r10);
+        case SYS_timerfd_gettime:
+            return sys_timerfd_gettime(frame->rdi, frame->rsi);
 
         case SYS_waitid:
             return sys_waitid(frame->rdi, frame->rsi, frame->rdx,

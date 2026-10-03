@@ -16,6 +16,7 @@
 #include "signal.h"
 #include "syscall.h"
 #include "timer.h"
+#include "ktimer.h"
 #include "io.h"
 #include "pic.h"
 #include "screen.h"
@@ -278,6 +279,7 @@ static void interrupt_dispatch_locked(struct interrupt_frame *frame) {
             /* ticks itself already advanced, before the lock - see
              * interrupt_dispatch. This is the rest of the tick. */
             timer_tick();
+            ktimer_tick();      /* timerfd and friends */
             kusd_tick();        /* the clock fields user mode reads */
             /* Only flags a pending switch. Switching here would unwind an
              * interrupt frame from underneath the handler that is still

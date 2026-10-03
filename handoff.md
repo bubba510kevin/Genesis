@@ -185,6 +185,11 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **epoll and timerfd — DONE 2026-10-03** (16(a), `kernel/fs/epoll.c`,
+  `kernel/fs/timerfd.c`): plus **kernel timers** (`ktimer.h`) - callbacks
+  run from the tick, the first thing that makes an OBJECT ready at a time
+  (NT waitable timers, `NtCreateTimer`, can be built on it next). systest
+  634 (was 561); the systest change is in the Genesis-userland patch.
 - **The in-kernel registry — DONE 2026-10-03** (16(p), `kernel/obj/registry.c`,
   NT calls `0x86`-`0x8F`): a key tree under `\Registry` built at boot and
   seeded with the CurrentVersion values, the session-manager environment, the
@@ -330,7 +335,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
-| `systest` | 561 passed | 558 passed |
+| `systest` | 634 passed | 558 passed |
 | `thr` (`thr.exe`) | 47 passed | 47 passed |
 | `smp` (`smp.exe`) | 70 passed | |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |

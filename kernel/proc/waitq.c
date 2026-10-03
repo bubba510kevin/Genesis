@@ -88,7 +88,14 @@ static void wake_list(wait_queue_t *q) {
     }
 }
 
+static uint64 wake_generation;
+
+uint64 waitq_generation(void) {
+    return wake_generation;
+}
+
 void waitq_wake_all(wait_queue_t *q) {
+    wake_generation++;
     wake_list(q);
 
     /* Every readiness change in the kernel passes through here, which is the

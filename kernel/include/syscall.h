@@ -225,6 +225,17 @@
 #define SYS_socketpair      53
 #define SYS_eventfd2       290
 
+/* --- ROADMAP 16(a): epoll and timerfd ------------------------------------ */
+#define SYS_epoll_create   213
+#define SYS_epoll_wait     232
+#define SYS_epoll_ctl      233
+#define SYS_epoll_pwait    281
+#define SYS_epoll_create1  291
+#define SYS_epoll_pwait2   441
+#define SYS_timerfd_create  283
+#define SYS_timerfd_settime 286
+#define SYS_timerfd_gettime 287
+
 /* --- ROADMAP item 6: sockets as descriptors ------------------------------ */
 #define SYS_socket          41
 #define SYS_connect         42
