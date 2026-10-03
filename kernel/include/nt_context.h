@@ -115,6 +115,8 @@ uint64 nt_apc_deliver(struct syscall_frame *f, uint64 status);
 #define NT_EXC_MACHFRAME_OFFSET 0x570
 #define NT_EXC_FRAME_EXTRA      (0x570 + 0x30 - NT_CONTEXT_SIZE)
 int nt_exception_deliver(struct interrupt_frame *f, uint64 cr2);
+int  nt_exception_deliver_status(struct interrupt_frame *f, uint32 code,
+                                 uint64 info0, uint64 info1);
 
 /* NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN FirstChance).
  * FirstChance TRUE dispatches it like a fault; FALSE means nothing in the

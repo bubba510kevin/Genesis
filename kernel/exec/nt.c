@@ -8,6 +8,7 @@
 #include "ntmix.h"
 #include "ntsec.h"
 #include "ntsync.h"
+#include "ntvm.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -428,31 +429,129 @@ static uint64 nt_rw_file(uint64 handle, int writing) {
  * to mean "anywhere" and reads back where it landed, and RegionSize is
  * rounded up to a page and written back. Ignoring the write-back is the
  * classic way to make a caller free the wrong range later. */
-static uint64 nt_allocate_virtual(uint64 process, uint64 base_ptr,
-                                  uint64 size_ptr) {
-    uint64 want, length, got;
+/* --- virtual memory (ROADMAP 16(l)/14(d)) ------------------------------------
+ *
+ * The page-state model is kernel/mm/ntvm.c; these copy the in/out
+ * arguments across. Only the calling process: a handle to another one does
+ * not exist yet (16(m)). */
+static int nt_self(uint64 process) {
+    return process == NT_CURRENT_PROCESS || process == 0;
+}
 
-    if (process != NT_CURRENT_PROCESS && process != 0) {
-        /* Allocating in another process needs a handle that names one, and
-         * nothing in the handle table does yet. */
+/* NtAllocateVirtualMemory(HANDLE, PVOID *Base, ULONG_PTR ZeroBits,
+ *                         PSIZE_T Size, ULONG Type, ULONG Protect) */
+static uint64 nt_allocate_virtual(uint64 process, uint64 base_ptr,
+                                  uint64 size_ptr, uint64 type,
+                                  uint64 protect) {
+    uint64 base, size;
+    uint32 st;
+
+    if (!nt_self(process)) {
         return STATUS_INVALID_HANDLE;
     }
-    if (!user_ptr_ok(base_ptr) || !user_ptr_ok(size_ptr)) {
+    if (!user_range_ok(base_ptr, 8) || !user_range_ok(size_ptr, 8)) {
         return STATUS_ACCESS_VIOLATION;
     }
-    want   = *(const uint64 *)base_ptr;
-    length = *(const uint64 *)size_ptr;
-    if (length == 0) {
-        return STATUS_INVALID_PARAMETER;
+    base = *(const uint64 *)base_ptr;
+    size = *(const uint64 *)size_ptr;
+    st = ntvm_allocate(proc_current()->space, &base, &size, (uint32)type,
+                       (uint32)protect);
+    if (st == STATUS_SUCCESS) {
+        *(uint64 *)base_ptr = base;
+        *(uint64 *)size_ptr = size;
     }
+    return st;
+}
 
-    got = syscall_map_anonymous(want, length, want != 0);
-    if ((int64)got < 0) {
-        return STATUS_NO_MEMORY;
+/* NtFreeVirtualMemory(HANDLE, PVOID *Base, PSIZE_T Size, ULONG FreeType) */
+static uint64 nt_free_virtual(uint64 process, uint64 base_ptr,
+                              uint64 size_ptr, uint64 type) {
+    uint64 base, size;
+    uint32 st;
+
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
     }
+    if (!user_range_ok(base_ptr, 8) || !user_range_ok(size_ptr, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    base = *(const uint64 *)base_ptr;
+    size = *(const uint64 *)size_ptr;
+    st = ntvm_free(proc_current()->space, &base, &size, (uint32)type);
+    if (st == STATUS_SUCCESS) {
+        *(uint64 *)base_ptr = base;
+        *(uint64 *)size_ptr = size;
+    }
+    return st;
+}
 
-    *(uint64 *)base_ptr = got;
-    *(uint64 *)size_ptr = (length + 0xFFFULL) & ~0xFFFULL;
+/* NtProtectVirtualMemory(HANDLE, PVOID *Base, PSIZE_T Size, ULONG New,
+ *                        PULONG Old) */
+static uint64 nt_protect_virtual(uint64 process, uint64 base_ptr,
+                                 uint64 size_ptr, uint64 new_protect,
+                                 uint64 old_ptr) {
+    uint64 base, size;
+    uint32 st, old = 0;
+
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!user_range_ok(base_ptr, 8) || !user_range_ok(size_ptr, 8) ||
+        !user_range_ok(old_ptr, 4)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    base = *(const uint64 *)base_ptr;
+    size = *(const uint64 *)size_ptr;
+    st = ntvm_protect(proc_current()->space, &base, &size,
+                      (uint32)new_protect, &old);
+    if (st == STATUS_SUCCESS) {
+        *(uint64 *)base_ptr = base;
+        *(uint64 *)size_ptr = size;
+        *(uint32 *)old_ptr = old;
+    }
+    return st;
+}
+
+/* NtQueryVirtualMemory(HANDLE, PVOID Base, MEMORY_INFORMATION_CLASS,
+ *                      PVOID Buffer, SIZE_T Length, PSIZE_T ReturnLength)
+ * Class 0, MemoryBasicInformation, only. */
+static uint64 nt_query_virtual(uint64 process, uint64 addr, uint64 klass,
+                               uint64 buf, uint64 len, uint64 retlen_ptr) {
+    process_t *p = proc_current();
+    nt_module_table_t mt;
+    uint64 images[2 * NT_MAX_MODULES];
+    ntvm_mbi_t mbi;
+    int n = 0, k;
+    uint32 st;
+
+    if (!nt_self(process)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if ((uint32)klass != 0) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if (len < sizeof(mbi)) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_range_ok(buf, sizeof(mbi)) ||
+        (retlen_ptr != 0 && !user_range_ok(retlen_ptr, 8))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (nt_modules_read(p->space, &mt) == 0) {
+        for (k = 0; k < (int)mt.count && k < NT_MAX_MODULES; k++) {
+            images[2 * n]     = mt.mod[k].base;
+            images[2 * n + 1] = mt.mod[k].size;
+            n++;
+        }
+    }
+    st = ntvm_query(p->space, addr, &mbi, images, n);
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    *(ntvm_mbi_t *)buf = mbi;
+    if (retlen_ptr != 0) {
+        *(uint64 *)retlen_ptr = sizeof(mbi);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1708,12 +1807,49 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
         case NT_SYS_WRITE_FILE:
             return nt_trace(frame->rax, nt_rw_file(frame->r10, 1));
 
-        case NT_SYS_ALLOCATE_VIRTUAL:
-            /* AllocationType and Protect are arguments five and six, on the
-             * stack, and are not read - see the note on MEM_COMMIT in nt.h. */
+        case NT_SYS_ALLOCATE_VIRTUAL: {
+            uint64 type = 0, protect = 0;
+
+            /* AllocationType and Protect: arguments five and six. */
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &type) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 6, &protect)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
             return nt_trace(frame->rax,
                             nt_allocate_virtual(frame->r10, frame->rdx,
-                                                frame->r9));
+                                                frame->r9, type, protect));
+        }
+
+        case NT_SYS_FREE_VIRTUAL:
+            return nt_trace(frame->rax,
+                            nt_free_virtual(frame->r10, frame->rdx, frame->r8,
+                                            frame->r9));
+
+        case NT_SYS_PROTECT_VIRTUAL: {
+            uint64 old = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &old)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_protect_virtual(frame->r10, frame->rdx,
+                                               frame->r8, frame->r9, old));
+        }
+
+        case NT_SYS_QUERY_VIRTUAL: {
+            uint64 buf = 0, len = 0, retlen = 0;
+
+            /* Base, Class: two and three; Buffer, Length, ReturnLength: four
+             * to six. */
+            buf = frame->r9;
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &len)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            (void)nt_stack_arg(syscall_get_user_rsp(), 6, &retlen);
+            return nt_trace(frame->rax,
+                            nt_query_virtual(frame->r10, frame->rdx,
+                                             frame->r8, buf, len, retlen));
+        }
 
         /* --- the dispatcher objects ---------------------------------------
          * Win64 puts arguments one to four in R10 (RCX before the stub), RDX,

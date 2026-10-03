@@ -406,6 +406,12 @@ and one spinning in ring 3 on another CPU.
 wherever it is: running on another CPU, blocked in a wait, or suspended.
 Mutexes it held are abandoned.
 
+**NT virtual memory ✅** (2026-10-03, ROADMAP 16(l)/14(d)): reserve, commit,
+decommit, release; `VirtualProtect` with enforced READONLY / NOACCESS /
+EXECUTE (DEP) and one-shot `PAGE_GUARD` (`STATUS_GUARD_PAGE_VIOLATION`);
+`VirtualQuery` over allocations, images, stacks and free space. Commit is
+eager (frames at commit time). Not yet: sections / `MapViewOfFile`.
+
 **KUSER_SHARED_DATA and the version ✅** (2026-10-03, ROADMAP 16(s)): the
 shared page at `0x7FFE0000` (time, tick count, NT 10.0.19045, processor
 features), the PEB's version fields, `GetVersion(Ex)`, `RtlGetVersion`,

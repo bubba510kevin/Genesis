@@ -1,3 +1,5 @@
+#include "ntvm.h"
+#include "nt.h"
 #include "kusd.h"
 #include "backtrace.h"
 #include "idt.h"
@@ -180,6 +182,27 @@ static void interrupt_dispatch_locked(struct interrupt_frame *frame) {
         if (frame->vector == 14 &&
             vmm_handle_write_fault(read_cr2(), frame->error_code)) {
             return_to_user(from_user);
+            return;
+        }
+
+        /* A guard page (ntvm.h): present, but not to ring 3. Its first touch
+         * clears the guard and raises STATUS_GUARD_PAGE_VIOLATION; the
+         * instruction then re-runs and succeeds. Only a user-mode access to
+         * a present page can be one (error code P and U both set). */
+        if (from_user && frame->vector == 14 &&
+            (frame->error_code & 0x5) == 0x5 && proc_current() != NULL &&
+            ntvm_guard_fault(proc_current()->space, read_cr2())) {
+            uint64 rw = (frame->error_code & 0x10) ? 8 :
+                        (frame->error_code & 0x2) ? 1 : 0;
+
+            if (nt_exception_deliver_status(frame, STATUS_GUARD_PAGE_VIOLATION,
+                                            rw, read_cr2())) {
+                return_to_user(1);
+                return;
+            }
+            /* No dispatcher to tell: the guard is gone, so re-running the
+             * instruction is what a process without one would see. */
+            return_to_user(1);
             return;
         }
 

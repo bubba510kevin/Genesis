@@ -375,6 +375,7 @@ address_space_t *vmm_space_create(void) {
 
     space_used[slot] = 1;
     space_pool[slot].root = root;
+    space_pool[slot].ntvm = NULL;
     return &space_pool[slot];
 }
 
@@ -385,6 +386,8 @@ address_space_t *vmm_space_create(void) {
  * tables out from under every other space. That is the single most dangerous
  * mistake available in this function, and the reason the loop bounds are
  * written as a slot check rather than as "all 512 entries". */
+void (*vmm_space_destroy_hook)(address_space_t *as);
+
 void vmm_space_destroy(address_space_t *as) {
     uint64 *pml4v;
     uint64 i4, i3, i2, i1;
@@ -413,6 +416,9 @@ void vmm_space_destroy(address_space_t *as) {
         }
     }
 
+    if (vmm_space_destroy_hook != NULL) {
+        vmm_space_destroy_hook(as);
+    }
     pml4v = table_at(as->root);
 
     for (i4 = 0; i4 < PT_ENTRIES; i4++) {

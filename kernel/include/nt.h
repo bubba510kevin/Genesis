@@ -290,6 +290,19 @@ struct syscall_frame;
 #define NT_SYS_REMOVE_IO_COMPLETION_EX 0x34
 #define NT_SYS_QUERY_IO_COMPLETION   0x35
 
+/* --- virtual memory (ROADMAP 16(l)/14(d), kernel/include/ntvm.h) ----------
+ * NtAllocateVirtualMemory (0x07, above) now honours AllocationType and
+ * Protect: reserve, commit, top-down, reset.
+ * NtFreeVirtualMemory(HANDLE, PVOID *Base, PSIZE_T Size, ULONG FreeType)
+ * NtProtectVirtualMemory(HANDLE, PVOID *Base, PSIZE_T Size, ULONG New,
+ *                        PULONG Old)
+ * NtQueryVirtualMemory(HANDLE, PVOID Base, ULONG Class, PVOID Buffer,
+ *                      SIZE_T Length, PSIZE_T ReturnLength)
+ *   Class 0 (MemoryBasicInformation) only. */
+#define NT_SYS_FREE_VIRTUAL          0x36
+#define NT_SYS_PROTECT_VIRTUAL       0x37
+#define NT_SYS_QUERY_VIRTUAL         0x38
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -424,14 +437,39 @@ typedef struct __attribute__((packed)) {
 #define NotificationEvent         0
 #define SynchronizationEvent      1
 
-/* NtAllocateVirtualMemory's AllocationType and Protect. Accepted and largely
- * ignored: every page this kernel hands out is committed, readable and
- * writable, so RESERVE without COMMIT would be a promise it cannot keep and
- * PAGE_READONLY a protection it cannot enforce until the VMM grows per-page
- * permission changes. Declared so the values a caller passes have names. */
+/* The NT page-state model (ROADMAP 16(l)/14(d), kernel/include/ntvm.h):
+ * AllocationType / FreeType bits, the MEMORY_BASIC_INFORMATION State and
+ * Type values, and the PAGE_* protections. */
 #define MEM_COMMIT       0x00001000u
 #define MEM_RESERVE      0x00002000u
-#define PAGE_READWRITE   0x00000004u
+#define MEM_DECOMMIT     0x00004000u
+#define MEM_RELEASE      0x00008000u
+#define MEM_FREE         0x00010000u
+#define MEM_PRIVATE      0x00020000u
+#define MEM_MAPPED       0x00040000u
+#define MEM_RESET        0x00080000u
+#define MEM_TOP_DOWN     0x00100000u
+#define MEM_IMAGE        0x01000000u
+
+#define PAGE_NOACCESS          0x01u
+#define PAGE_READONLY          0x02u
+#define PAGE_READWRITE         0x04u
+#define PAGE_WRITECOPY         0x08u
+#define PAGE_EXECUTE           0x10u
+#define PAGE_EXECUTE_READ      0x20u
+#define PAGE_EXECUTE_READWRITE 0x40u
+#define PAGE_EXECUTE_WRITECOPY 0x80u
+#define PAGE_GUARD             0x100u
+#define PAGE_NOCACHE           0x200u
+#define PAGE_WRITECOMBINE      0x400u
+
+#define STATUS_GUARD_PAGE_VIOLATION   0x80000001u
+#define STATUS_CONFLICTING_ADDRESSES  0xC0000018u
+#define STATUS_UNABLE_TO_FREE_VM      0xC000001Au
+#define STATUS_NOT_COMMITTED          0xC000002Du
+#define STATUS_INVALID_PAGE_PROTECTION 0xC0000045u
+#define STATUS_FREE_VM_NOT_AT_BASE    0xC000009Fu
+#define STATUS_MEMORY_NOT_ALLOCATED   0xC00000A0u
 
 /* UNICODE_STRING, as documented: a counted UTF-16 string whose Length is in
  * BYTES and not in characters. Reading it as characters is the classic way to

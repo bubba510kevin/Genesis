@@ -131,7 +131,16 @@ static inline virt_addr_t phys_to_virt(phys_addr_t phys) {
  * revisiting every mapping call site. */
 typedef struct address_space {
     phys_addr_t root;   /* physical address of this space's PML4 */
+    /* The NT page-state bookkeeping (ntvm.h) for a space a Windows program
+     * allocates in; NULL until the first NtAllocateVirtualMemory. Not
+     * copied by vmm_space_clone - NT processes do not fork. */
+    void       *ntvm;
 } address_space_t;
+
+/* Called by vmm_space_destroy before it frees a space, for bookkeeping that
+ * hangs off it (ntvm sets it). NULL when nothing needs telling - the host
+ * test harness, which builds paging.c alone. */
+extern void (*vmm_space_destroy_hook)(address_space_t *as);
 
 /* Statically pooled rather than heap allocated: the count is small, the
  * lifetime is the process's, and a fixed pool means a leak shows up as

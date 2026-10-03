@@ -393,11 +393,11 @@ static uint64 exception_frame(const nt_context_t *c,
     return sp;
 }
 
+static int deliver(struct interrupt_frame *f, nt_exception_record_t *recp);
+
 int nt_exception_deliver(struct interrupt_frame *f, uint64 cr2) {
     process_t *me = proc_current();
     nt_exception_record_t rec;
-    nt_context_t c;
-    uint64 sp;
 
     if (me == NULL || me->personality != PERSONALITY_WINDOWS ||
         me->nt_exc_dispatcher == 0) {
@@ -432,6 +432,35 @@ int nt_exception_deliver(struct interrupt_frame *f, uint64 cr2) {
     default:
         return 0;
     }
+    return deliver(f, &rec);
+}
+
+/* A fault the kernel has already classified, raised as exception `code`
+ * with two parameters - a guard page's STATUS_GUARD_PAGE_VIOLATION, whose
+ * parameters are an access violation's (read/write/execute, address). */
+int nt_exception_deliver_status(struct interrupt_frame *f, uint32 code,
+                                uint64 info0, uint64 info1) {
+    process_t *me = proc_current();
+    nt_exception_record_t rec;
+
+    if (me == NULL || me->personality != PERSONALITY_WINDOWS ||
+        me->nt_exc_dispatcher == 0) {
+        return 0;
+    }
+    zero(&rec, sizeof(rec));
+    rec.code = code;
+    rec.nparams = 2;
+    rec.info[0] = info0;
+    rec.info[1] = info1;
+    return deliver(f, &rec);
+}
+
+static int deliver(struct interrupt_frame *f, nt_exception_record_t *recp) {
+    process_t *me = proc_current();
+    nt_exception_record_t rec = *recp;
+    nt_context_t c;
+    uint64 sp;
+
     ntctx_capture_intr(&c, f);
     if (f->vector == 3) {
         /* int3 is a trap - RIP is past it. NT reports the breakpoint AT
