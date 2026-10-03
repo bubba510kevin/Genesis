@@ -272,9 +272,8 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x3F` and `0x80`
-  (NtCreateUserProcess). `0x40`-`0x7F` is the display/input range; the next
-  core call is `0x81`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x85`.
+  `0x40`-`0x7F` is the display/input range; the next core call is `0x86`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
@@ -331,7 +330,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `sync` (`sync.exe`) | 51 passed | |
 | `ntsync` (`ntsync.exe`) | 34 passed | |
 | `vm` (`vm.exe`) | 68 passed | |
-| `proc` (`proc.exe`) | 28 passed | |
+| `proc` (`proc.exe`) | 40 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
 | `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |

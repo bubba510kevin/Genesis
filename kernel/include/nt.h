@@ -332,6 +332,22 @@ struct syscall_frame;
  * core call past the display/input range (0x40-0x7F). */
 #define NT_SYS_CREATE_USER_PROCESS   0x80
 
+/* Handles across processes (16(m)):
+ * NtDuplicateObject(HANDLE SourceProcess, HANDLE SourceHandle,
+ *                   HANDLE TargetProcess, PHANDLE TargetHandle,
+ *                   ACCESS_MASK, ULONG HandleAttributes, ULONG Options)
+ * NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID)
+ * NtSetInformationObject(HANDLE, ULONG Class, PVOID, ULONG Length)
+ * NtQueryObject(HANDLE, ULONG Class, PVOID, ULONG Length, PULONG Ret)
+ *   Class 4 (ObjectHandleFlagInformation) only, for both.
+ * NtGenesisCreatePipe(PHANDLE Read, PHANDLE Write, ULONG Attributes,
+ *                     ULONG BufferSize) - Genesis's own; see nt.c. */
+#define NT_SYS_DUPLICATE_OBJECT      0x81
+#define NT_SYS_OPEN_PROCESS          0x82
+#define NT_SYS_SET_INFORMATION_OBJECT 0x83
+#define NT_SYS_QUERY_OBJECT          0x84
+#define NT_SYS_GENESIS_CREATE_PIPE   0x85
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -418,6 +434,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_NOT_A_DIRECTORY    0xC0000103u
 #define STATUS_TOO_MANY_OPENED_FILES 0xC000011Fu
 #define STATUS_END_OF_FILE        0xC0000011u
+#define STATUS_PIPE_BROKEN        0xC000014Bu
 #define STATUS_ACCESS_DENIED      0xC0000022u
 #define STATUS_NAME_TOO_LONG      0xC0000106u
 #define STATUS_NO_MEMORY          0xC0000017u

@@ -11,6 +11,7 @@
 #include "ntvm.h"
 #include "section.h"
 #include "ntspawn.h"
+#include "pipe.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -467,8 +468,15 @@ static uint64 nt_rw_file(uint64 handle, int writing) {
      * until Information is zero works either way; one that tests NT_SUCCESS
      * loops forever without this. */
     if (!writing && done == 0 && length > 0) {
-        iosb->status = STATUS_END_OF_FILE;
-        return STATUS_END_OF_FILE;
+        /* A pipe with no writer left is BROKEN on NT, not at its end -
+         * ReadFile's ERROR_BROKEN_PIPE, which is what a loop draining a
+         * child's output stops on. */
+        uint64 eof = (f->obj->type != NULL &&
+                      f->obj->type->klass == OBJ_PIPE)
+                         ? STATUS_PIPE_BROKEN : STATUS_END_OF_FILE;
+
+        iosb->status = eof;
+        return eof;
     }
     iosb->status = STATUS_SUCCESS;
     return STATUS_SUCCESS;
@@ -1623,6 +1631,254 @@ static uint64 nt_flush_virtual(uint64 process, uint64 base_ptr,
     return st;
 }
 
+/* --- handles across processes (ROADMAP 16(m)) ------------------------------
+ *
+ * A process's handle table is its leader's; another process's is reached
+ * through a process handle. Holding that handle is the permission - access
+ * masks are not checked anywhere yet. */
+
+/* The live process a process handle (or NtCurrentProcess()) names. */
+static process_t *nt_process_of(uint64 handle) {
+    process_t *me = proc_current(), *leader;
+    object_t *obj;
+    int pid = 0;
+
+    if (handle == NT_CURRENT_PROCESS) {
+        leader = proc_find(me->tgid);
+        return leader != NULL ? leader : me;
+    }
+    obj = nt_object_of(handle);
+    if (obj == NULL || process_object_query(obj, &pid, NULL, NULL) != 0) {
+        return NULL;                  /* not a process, or it has ended */
+    }
+    leader = proc_find(pid);
+    if (leader == NULL || leader->tgid != pid || leader->state == PROC_ZOMBIE) {
+        return NULL;
+    }
+    return leader;
+}
+
+/* What a pseudo-handle stands for, as an object a real handle can name:
+ * GetCurrentProcess() and GetCurrentThread() duplicated are the classic way
+ * to get a handle another thread or process can use. The main thread has
+ * no Thread object until it is asked for one. */
+static object_t *pseudo_object(uint64 h) {
+    process_t *me = proc_current();
+
+    if (h == NT_CURRENT_PROCESS) {
+        process_t *leader = proc_find(me->tgid);
+
+        return proc_process_object(leader != NULL ? leader : me);
+    }
+    if (h == NT_CURRENT_THREAD) {
+        if (me->nt_thread_obj == NULL) {
+            me->nt_thread_obj = thread_object_create(me->pid);
+        }
+        return me->nt_thread_obj;
+    }
+    return NULL;
+}
+
+#define DUPLICATE_CLOSE_SOURCE     0x1u
+#define DUPLICATE_SAME_ACCESS      0x2u
+#define DUPLICATE_SAME_ATTRIBUTES  0x4u
+#define OBJ_INHERIT                0x2u
+
+/* NtDuplicateObject(HANDLE SourceProcess, HANDLE SourceHandle,
+ *                   HANDLE TargetProcess, PHANDLE TargetHandle,
+ *                   ACCESS_MASK, ULONG HandleAttributes, ULONG Options)
+ * The new handle shares the source's open instance (and file position), as
+ * a duplicated handle does on NT. */
+static uint64 nt_duplicate_object(uint64 src_proc, uint64 src_handle,
+                                  uint64 dst_proc, uint64 dst_ptr,
+                                  uint64 attributes, uint64 options) {
+    process_t *src = nt_process_of(src_proc), *dst = NULL;
+    open_file_t *of = NULL;
+    uint32 flags = 0;
+    int sindex = -1, dindex;
+
+    if (src == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (dst_ptr != 0) {
+        dst = nt_process_of(dst_proc);
+        if (dst == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if (!user_range_ok(dst_ptr, 8)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    if ((src_handle == NT_CURRENT_PROCESS || src_handle == NT_CURRENT_THREAD) &&
+        src->tgid == proc_current()->tgid) {
+        object_t *obj = pseudo_object(src_handle);
+
+        if (obj == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        of = of_open(obj, ACCESS_READ | ACCESS_WRITE);
+        if (of == NULL) {
+            return STATUS_TOO_MANY_OPENED_FILES;
+        }
+    } else {
+        sindex = nt_handle_index(src_handle);
+        of = sindex >= 0 ? handle_get(src->handles, sindex) : NULL;
+        if (of == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if ((uint32)options & DUPLICATE_SAME_ATTRIBUTES) {
+            flags = (uint32)handle_flags(src->handles, sindex) &
+                    HANDLE_INHERITABLE;
+        }
+        of_ref(of);
+    }
+    if ((uint32)attributes & OBJ_INHERIT) {
+        flags |= HANDLE_INHERITABLE;
+    }
+    if (dst != NULL) {
+        dindex = handle_alloc(dst->handles, of, flags);   /* consumes of */
+        if (dindex < 0) {
+            return STATUS_TOO_MANY_OPENED_FILES;
+        }
+        *(uint64 *)dst_ptr = NT_HANDLE_FROM_INDEX(dindex);
+    } else {
+        of_deref(of);
+    }
+    if (((uint32)options & DUPLICATE_CLOSE_SOURCE) && sindex >= 0) {
+        (void)handle_close(src->handles, sindex);
+    }
+    return STATUS_SUCCESS;
+}
+
+/* NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): by
+ * process id. Any process - Linux ones too: one table serves both. */
+static uint64 nt_open_process(uint64 handle_out, uint64 cid_ptr) {
+    process_t *leader;
+    object_t *obj;
+    int pid;
+
+    if (!user_range_ok(handle_out, 8) || !user_range_ok(cid_ptr, 16)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    pid = (int)((const uint64 *)cid_ptr)[0];
+    leader = proc_find(pid);
+    if (pid <= 0 || leader == NULL || leader->tgid != pid ||
+        leader->is_kthread || leader->state == PROC_ZOMBIE) {
+        return STATUS_INVALID_CID;
+    }
+    obj = proc_process_object(leader);
+    if (obj == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    return nt_handle_for(obj, handle_out);
+}
+
+/* NtSetInformationObject / NtQueryObject, class 4 only:
+ * OBJECT_HANDLE_FLAG_INFORMATION { BOOLEAN Inherit; BOOLEAN ProtectFromClose; }
+ * - SetHandleInformation / GetHandleInformation. ProtectFromClose is
+ * remembered by nothing and reported FALSE. */
+#define ObjectHandleFlagInformation 4
+
+static uint64 nt_set_information_object(uint64 handle, uint64 klass,
+                                        uint64 buf, uint64 len) {
+    process_t *p = proc_current();
+    int index = nt_handle_index(handle), flags;
+
+    if ((uint32)klass != ObjectHandleFlagInformation) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if ((uint32)len < 2) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_range_ok(buf, 2)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (index < 0 || handle_get(p->handles, index) == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    flags = handle_flags(p->handles, index);
+    if (((const uint8 *)buf)[0]) {
+        flags |= HANDLE_INHERITABLE;
+    } else {
+        flags &= ~HANDLE_INHERITABLE;
+    }
+    (void)handle_set_flags(p->handles, index, (uint32)flags);
+    return STATUS_SUCCESS;
+}
+
+static uint64 nt_query_object(uint64 handle, uint64 klass, uint64 buf,
+                              uint64 len, uint64 retlen_ptr) {
+    process_t *p = proc_current();
+    int index = nt_handle_index(handle);
+
+    if ((uint32)klass != ObjectHandleFlagInformation) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if ((uint32)len < 2) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if (!user_range_ok(buf, 2) ||
+        (retlen_ptr != 0 && !user_range_ok(retlen_ptr, 4))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (index < 0 || handle_get(p->handles, index) == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    ((uint8 *)buf)[0] = (handle_flags(p->handles, index) &
+                         HANDLE_INHERITABLE) != 0;
+    ((uint8 *)buf)[1] = 0;
+    if (retlen_ptr != 0) {
+        *(uint32 *)retlen_ptr = 2;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* NtGenesisCreatePipe(PHANDLE Read, PHANDLE Write, ULONG Attributes,
+ *                     ULONG BufferSize) - Genesis's own, like
+ * NtGenesisLoadImage: an anonymous pipe as two handles, OBJ_INHERIT making
+ * both inheritable. NT builds CreatePipe out of a uniquely named pipe in
+ * \Device\NamedPipe; there is no named-pipe file system yet (16(q)), and
+ * an anonymous pipe needs nothing a name would add. The same pipe object
+ * Linux's pipe2 makes, so a Windows parent and a Linux child (or the
+ * reverse) can be joined by one. */
+static uint64 nt_genesis_create_pipe(uint64 rd_ptr, uint64 wr_ptr,
+                                     uint64 attributes) {
+    process_t *p = proc_current();
+    object_t *rd = NULL, *wr = NULL;
+    open_file_t *rf, *wf;
+    uint32 flags = ((uint32)attributes & OBJ_INHERIT) ? HANDLE_INHERITABLE : 0;
+    int ri, wi;
+
+    if (!user_range_ok(rd_ptr, 8) || !user_range_ok(wr_ptr, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (pipe_create(&rd, &wr) != 0) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    rf = of_open(rd, ACCESS_READ);
+    wf = of_open(wr, ACCESS_WRITE);
+    ob_deref(rd);
+    ob_deref(wr);
+    if (rf == NULL || wf == NULL) {
+        of_deref(rf);
+        of_deref(wf);
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    ri = handle_alloc(p->handles, rf, flags);
+    if (ri < 0) {
+        of_deref(wf);
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    wi = handle_alloc(p->handles, wf, flags);
+    if (wi < 0) {
+        (void)handle_close(p->handles, ri);
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    *(uint64 *)rd_ptr = NT_HANDLE_FROM_INDEX(ri);
+    *(uint64 *)wr_ptr = NT_HANDLE_FROM_INDEX(wi);
+    return STATUS_SUCCESS;
+}
+
 /* --- threads (ROADMAP item 14(a)) -------------------------------------------
  *
  * See NT_SYS_CREATE_THREAD in nt.h for the contract and the one register
@@ -2066,6 +2322,43 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
 
         case NT_SYS_CREATE_USER_PROCESS:
             return nt_trace(frame->rax, nt_create_user_process(frame));
+
+        case NT_SYS_DUPLICATE_OBJECT: {
+            uint64 attributes = 0, options = 0;
+
+            /* DesiredAccess (5) is not checked: no access masks yet. */
+            if (!nt_stack_arg(syscall_get_user_rsp(), 6, &attributes) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 7, &options)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            nt_duplicate_object(frame->r10, frame->rdx,
+                                                frame->r8, frame->r9,
+                                                attributes, options));
+        }
+
+        case NT_SYS_OPEN_PROCESS:
+            return nt_trace(frame->rax,
+                            nt_open_process(frame->r10, frame->r9));
+
+        case NT_SYS_SET_INFORMATION_OBJECT:
+            return nt_trace(frame->rax,
+                            nt_set_information_object(frame->r10, frame->rdx,
+                                                      frame->r8, frame->r9));
+
+        case NT_SYS_QUERY_OBJECT: {
+            uint64 retlen = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &retlen);
+            return nt_trace(frame->rax,
+                            nt_query_object(frame->r10, frame->rdx, frame->r8,
+                                            frame->r9, retlen));
+        }
+
+        case NT_SYS_GENESIS_CREATE_PIPE:
+            return nt_trace(frame->rax,
+                            nt_genesis_create_pipe(frame->r10, frame->rdx,
+                                                   frame->r8));
 
         case NT_SYS_FLUSH_VIRTUAL:
             return nt_trace(frame->rax,

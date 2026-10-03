@@ -411,7 +411,9 @@ and kernel32's `CreateProcessW/A`; process handles that are waitable and
 carry the 32-bit exit code (`GetExitCodeProcess`, `TerminateProcess`,
 `STILL_ACTIVE`); `CREATE_SUSPENDED`; inherited and standard handles;
 `NtSuspendProcess`/`NtResumeProcess`. Two Windows processes now share named
-objects and sections.
+objects and sections. `DuplicateHandle` (into and out of other processes),
+`OpenProcess`, handle inheritance flags, and `CreatePipe` - a child's output
+read through a pipe until `ERROR_BROKEN_PIPE`.
 
 **NT virtual memory ✅** (2026-10-03, ROADMAP 16(l)/14(d)): reserve, commit,
 decommit, release; `VirtualProtect` with enforced READONLY / NOACCESS /
