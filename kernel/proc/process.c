@@ -165,6 +165,7 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->clear_child_tid = 0;
     current->nt_thread_obj   = NULL;
     current->nt_process_obj  = NULL;
+    current->nt_token        = NULL;
     current->nt_exit_code_set = 0;
     current->autoreap        = 0;
     current->group_finished  = 0;
@@ -606,6 +607,7 @@ process_t *proc_alloc(int ppid) {
             p->clear_child_tid = 0;
             p->nt_thread_obj   = NULL;
             p->nt_process_obj  = NULL;
+            p->nt_token        = NULL;
             p->nt_exit_code    = 0;
             p->nt_exit_code_set = 0;
             p->autoreap        = 0;
@@ -808,6 +810,10 @@ void proc_group_finished(process_t *p) {
                               cpu);
         ob_deref(leader->nt_process_obj);       /* the process's own ref */
         leader->nt_process_obj = NULL;
+    }
+    if (leader->nt_token != NULL) {
+        ob_deref(leader->nt_token);             /* handles keep theirs */
+        leader->nt_token = NULL;
     }
 }
 

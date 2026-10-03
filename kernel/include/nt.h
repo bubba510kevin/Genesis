@@ -384,6 +384,14 @@ struct syscall_frame;
 #define NT_SYS_CREATE_NAMED_PIPE     0x95
 #define NT_SYS_FS_CONTROL_FILE       0x96
 
+/* Access tokens (ROADMAP 16(n)), kernel/obj/token.c. */
+#define NT_SYS_OPEN_PROCESS_TOKEN    0x97
+#define NT_SYS_OPEN_PROCESS_TOKEN_EX 0x98
+#define NT_SYS_OPEN_THREAD_TOKEN     0x99
+#define NT_SYS_OPEN_THREAD_TOKEN_EX  0x9A
+#define NT_SYS_QUERY_TOKEN           0x9B
+#define NT_SYS_ADJUST_PRIVILEGES     0x9C
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -481,6 +489,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_PIPE_LISTENING     0xC00000B3u
 #define STATUS_IO_TIMEOUT         0xC00000B5u
 #define STATUS_CANCELLED          0xC0000120u
+#define STATUS_NO_TOKEN           0xC000007Cu
 #define STATUS_INVALID_DEVICE_REQUEST 0xC0000010u
 #define STATUS_OBJECT_NAME_INVALID 0xC0000033u
 #define STATUS_PIPE_BUFFER_OVERFLOW 0x80000005u   /* STATUS_BUFFER_OVERFLOW */

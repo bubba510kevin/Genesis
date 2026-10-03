@@ -246,6 +246,9 @@ typedef struct process {
      * its parent will never call wait4, so its slot is freed as soon as the
      * process has ended rather than waiting for a reaper that never comes. */
     struct object   *nt_process_obj;
+    /* The process's access token, built on first open (kernel/obj/token.c)
+     * and released when the process has ended. On the leader. */
+    struct object   *nt_token;
     uint32           nt_exit_code;
     uint8            nt_exit_code_set;
     uint8            autoreap;

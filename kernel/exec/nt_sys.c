@@ -10,6 +10,8 @@
 #include "syscall.h"
 #include "teb.h"
 #include "timer.h"
+#include "token.h"
+#include "kheap.h"
 #include "typesk.h"
 #include "waitq.h"
 
@@ -737,6 +739,149 @@ static int resolve_process(uint64 handle, proc_ref_t *r) {
         r->leader = NULL;
     }
     return 1;
+}
+
+/* --- access tokens (ROADMAP 16(n)) -----------------------------------------
+ *
+ * The token is kernel/obj/token.c; these open it and copy its information
+ * out. A process's token is shared by every handle to it, so an
+ * NtAdjustPrivilegesToken through one is seen through the others. */
+
+uint64 nt_handle_for(object_t *obj, uint64 handle_out);
+
+/* NtOpenProcessToken(Ex): the token of the process a handle names. */
+static uint64 nt_open_process_token(uint64 process, uint64 handle_out) {
+    proc_ref_t pr;
+    object_t *tok;
+    uint64 st;
+
+    if (!user_range_ok(handle_out, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!resolve_process(process, &pr)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (pr.leader == NULL) {
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+    tok = token_of_process(pr.leader);
+    if (tok == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    st = nt_handle_for(tok, handle_out);
+    ob_deref(tok);
+    return st;
+}
+
+/* NtOpenThreadToken(Ex): a thread has a token of its own only while it
+ * impersonates, which nothing here does yet - STATUS_NO_TOKEN, the answer
+ * every caller is written to expect (it then opens the process token). */
+static uint64 nt_open_thread_token(uint64 thread, uint64 handle_out) {
+    (void)thread;
+    if (!user_range_ok(handle_out, 8)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    return STATUS_NO_TOKEN;
+}
+
+static object_t *token_handle(uint64 handle) {
+    object_t *obj = nt_object_of(handle);
+
+    return token_is_token(obj) ? obj : NULL;
+}
+
+/* NtQueryInformationToken(Token, Class, Buffer, Length, ReturnLength):
+ * built in a kernel buffer, then copied out - the SID pointers inside are
+ * computed for where the copy lands. */
+static uint64 nt_query_token(uint64 handle, uint64 klass, uint64 buf,
+                             uint64 len, uint64 ret_ptr) {
+    object_t *tok = token_handle(handle);
+    uint8 *k;
+    uint32 need = 0, st;
+    uint64 i;
+
+    if (tok == NULL) {
+        return nt_object_of(handle) == NULL ? STATUS_INVALID_HANDLE
+                                            : STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    len &= 0xFFFFFFFFULL;
+    if ((len != 0 && !user_range_ok(buf, len)) ||
+        (ret_ptr != 0 && !user_range_ok(ret_ptr, 4))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (len > 4096) {
+        len = 4096;
+    }
+    k = (uint8 *)kmalloc(len != 0 ? len : 1);
+    if (k == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    st = token_query(tok, (uint32)klass, k, (uint32)len, buf, &need);
+    if (st == STATUS_SUCCESS) {
+        for (i = 0; i < need; i++) {
+            ((uint8 *)buf)[i] = k[i];
+        }
+    }
+    kfree(k);
+    if (ret_ptr != 0) {
+        *(uint32 *)ret_ptr = need;
+    }
+    return st;
+}
+
+/* NtAdjustPrivilegesToken(Token, DisableAll, NewState, BufferLength,
+ *                         PreviousState, ReturnLength) */
+static uint64 nt_adjust_privileges(uint64 handle, uint64 disable_all,
+                                   uint64 new_state, uint64 prev_len,
+                                   uint64 prev, uint64 ret_ptr) {
+    object_t *tok = token_handle(handle);
+    uint8 knew[4 + 12 * 32], kprev[4 + 12 * 32];
+    uint32 count = 0, new_len = 0, need = 0, st;
+    uint64 i;
+
+    if (tok == NULL) {
+        return nt_object_of(handle) == NULL ? STATUS_INVALID_HANDLE
+                                            : STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    prev_len &= 0xFFFFFFFFULL;
+    if (!(uint8)disable_all) {
+        if (!user_range_ok(new_state, 4)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        count = *(const uint32 *)new_state;
+        if (count > 32) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        new_len = 4 + 12 * count;
+        if (!user_range_ok(new_state, new_len)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        for (i = 0; i < new_len; i++) {
+            knew[i] = ((const uint8 *)new_state)[i];
+        }
+    }
+    if (prev != 0 && !user_range_ok(prev, prev_len)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (ret_ptr != 0 && !user_range_ok(ret_ptr, 4)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = token_adjust(tok, (uint8)disable_all, knew, new_len,
+                      prev != 0 ? kprev : NULL,
+                      prev != 0 ? (prev_len < sizeof(kprev)
+                                       ? (uint32)prev_len
+                                       : (uint32)sizeof(kprev))
+                                : 0,
+                      &need);
+    if (ret_ptr != 0) {
+        *(uint32 *)ret_ptr = need;
+    }
+    if (prev != 0 && (st == STATUS_SUCCESS || st == 0x00000106u)) {
+        for (i = 0; i < need; i++) {
+            ((uint8 *)prev)[i] = kprev[i];
+        }
+    }
+    return st;
 }
 
 static uint64 nt_query_information_process(uint64 handle, uint64 cls, uint64 buf,
@@ -1518,6 +1663,25 @@ uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
         (void)nt_stack_arg(syscall_get_user_rsp(), 6, &a6);
         return nt_query_system_information_ex(frame->r10, frame->rdx, frame->r8,
                                               frame->r9, a5, a6);
+    case NT_SYS_OPEN_PROCESS_TOKEN:
+        return nt_open_process_token(frame->r10, frame->r8);
+    case NT_SYS_OPEN_PROCESS_TOKEN_EX:
+        return nt_open_process_token(frame->r10, frame->r9);
+    case NT_SYS_OPEN_THREAD_TOKEN:
+    case NT_SYS_OPEN_THREAD_TOKEN_EX:
+        (void)nt_stack_arg(syscall_get_user_rsp(), 5, &a5);
+        return nt_open_thread_token(frame->r10,
+                                    frame->rax == NT_SYS_OPEN_THREAD_TOKEN
+                                        ? frame->r9 : a5);
+    case NT_SYS_QUERY_TOKEN:
+        (void)nt_stack_arg(syscall_get_user_rsp(), 5, &a5);
+        return nt_query_token(frame->r10, frame->rdx, frame->r8, frame->r9,
+                              a5);
+    case NT_SYS_ADJUST_PRIVILEGES:
+        (void)nt_stack_arg(syscall_get_user_rsp(), 5, &a5);
+        (void)nt_stack_arg(syscall_get_user_rsp(), 6, &a6);
+        return nt_adjust_privileges(frame->r10, frame->rdx, frame->r8,
+                                    frame->r9, a5, a6);
     case NT_SYS_QUERY_PROCESS:
         (void)nt_stack_arg(syscall_get_user_rsp(), 5, &a5);
         return nt_query_information_process(frame->r10, frame->rdx, frame->r8,

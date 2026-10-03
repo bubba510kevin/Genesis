@@ -446,6 +446,12 @@ ports (`NtCreateIoCompletion`, `NtSetIoCompletion`,
 `GetQueuedCompletionStatus(Ex)`, alertable included). Not yet: a file
 associated with a port (needs overlapped I/O), the concurrency limit.
 
+**Access tokens ✅ (first slice)** (2026-10-03, ROADMAP 16(n)):
+`NtOpenProcessToken`, `NtQueryInformationToken` (user, groups,
+privileges, owner, primary group, integrity level, elevation, statistics)
+and `NtAdjustPrivilegesToken`, one token per process built from its uid and
+groups. No impersonation yet, and nothing checks access against a token.
+
 **Named pipes ✅** (2026-10-03, ROADMAP 16(q)): `\\.\pipe\name` -
 `CreateNamedPipe` (instance limits, `FILE_FLAG_FIRST_PIPE_INSTANCE`),
 clients through `CreateFile`, `ConnectNamedPipe`, `DisconnectNamedPipe`,

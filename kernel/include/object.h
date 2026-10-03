@@ -163,7 +163,10 @@ typedef enum {
 
     /* Linux's signalfd and pidfd (kernel/proc/sigfd.c). */
     OBJ_SIGNALFD,
-    OBJ_PIDFD
+    OBJ_PIDFD,
+
+    /* An access token (kernel/obj/token.c). */
+    OBJ_TOKEN
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three
