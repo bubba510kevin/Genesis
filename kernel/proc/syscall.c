@@ -1,3 +1,4 @@
+#include "ntspawn.h"
 #include "kusd.h"
 #include "syscall.h"
 #include "io.h"
@@ -2825,6 +2826,12 @@ uint64 syscall_exit_process(uint64 status, struct syscall_frame *frame) {
         handle_close_all(p->handles);
     }
 
+    /* The last one out of a process tells its process object (a Windows
+     * parent waiting on a process handle). Usually not yet - this thread is
+     * still on its CPU and so still counts as alive - in which case
+     * schedule()'s zombie_left_cpu says it again once it is off. */
+    proc_group_finished(p);
+
     if (resume_vfork_parent(p, frame)) {
         return frame->rax;
     }
@@ -3270,6 +3277,118 @@ static void exec_release_file(uint8 *buf) {
     fs_free_file(buf);
 }
 
+/* --- building a Windows process image ------------------------------------
+ *
+ * Everything a PE needs in its address space before its first instruction:
+ * the image and its DLLs (pe_load_executable), the TEB and PEB, the shared
+ * page, the module table ntdll's unwinder reads, implicit TLS, and the
+ * parameters block. Into `new_space`, which need not be loaded - execve
+ * builds the image that replaces the caller, NtCreateUserProcess one for a
+ * process that does not exist yet (kernel/exec/ntspawn.c). 0 or a negative
+ * errno; on failure the caller destroys the space. */
+int pe_exec_build(address_space_t *new_space, uint8 *image, uint32 size,
+                  int pid, int tid, const nt_params_desc_t *pd,
+                  pe_exec_t *out) {
+    pe_info_t pe;
+    int rc;
+
+    out->tls_va = out->tls_pages = out->tls_entry_via_ntdll = 0;
+    rc = pe_load_executable(new_space, image, size, &pe,
+                            exec_read_file, exec_release_file);
+    if (rc != PE_OK) {
+        print_string("execve: ", 0x0C);
+        print_string(pe_strerror(rc), 0x0C);
+        print_string("\n", 0x0C);
+        return -8;    /* -ENOEXEC */
+    }
+    out->entry          = pe.entry;
+    out->image_base     = pe.image_base;
+    out->highest_vaddr  = pe.highest_vaddr;
+    out->section_count  = pe.section_count;
+    out->thread_start   = pe.thread_start;
+    out->apc_dispatcher = pe.apc_dispatcher;
+    out->exc_dispatcher = pe.exception_dispatcher;
+
+    /* The TEB and PEB, built by the kernel before the image runs -
+     * exactly as NT does it, and it has to be that way round:
+     * LdrInitializeThunk reads its arguments out of the block, so it
+     * cannot be the thing that creates it. */
+    rc = nt_process_init(new_space, pe.image_base,
+                         USER_STACK_TOP, USER_STACK_SIZE, pid, tid);
+    if (rc == 0) {
+        /* The shared page and the PEB's version fields (kusd.h). */
+        rc = kusd_map(new_space);
+        kusd_fill_peb(new_space);
+    }
+    if (rc != 0) {
+        return -12;   /* -ENOMEM */
+    }
+
+    /* The module table, for ntdll's exception unwinder. */
+    {
+        nt_module_table_t mt;
+        int k;
+
+        mt.magic = NT_MODULES_MAGIC;
+        mt.count = 0;
+        for (k = 0; k < NT_MAX_MODULES; k++) {
+            mt.mod[k].base = mt.mod[k].size = 0;
+        }
+        for (k = 0; k < pe.mod_count && k < NT_MAX_MODULES; k++) {
+            mt.mod[k].base = pe.mods[k].base;
+            mt.mod[k].size = pe.mods[k].size;
+            mt.count++;
+        }
+        (void)nt_modules_publish(new_space, &mt);
+    }
+
+    /* Implicit TLS: lay out one thread's area (the pointer array, then
+     * each module's block, 16-aligned), publish the table in the PEB for
+     * every later thread and for ntdll's callbacks, and build the main
+     * thread's area now. */
+    if (pe.tls_count > 0) {
+        nt_tls_table_t tt;
+        uint64 off;
+        int k;
+
+        tt.magic = NT_TLS_MAGIC;
+        tt.count = (uint32)pe.tls_count;
+        off = ((uint64)pe.tls_count * 8 + 15) & ~15ULL;
+        for (k = 0; k < NT_TLS_MAX_MODULES; k++) {
+            nt_tls_module_t *m = &tt.mod[k];
+
+            if (k >= pe.tls_count) {
+                m->module_base = m->start = m->end = m->zero_fill = 0;
+                m->index_addr = m->callbacks = m->block_offset = 0;
+                continue;
+            }
+            m->module_base  = pe.tls[k].module_base;
+            m->start        = pe.tls[k].start;
+            m->end          = pe.tls[k].end;
+            m->zero_fill    = pe.tls[k].zero_fill;
+            m->index_addr   = pe.tls[k].index_addr;
+            m->callbacks    = pe.tls[k].callbacks;
+            m->block_offset = off;
+            off += ((m->end - m->start) + m->zero_fill + 15) & ~15ULL;
+        }
+        tt.area_bytes = off;
+        if (off > NT_TLS_AREA_STRIDE || nt_tls_publish(new_space, &tt) != 0 ||
+            nt_thread_tls_init(new_space, NT_TLS_MAIN_SLOT, NT_TEB_BASE,
+                               &out->tls_va, &out->tls_pages) != 0) {
+            print_string("execve: implicit TLS does not fit\n", 0x0C);
+            return -8;
+        }
+        /* TLS callbacks run in ring 3, so the main thread enters through
+         * ntdll's RtlUserThreadStart - StartRoutine in RDX, as for every
+         * other thread - which runs them (DLL_PROCESS_ATTACH) first. */
+        if (pe.has_tls_callbacks && pe.thread_start != 0) {
+            out->tls_entry_via_ntdll = pe.thread_start;
+        }
+    }
+
+    return nt_process_params_init(new_space, pd);
+}
+
 static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
                          struct syscall_frame *frame) {
     process_t *p = proc_current();
@@ -3354,121 +3473,8 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
      * is not in CR3, so the caller's mappings are untouched and a malformed
      * file is still just an errno. */
     if (pe_is_pe(image, size)) {
-        pe_info_t pe;
-
-        rc = pe_load_executable(new_space, image, size, &pe,
-                                exec_read_file, exec_release_file);
-        if (rc != PE_OK) {
-            print_string("execve: ", 0x0C);
-            print_string(pe_strerror(rc), 0x0C);
-            print_string("\n", 0x0C);
-            vmm_space_destroy(new_space);
-            kfree(image);
-            kfree(ec);
-            return (uint64)-8;    /* -ENOEXEC */
-        }
-        /* elf_info_t is what the rest of execve reads. Only three of its
-         * fields mean anything for a PE - there are no program headers to
-         * publish through auxv, so phnum stays zero and the stack builder
-         * emits an empty AT_PHDR rather than a fabricated one. */
-        info.entry         = pe.entry;
-        info.lowest_vaddr  = pe.image_base;
-        info.highest_vaddr = pe.highest_vaddr;
-        info.load_count    = pe.section_count;
-        info.phdr_vaddr    = 0;
-        info.phnum         = 0;
-        info.phentsize     = 0;
-        new_personality    = PERSONALITY_WINDOWS;
-        new_thread_start   = pe.thread_start;
-        new_apc_dispatcher = pe.apc_dispatcher;
-        new_exc_dispatcher = pe.exception_dispatcher;
-
-        /* The TEB and PEB, built by the kernel before the image runs -
-         * exactly as NT does it, and it has to be that way round:
-         * LdrInitializeThunk reads its arguments out of the block, so it
-         * cannot be the thing that creates it. Built into the NEW address
-         * space, so a failure here is still just -ENOEXEC. */
-        rc = nt_process_init(new_space, pe.image_base,
-                             USER_STACK_TOP, USER_STACK_SIZE,
-                             p->pid, p->thread.tid);
-        if (rc == 0) {
-            /* The shared page and the PEB's version fields (kusd.h). */
-            rc = kusd_map(new_space);
-            kusd_fill_peb(new_space);
-        }
-        if (rc != 0) {
-            vmm_space_destroy(new_space);
-            kfree(image);
-            kfree(ec);
-            return (uint64)-12;   /* -ENOMEM */
-        }
-
-        /* The module table, for ntdll's exception unwinder. */
-        {
-            nt_module_table_t mt;
-            int k;
-
-            mt.magic = NT_MODULES_MAGIC;
-            mt.count = 0;
-            for (k = 0; k < NT_MAX_MODULES; k++) {
-                mt.mod[k].base = mt.mod[k].size = 0;
-            }
-            for (k = 0; k < pe.mod_count && k < NT_MAX_MODULES; k++) {
-                mt.mod[k].base = pe.mods[k].base;
-                mt.mod[k].size = pe.mods[k].size;
-                mt.count++;
-            }
-            (void)nt_modules_publish(new_space, &mt);
-        }
-
-        /* Implicit TLS: lay out one thread's area (the pointer array, then
-         * each module's block, 16-aligned), publish the table in the PEB for
-         * every later thread and for ntdll's callbacks, and build the main
-         * thread's area now. */
-        new_tls_va = 0;
-        new_tls_pages = 0;
-        if (pe.tls_count > 0) {
-            nt_tls_table_t tt;
-            uint64 off;
-            int k;
-
-            tt.magic = NT_TLS_MAGIC;
-            tt.count = (uint32)pe.tls_count;
-            off = ((uint64)pe.tls_count * 8 + 15) & ~15ULL;
-            for (k = 0; k < NT_TLS_MAX_MODULES; k++) {
-                nt_tls_module_t *m = &tt.mod[k];
-
-                if (k >= pe.tls_count) {
-                    m->module_base = m->start = m->end = m->zero_fill = 0;
-                    m->index_addr = m->callbacks = m->block_offset = 0;
-                    continue;
-                }
-                m->module_base  = pe.tls[k].module_base;
-                m->start        = pe.tls[k].start;
-                m->end          = pe.tls[k].end;
-                m->zero_fill    = pe.tls[k].zero_fill;
-                m->index_addr   = pe.tls[k].index_addr;
-                m->callbacks    = pe.tls[k].callbacks;
-                m->block_offset = off;
-                off += ((m->end - m->start) + m->zero_fill + 15) & ~15ULL;
-            }
-            tt.area_bytes = off;
-            if (off > NT_TLS_AREA_STRIDE || nt_tls_publish(new_space, &tt) != 0 ||
-                nt_thread_tls_init(new_space, NT_TLS_MAIN_SLOT, NT_TEB_BASE,
-                                   &new_tls_va, &new_tls_pages) != 0) {
-                print_string("execve: implicit TLS does not fit\n", 0x0C);
-                vmm_space_destroy(new_space);
-                kfree(image);
-                kfree(ec);
-                return (uint64)-8;
-            }
-            /* TLS callbacks run in ring 3, so the main thread enters through
-             * ntdll's RtlUserThreadStart - StartRoutine in RDX, as for every
-             * other thread - which runs them (DLL_PROCESS_ATTACH) first. */
-            if (pe.has_tls_callbacks && pe.thread_start != 0) {
-                tls_entry_via_ntdll = pe.thread_start;
-            }
-        }
+        pe_exec_t pex;
+        nt_params_desc_t pd;
 
         /* RTL_USER_PROCESS_PARAMETERS: what the process was started with.
          *
@@ -3489,28 +3495,47 @@ static uint64 sys_execve(uint64 path_ptr, uint64 argv_ptr, uint64 envp_ptr,
          * never a valid handle - so a program that checks gets INVALID and a
          * program that does not gets a failed call, rather than either
          * getting whatever object happens to sit at index 0 later. */
-        {
-            nt_params_desc_t pd;
+        pd.image_path = resolved;
+        pd.cwd        = p->cwd;
+        pd.argv       = ec->argv;
+        pd.envp       = ec->envp;
+        pd.command_line = NULL;
+        pd.command_line_chars = 0;
+        pd.environment = NULL;
+        pd.environment_chars = 0;
+        pd.std_input  = handle_get(p->handles, 0) != NULL
+                            ? NT_HANDLE_FROM_INDEX(0) : 0;
+        pd.std_output = handle_get(p->handles, 1) != NULL
+                            ? NT_HANDLE_FROM_INDEX(1) : 0;
+        pd.std_error  = handle_get(p->handles, 2) != NULL
+                            ? NT_HANDLE_FROM_INDEX(2) : 0;
 
-            pd.image_path = resolved;
-            pd.cwd        = p->cwd;
-            pd.argv       = ec->argv;
-            pd.envp       = ec->envp;
-            pd.std_input  = handle_get(p->handles, 0) != NULL
-                                ? NT_HANDLE_FROM_INDEX(0) : 0;
-            pd.std_output = handle_get(p->handles, 1) != NULL
-                                ? NT_HANDLE_FROM_INDEX(1) : 0;
-            pd.std_error  = handle_get(p->handles, 2) != NULL
-                                ? NT_HANDLE_FROM_INDEX(2) : 0;
-
-            rc = nt_process_params_init(new_space, &pd);
-            if (rc != 0) {
-                vmm_space_destroy(new_space);
-                kfree(image);
-                kfree(ec);
-                return (uint64)(int64)rc;
-            }
+        rc = pe_exec_build(new_space, image, size, p->pid, p->thread.tid,
+                           &pd, &pex);
+        if (rc != 0) {
+            vmm_space_destroy(new_space);
+            kfree(image);
+            kfree(ec);
+            return (uint64)(int64)rc;
         }
+        /* elf_info_t is what the rest of execve reads. Only three of its
+         * fields mean anything for a PE - there are no program headers to
+         * publish through auxv, so phnum stays zero and the stack builder
+         * emits an empty AT_PHDR rather than a fabricated one. */
+        info.entry         = pex.entry;
+        info.lowest_vaddr  = pex.image_base;
+        info.highest_vaddr = pex.highest_vaddr;
+        info.load_count    = pex.section_count;
+        info.phdr_vaddr    = 0;
+        info.phnum         = 0;
+        info.phentsize     = 0;
+        new_personality    = PERSONALITY_WINDOWS;
+        new_thread_start   = pex.thread_start;
+        new_apc_dispatcher = pex.apc_dispatcher;
+        new_exc_dispatcher = pex.exc_dispatcher;
+        new_tls_va         = pex.tls_va;
+        new_tls_pages      = pex.tls_pages;
+        tls_entry_via_ntdll = pex.tls_entry_via_ntdll;
         new_gs_base = NT_TEB_BASE;
     } else {
         rc = elf_load_into(new_space, image, size, &info);

@@ -406,6 +406,13 @@ and one spinning in ring 3 on another CPU.
 wherever it is: running on another CPU, blocked in a wait, or suspended.
 Mutexes it held are abandoned.
 
+**Process creation ✅** (2026-10-03, ROADMAP 16(m)): `NtCreateUserProcess`
+and kernel32's `CreateProcessW/A`; process handles that are waitable and
+carry the 32-bit exit code (`GetExitCodeProcess`, `TerminateProcess`,
+`STILL_ACTIVE`); `CREATE_SUSPENDED`; inherited and standard handles;
+`NtSuspendProcess`/`NtResumeProcess`. Two Windows processes now share named
+objects and sections.
+
 **NT virtual memory ✅** (2026-10-03, ROADMAP 16(l)/14(d)): reserve, commit,
 decommit, release; `VirtualProtect` with enforced READONLY / NOACCESS /
 EXECUTE (DEP) and one-shot `PAGE_GUARD` (`STATUS_GUARD_PAGE_VIOLATION`);

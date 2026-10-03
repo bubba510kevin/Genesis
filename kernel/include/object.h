@@ -142,7 +142,13 @@ typedef enum {
 
     /* An NT section: memory that can be mapped as views, backed by the
      * pagefile or by a file (kernel/include/section.h). */
-    OBJ_SECTION
+    OBJ_SECTION,
+
+    /* An NT process, as a handle sees it: like OBJ_THREAD, a dispatcher
+     * object signalled for good when the whole process has ended, carrying
+     * its 32-bit exit code - what WaitForSingleObject and GetExitCodeProcess
+     * on a process handle read. */
+    OBJ_PROCESS
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

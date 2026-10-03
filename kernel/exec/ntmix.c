@@ -152,6 +152,10 @@ static int nt_attach(process_t *p) {
     pd.std_input  = handle_get(p->handles, 0) != NULL ? NT_HANDLE_FROM_INDEX(0) : 0;
     pd.std_output = handle_get(p->handles, 1) != NULL ? NT_HANDLE_FROM_INDEX(1) : 0;
     pd.std_error  = handle_get(p->handles, 2) != NULL ? NT_HANDLE_FROM_INDEX(2) : 0;
+    pd.command_line = NULL;           /* built from argv, not given */
+    pd.command_line_chars = 0;
+    pd.environment = NULL;
+    pd.environment_chars = 0;
     rc = nt_process_params_init(p->space, &pd);
     if (rc != 0) {
         return attach_err("cannot build the process parameters", rc);

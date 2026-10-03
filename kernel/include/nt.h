@@ -322,6 +322,15 @@ struct syscall_frame;
 #define NT_SYS_MAP_VIEW              0x3B
 #define NT_SYS_UNMAP_VIEW            0x3C
 #define NT_SYS_FLUSH_VIRTUAL         0x3D
+/* NtSuspendProcess / NtResumeProcess(HANDLE Process): every thread of the
+ * process by one suspend count (ROADMAP 16(k)). */
+#define NT_SYS_SUSPEND_PROCESS       0x3E
+#define NT_SYS_RESUME_PROCESS        0x3F
+
+/* --- processes (ROADMAP 16(m), kernel/exec/ntspawn.c) ---------------------
+ * NtCreateUserProcess - the eleven-argument call; see ntspawn.c. The first
+ * core call past the display/input range (0x40-0x7F). */
+#define NT_SYS_CREATE_USER_PROCESS   0x80
 
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
@@ -445,6 +454,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_MUTANT_NOT_OWNED   0xC0000046u
 #define STATUS_SUSPEND_COUNT_EXCEEDED 0xC000004Au
 #define STATUS_THREAD_IS_TERMINATING  0xC000004Bu
+#define STATUS_PROCESS_IS_TERMINATING 0xC000010Au
 #define STATUS_ABANDONED_WAIT_0   0x00000080u  /* also WAIT_ABANDONED */
 #define STATUS_WAIT_0             0x00000000u
 #define STATUS_USER_APC           0x000000C0u

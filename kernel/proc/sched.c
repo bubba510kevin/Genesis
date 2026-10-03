@@ -198,7 +198,9 @@ int sched_needs_resched(void) {
 static void zombie_left_cpu(process_t *z) {
     int i;
 
-    (void)z;
+    /* While it was on its CPU it counted as alive; now its process may
+     * have ended (process.c). */
+    proc_group_finished(z);
     for (i = 0; i < proc_slots_used(); i++) {
         process_t *t = proc_at(i);
 

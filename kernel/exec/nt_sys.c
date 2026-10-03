@@ -627,7 +627,11 @@ static process_t *thread_of_handle(uint64 handle) {
         return NULL;                         /* not a thread, or it exited */
     }
     t = proc_find(tid);
-    if (t == NULL || t->tgid != me->tgid || t->state == PROC_ZOMBIE) {
+    /* A thread of ANOTHER process is fine: holding a handle to it is the
+     * permission (NtCreateUserProcess hands its creator one, and
+     * CreateProcess(CREATE_SUSPENDED) is resumed through it). */
+    (void)me;
+    if (t == NULL || t->is_kthread || t->state == PROC_ZOMBIE) {
         return NULL;
     }
     return t;
@@ -694,16 +698,58 @@ static uint64 process_affinity(process_t *leader) {
     return m & smp_online_mask();
 }
 
+/* A process handle - from NtCreateUserProcess - or the current process's
+ * pseudo-handle: the pid, the leader while it is alive, and, once the
+ * process has ended, its exit code and CPU time from the process object. */
+typedef struct {
+    int        pid;
+    process_t *leader;            /* NULL once the process has ended */
+    int        exited;
+    uint32     exit_code;
+    uint64     cpu_ticks;
+} proc_ref_t;
+
+static int resolve_process(uint64 handle, proc_ref_t *r) {
+    process_t *me = proc_current();
+    object_t *obj;
+    int rc;
+
+    r->exited = 0;
+    r->exit_code = 0;
+    r->cpu_ticks = 0;
+    if (is_current_process(handle)) {
+        r->pid = me->tgid;
+        r->leader = proc_find(me->tgid);
+        if (r->leader == NULL) {
+            r->leader = me;
+        }
+        return 1;
+    }
+    obj = nt_object_of(handle);
+    rc = obj != NULL ? process_object_query(obj, &r->pid, &r->exit_code,
+                                            &r->cpu_ticks) : -22;
+    if (rc < 0) {
+        return 0;
+    }
+    r->exited = rc;
+    r->leader = rc ? NULL : proc_find(r->pid);
+    if (r->leader != NULL && r->leader->tgid != r->pid) {
+        r->leader = NULL;
+    }
+    return 1;
+}
+
 static uint64 nt_query_information_process(uint64 handle, uint64 cls, uint64 buf,
                                            uint64 len, uint64 retlen) {
-    process_t *me = proc_current();
-    process_t *leader = proc_find(me->tgid);
+    proc_ref_t pr;
+    process_t *leader;
 
-    if (!is_current_process(handle)) {
+    if (!resolve_process(handle, &pr)) {
         return STATUS_INVALID_HANDLE;
     }
-    if (leader == NULL) {
-        leader = me;
+    leader = pr.leader;
+    if (leader == NULL && !pr.exited) {
+        return STATUS_INVALID_HANDLE;
     }
     switch ((uint32)cls) {
     case ProcessBasicInformation: {
@@ -717,12 +763,15 @@ static uint64 nt_query_information_process(uint64 handle, uint64 cls, uint64 buf
             return STATUS_ACCESS_VIOLATION;
         }
         zero(&b, sizeof(b));
-        b.ExitStatus     = STATUS_PENDING;
+        /* STILL_ACTIVE (STATUS_PENDING, 259) while it runs - which is why a
+         * program must not exit with 259, on NT too. */
+        b.ExitStatus     = pr.exited ? pr.exit_code : STATUS_PENDING;
         b.PebBaseAddress = NT_PEB_BASE;
-        b.AffinityMask   = process_affinity(leader);
+        b.AffinityMask   = leader != NULL ? process_affinity(leader) : 0;
         b.BasePriority   = 8;
-        b.UniqueProcessId = (uint64)me->tgid;
-        b.InheritedFromUniqueProcessId = (uint64)leader->ppid;
+        b.UniqueProcessId = (uint64)pr.pid;
+        b.InheritedFromUniqueProcessId = leader != NULL ? (uint64)leader->ppid
+                                                        : 0;
         *(nt_pbi_t *)buf = b;
         put_retlen(retlen, sizeof(b));
         return STATUS_SUCCESS;
@@ -739,12 +788,15 @@ static uint64 nt_query_information_process(uint64 handle, uint64 cls, uint64 buf
         if (!range_ok(buf, sizeof(t))) {
             return STATUS_ACCESS_VIOLATION;
         }
-        for (i = 0; i < MAX_PROCESSES; i++) {
+        for (i = 0; leader != NULL && i < MAX_PROCESSES; i++) {
             process_t *p = proc_at(i);
 
-            if (p != NULL && !p->is_kthread && p->tgid == me->tgid) {
+            if (p != NULL && !p->is_kthread && p->tgid == pr.pid) {
                 run += p->cpu_ticks;
             }
+        }
+        if (pr.exited) {
+            run = pr.cpu_ticks;
         }
         zero(&t, sizeof(t));
         t.UserTime = (int64)ticks_to_100ns(run);
@@ -753,7 +805,12 @@ static uint64 nt_query_information_process(uint64 handle, uint64 cls, uint64 buf
         return STATUS_SUCCESS;
     }
     case ProcessPriorityClass: {
-        int s = proc_index(leader);
+        int s;
+
+        if (leader == NULL) {
+            return STATUS_PROCESS_IS_TERMINATING;
+        }
+        s = proc_index(leader);
 
         if ((uint32)len < 2) {
             put_retlen(retlen, 2);
@@ -1359,17 +1416,11 @@ static int apc_waiting(void *ctx) {
 
 /* --- suspend and resume ------------------------------------------------------------ */
 
-static uint64 nt_suspend_resume(uint64 handle, uint64 prev_ptr, int suspend) {
-    process_t *t = thread_of_handle(handle);
-    int prev;
+/* Suspend or resume one thread; its previous suspend count in *prev_out. */
+static uint64 suspend_one(process_t *t, int suspend, int *prev_out) {
+    int prev = t->nt_suspend_count;
 
-    if (t == NULL || t->is_kthread) {
-        return STATUS_INVALID_HANDLE;
-    }
-    if (prev_ptr != 0 && !range_ok(prev_ptr, 4)) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    prev = t->nt_suspend_count;
+    *prev_out = prev;
     if (suspend) {
         if (prev >= NT_MAXIMUM_SUSPEND_COUNT) {
             return STATUS_SUSPEND_COUNT_EXCEEDED;
@@ -1396,8 +1447,58 @@ static uint64 nt_suspend_resume(uint64 handle, uint64 prev_ptr, int suspend) {
             sched_wake(t);
         }
     }
-    if (prev_ptr != 0) {
+    return STATUS_SUCCESS;
+}
+
+static uint64 nt_suspend_resume(uint64 handle, uint64 prev_ptr, int suspend) {
+    process_t *t = thread_of_handle(handle);
+    uint64 st;
+    int prev = 0;
+
+    if (t == NULL || t->is_kthread) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (prev_ptr != 0 && !range_ok(prev_ptr, 4)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = suspend_one(t, suspend, &prev);
+    if (st == STATUS_SUCCESS && prev_ptr != 0) {
         *(uint32 *)prev_ptr = (uint32)prev;
+    }
+    return st;
+}
+
+/* NtSuspendProcess / NtResumeProcess(HANDLE Process): every thread of the
+ * process, each by one count - what a debugger, a job-control ^Z on a
+ * Windows program (item 17), or Process Explorer's "Suspend" do. The
+ * calling thread, when it is in the process, is suspended last and parks on
+ * its way back out of this call, as NtSuspendThread on itself does. */
+static uint64 nt_suspend_resume_process(uint64 handle, int suspend) {
+    process_t *me = proc_current();
+    proc_ref_t pr;
+    int i, prev, self = 0;
+
+    if (!resolve_process(handle, &pr)) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (pr.exited || pr.leader == NULL) {
+        return STATUS_PROCESS_IS_TERMINATING;
+    }
+    for (i = 0; i < proc_slots_used(); i++) {
+        process_t *t = proc_at(i);
+
+        if (t == NULL || t->is_kthread || t->tgid != pr.pid ||
+            t->state == PROC_ZOMBIE) {
+            continue;
+        }
+        if (t == me) {
+            self = 1;
+            continue;
+        }
+        (void)suspend_one(t, suspend, &prev);
+    }
+    if (self) {
+        (void)suspend_one(me, suspend, &prev);
     }
     return STATUS_SUCCESS;
 }
@@ -1450,6 +1551,10 @@ uint64 nt_sys_dispatch(struct syscall_frame *frame, int *handled) {
         return nt_suspend_resume(frame->r10, frame->rdx, 1);
     case NT_SYS_RESUME_THREAD:
         return nt_suspend_resume(frame->r10, frame->rdx, 0);
+    case NT_SYS_SUSPEND_PROCESS:
+        return nt_suspend_resume_process(frame->r10, 1);
+    case NT_SYS_RESUME_PROCESS:
+        return nt_suspend_resume_process(frame->r10, 0);
     default:
         *handled = 0;
         return 0;

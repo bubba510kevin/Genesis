@@ -28,7 +28,8 @@ typedef enum {
     D_EVENT = 0,
     D_SEMAPHORE,
     D_MUTANT,
-    D_THREAD
+    D_THREAD,
+    D_PROCESS            /* the same shape as D_THREAD: tid holds the pid */
 } disp_kind_t;
 
 typedef struct dispatcher {
@@ -117,6 +118,7 @@ static int disp_ready(const dispatcher_t *d, int who) {
          * deadlocks against a mutant it is already holding. */
         return d->owner == 0 || d->owner == who;
     case D_THREAD:
+    case D_PROCESS:
         return d->signalled;
     }
     return 0;
@@ -157,6 +159,7 @@ static int disp_consume(dispatcher_t *d, int who) {
         d->depth++;
         break;
     case D_THREAD:
+    case D_PROCESS:
         /* Nothing to take. A thread stays exited, so EVERY waiter gets
          * through - the notification-event shape, not the synchronisation
          * one. */
@@ -442,6 +445,7 @@ static int disp_signal(object_t *obj, int op, int64 count, int64 *prev) {
         break;
 
     case D_THREAD:
+    case D_PROCESS:
         /* Only the thread's own exit signals it (thread_object_exited),
          * never a caller: NtSetEvent on a thread handle is a type error,
          * and letting it through would release a WaitForSingleObject on a
@@ -524,9 +528,19 @@ static const object_type_t thread_type = {
     .destroy = disp_destroy
 };
 
+static const object_type_t process_type = {
+    .name    = "Process",
+    .klass   = OBJ_PROCESS,
+    .poll    = disp_poll,
+    .wait    = disp_wait,
+    .signal  = disp_signal,
+    .destroy = disp_destroy
+};
+
 static int is_dispatcher(const object_t *obj) {
     return obj->type == &event_type || obj->type == &semaphore_type ||
-           obj->type == &mutant_type || obj->type == &thread_type;
+           obj->type == &mutant_type || obj->type == &thread_type ||
+           obj->type == &process_type;
 }
 
 /* --- creation ------------------------------------------------------------ */
@@ -709,6 +723,67 @@ int thread_object_query(object_t *obj, int *tid, uint32 *exit_code) {
     return d->signalled;
 }
 
+/* --- processes ------------------------------------------------------------- */
+
+object_t *process_object_create(int pid) {
+    dispatcher_t *d = disp_alloc(D_PROCESS);
+    object_t *obj;
+
+    if (d == NULL) {
+        return NULL;
+    }
+    d->tid = pid;
+    obj = ob_create(&process_type, d);
+    if (obj == NULL) {
+        d->in_use = 0;
+    }
+    return obj;
+}
+
+void process_object_exited(object_t *obj, uint32 exit_code, uint64 cpu_ticks) {
+    dispatcher_t *d;
+    uint64 flags;
+
+    if (obj == NULL || obj->type != &process_type) {
+        return;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d == NULL || !d->in_use) {
+        return;
+    }
+    flags = intr_disable();
+    if (!d->signalled) {
+        d->exit_code = exit_code;
+        d->cpu_ticks = cpu_ticks;
+        d->signalled = 1;
+        waitq_wake_all(&d->q);
+    }
+    intr_restore(flags);
+}
+
+int process_object_query(object_t *obj, int *pid, uint32 *exit_code,
+                         uint64 *cpu_ticks) {
+    dispatcher_t *d;
+
+    if (obj == NULL || obj->type != &process_type) {
+        return -22;
+    }
+    d = (dispatcher_t *)obj->body;
+    if (d == NULL || !d->in_use) {
+        return -22;
+    }
+    if (pid != NULL) {
+        *pid = d->tid;
+    }
+    if (exit_code != NULL) {
+        *exit_code = d->exit_code;
+    }
+    if (cpu_ticks != NULL) {
+        *cpu_ticks = d->cpu_ticks;
+    }
+    return d->signalled;
+}
+
 /* --- naming -------------------------------------------------------------- */
 
 #define BNO_PREFIX "\\BaseNamedObjects\\"
@@ -788,6 +863,7 @@ void dispatch_init(void) {
     (void)ob_register_type(&semaphore_type);
     (void)ob_register_type(&mutant_type);
     (void)ob_register_type(&thread_type);
+    (void)ob_register_type(&process_type);
 
     /* After \ObjectTypes exists, and after the three above are registered -
      * this is the sweep that publishes everything anybody registered before

@@ -236,6 +236,20 @@ typedef struct process {
      * there. Inherited by the threads of the group. 0 for a process with no
      * ntdll, which therefore cannot create NT threads. */
     struct object   *nt_thread_obj;
+
+    /* The process's waitable half (OBJ_PROCESS), on the GROUP LEADER only:
+     * created by NtCreateUserProcess, or on first need, and signalled with
+     * nt_exit_code once the whole process has ended (proc_group_finished).
+     * nt_exit_code is the full 32-bit NT exit code - exit_status keeps only
+     * the low 8 bits a POSIX wait status can carry - and is valid when
+     * nt_exit_code_set. A process created by a Windows parent is AUTOREAP:
+     * its parent will never call wait4, so its slot is freed as soon as the
+     * process has ended rather than waiting for a reaper that never comes. */
+    struct object   *nt_process_obj;
+    uint32           nt_exit_code;
+    uint8            nt_exit_code_set;
+    uint8            autoreap;
+    uint8            group_finished;
     uint64           nt_teb_va;
     uint64           nt_stack_lo;
     uint64           nt_stack_pages;
@@ -706,5 +720,15 @@ void proc_dump(void);
  * distinction: no children is -ECHILD, children that have not exited is a
  * different answer entirely. */
 int proc_has_children(const process_t *p);
+
+/* The whole of `p`'s process has ended - its leader is a zombie and no
+ * thread of the group is still alive - and nobody has been told: signal the
+ * leader's process object (if any) with the exit code. Called from every
+ * point a thread can be the last one out; idempotent. */
+void proc_group_finished(process_t *p);
+
+/* The leader's process object, created on first use; NULL when out of
+ * objects. The caller takes no reference - ob_ref for a handle. */
+struct object *proc_process_object(process_t *leader);
 
 #endif

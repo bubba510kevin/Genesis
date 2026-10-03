@@ -82,6 +82,16 @@ int thread_object_query(object_t *obj, int *tid, uint32 *exit_code);
 void thread_object_record_cpu(object_t *obj, uint64 cpu_ticks);
 int  thread_object_cpu(object_t *obj, uint64 *cpu_ticks);
 
+/* An NT process's waitable half - see OBJ_PROCESS in object.h. Created
+ * unsignalled for process `pid` (its group leader's pid); exited signals it
+ * for good with the 32-bit exit code and the process's CPU time (the first
+ * call wins); query returns 1 once exited, 0 while running, -EINVAL when
+ * obj is not a process. */
+object_t *process_object_create(int pid);
+void process_object_exited(object_t *obj, uint32 exit_code, uint64 cpu_ticks);
+int process_object_query(object_t *obj, int *pid, uint32 *exit_code,
+                         uint64 *cpu_ticks);
+
 int dispatch_create_named(const char *name, object_t *obj);
 
 /* Thread `pid` has died: every mutant it still owns is released and marked

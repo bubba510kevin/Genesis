@@ -403,7 +403,11 @@ int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc) {
      * argv[0] is included, as on Windows: GetCommandLineW returns the
      * program name too, which is why every CRT skips it. */
     start = NT_PARAMS_BASE + a.used;
-    for (i = 0; desc->argv != NULL && desc->argv[i] != NULL; i++) {
+    if (desc->command_line != NULL) {
+        arena_put(&a, desc->command_line, desc->command_line_chars * 2);
+    }
+    for (i = 0; desc->command_line == NULL && desc->argv != NULL &&
+                desc->argv[i] != NULL; i++) {
         int quote = str_has_space(desc->argv[i]);
 
         if (i > 0) {
@@ -426,11 +430,19 @@ int nt_process_params_init(address_space_t *as, const nt_params_desc_t *desc) {
      * bytes and not zero - a program scans for the double null, and a null
      * pointer or an empty block would be read as unterminated. */
     start = NT_PARAMS_BASE + a.used;
-    for (i = 0; desc->envp != NULL && desc->envp[i] != NULL; i++) {
-        arena_put_wstr(&a, desc->envp[i]);
+    if (desc->environment != NULL) {
+        /* The parent's block, whose last two characters are the double
+         * null; one more is harmless and guarantees it. */
+        arena_put(&a, desc->environment, desc->environment_chars * 2);
+        arena_put_wchar(&a, 0);
+        arena_put_wchar(&a, 0);
+    } else {
+        for (i = 0; desc->envp != NULL && desc->envp[i] != NULL; i++) {
+            arena_put_wstr(&a, desc->envp[i]);
+            arena_put_wchar(&a, 0);
+        }
         arena_put_wchar(&a, 0);
     }
-    arena_put_wchar(&a, 0);
     params->environment = start;
 
     if (a.overflowed) {

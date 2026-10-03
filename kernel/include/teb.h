@@ -153,6 +153,15 @@ typedef struct {
     uint64             std_input;     /* NT HANDLE, or 0 if not open       */
     uint64             std_output;
     uint64             std_error;
+    /* A process created by another Windows process (NtCreateUserProcess)
+     * arrives with the UTF-16 forms instead of argv/envp: the command line
+     * as the parent wrote it, and the environment block, double null and
+     * all. When set they are copied verbatim and argv/envp are not read.
+     * Kernel copies, never user pointers. */
+    const uint16      *command_line;
+    uint64             command_line_chars;
+    const uint16      *environment;
+    uint64             environment_chars;
 } nt_params_desc_t;
 
 /* Build the parameters block and point the PEB at it.

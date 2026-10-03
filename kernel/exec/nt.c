@@ -10,6 +10,7 @@
 #include "ntsync.h"
 #include "ntvm.h"
 #include "section.h"
+#include "ntspawn.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -113,15 +114,64 @@ static uint64 nt_display_string(uint64 str_ptr) {
     return STATUS_SUCCESS;
 }
 
+/* Terminate the process whose leader is `pid` from outside: every thread
+ * retired wherever it is, the leader last (it owns the tables the others'
+ * retirement reads), and the full 32-bit code recorded for its process
+ * object. TerminateProcess(handle) on another process. */
+static uint64 nt_kill_process(int pid, uint32 code) {
+    process_t *leader = proc_find(pid);
+    int i;
+
+    if (leader == NULL || leader->tgid != pid || leader->group_finished) {
+        return STATUS_SUCCESS;            /* already gone: nothing to do */
+    }
+    if (!leader->nt_exit_code_set) {
+        leader->nt_exit_code = code;
+        leader->nt_exit_code_set = 1;
+    }
+    for (i = 0; i < proc_slots_used(); i++) {
+        process_t *t = proc_at(i);
+
+        if (t != NULL && t != leader && !t->is_kthread && t->tgid == pid &&
+            t->state != PROC_ZOMBIE) {
+            proc_retire(t, (int)(code & 0xFF));
+        }
+    }
+    if (leader->state != PROC_ZOMBIE) {
+        proc_retire(leader, (int)(code & 0xFF));
+    }
+    proc_group_finished(leader);
+    return STATUS_SUCCESS;
+}
+
 /* NtTerminateProcess(HANDLE, NTSTATUS).
  *
- * Only the current process, named by the pseudo-handle -1, which is what a
- * process exiting itself passes. Terminating another one needs a handle to
- * it, and there is no handle table entry that names a process yet. */
+ * The current process (the pseudo-handle -1, or a handle that names it)
+ * goes down the ordinary group exit. A handle to ANOTHER process - from
+ * NtCreateUserProcess - kills that one from outside. The status is the full
+ * 32-bit NT exit code: recorded for the process object, which is what
+ * GetExitCodeProcess and a waiter read, while the POSIX side keeps the low
+ * eight bits it can carry. */
 static uint64 nt_terminate_process(uint64 handle, uint64 status,
                                    struct syscall_frame *frame) {
+    process_t *me = proc_current();
+    process_t *leader;
+
     if (handle != NT_CURRENT_PROCESS && handle != 0) {
-        return STATUS_INVALID_HANDLE;
+        object_t *obj = nt_object_of(handle);
+        int pid = 0;
+
+        if (obj == NULL || process_object_query(obj, &pid, NULL, NULL) < 0) {
+            return STATUS_INVALID_HANDLE;
+        }
+        if (pid != me->tgid) {
+            return nt_kill_process(pid, (uint32)status);
+        }
+    }
+    leader = proc_find(me->tgid);
+    if (leader != NULL && !leader->nt_exit_code_set) {
+        leader->nt_exit_code = (uint32)status;
+        leader->nt_exit_code_set = 1;
     }
     /* Straight into the shared exit path. Ending a process is mechanism, not
      * ABI - the reaping, the SIGCHLD to a Linux parent, the vfork resume are
@@ -611,6 +661,15 @@ static uint64 nt_handle_out(object_t *obj, uint64 handle_out, uint32 access) {
     }
     *(uint64 *)handle_out = NT_HANDLE_FROM_INDEX(index);
     return STATUS_SUCCESS;
+}
+
+/* A new handle to `obj` (which keeps its other references). */
+uint64 nt_handle_for(object_t *obj, uint64 handle_out) {
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    ob_ref(obj);
+    return nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
 }
 
 /* The object a HANDLE names, or NULL. */
@@ -2004,6 +2063,9 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
         case NT_SYS_UNMAP_VIEW:
             return nt_trace(frame->rax,
                             nt_unmap_view(frame->r10, frame->rdx));
+
+        case NT_SYS_CREATE_USER_PROCESS:
+            return nt_trace(frame->rax, nt_create_user_process(frame));
 
         case NT_SYS_FLUSH_VIRTUAL:
             return nt_trace(frame->rax,

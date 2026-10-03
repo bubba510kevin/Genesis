@@ -164,6 +164,10 @@ void proc_init(uint64 boot_kernel_stack_top) {
     current->tgid         = current->pid;
     current->clear_child_tid = 0;
     current->nt_thread_obj   = NULL;
+    current->nt_process_obj  = NULL;
+    current->nt_exit_code_set = 0;
+    current->autoreap        = 0;
+    current->group_finished  = 0;
     current->nt_teb_va       = 0;
     current->nt_stack_lo     = 0;
     current->nt_stack_pages  = 0;
@@ -362,8 +366,16 @@ void proc_reap_threads(void) {
          * it: the dying thread may still be the one standing on its own
          * kernel stack, and proc_free would pull it out from under it. */
         if (t == current || t->state != PROC_ZOMBIE || t->oncpu ||
-            is_kernel_thread(t) || t->tgid == t->pid) {
+            is_kernel_thread(t)) {
             continue;
+        }
+        if (t->tgid == t->pid) {
+            /* A leader: kept for its parent's wait4, unless it was created
+             * by a Windows parent that will never call one. */
+            if (!t->autoreap || group_has_live_threads(t)) {
+                continue;
+            }
+            proc_group_finished(t);
         }
         proc_free(t);
     }
@@ -593,6 +605,11 @@ process_t *proc_alloc(int ppid) {
             p->tgid          = p->pid;
             p->clear_child_tid = 0;
             p->nt_thread_obj   = NULL;
+            p->nt_process_obj  = NULL;
+            p->nt_exit_code    = 0;
+            p->nt_exit_code_set = 0;
+            p->autoreap        = 0;
+            p->group_finished  = 0;
             p->nt_teb_va       = 0;
             p->nt_stack_lo     = 0;
             p->nt_stack_pages  = 0;
@@ -750,6 +767,48 @@ void proc_retire(process_t *p, int exit_status) {
     }
 
     sched_dequeue(p);
+    proc_group_finished(p);
+}
+
+struct object *proc_process_object(process_t *leader) {
+    if (leader == NULL) {
+        return NULL;
+    }
+    if (leader->nt_process_obj == NULL && !leader->group_finished) {
+        leader->nt_process_obj = process_object_create(leader->pid);
+    }
+    return leader->nt_process_obj;
+}
+
+void proc_group_finished(process_t *p) {
+    process_t *leader;
+    uint64 cpu = 0;
+    int i;
+
+    if (p == NULL || is_kernel_thread(p)) {
+        return;
+    }
+    leader = p->tgid == p->pid ? p : proc_find(p->tgid);
+    if (leader == NULL || leader->group_finished ||
+        leader->state != PROC_ZOMBIE || group_has_live_threads(leader)) {
+        return;
+    }
+    leader->group_finished = 1;
+    for (i = 0; i < proc_slots_used(); i++) {
+        if (table[i].state != PROC_UNUSED && !is_kernel_thread(&table[i]) &&
+            table[i].tgid == leader->tgid) {
+            cpu += table[i].cpu_ticks;
+        }
+    }
+    if (leader->nt_process_obj != NULL) {
+        process_object_exited(leader->nt_process_obj,
+                              leader->nt_exit_code_set
+                                  ? leader->nt_exit_code
+                                  : (uint32)leader->exit_status,
+                              cpu);
+        ob_deref(leader->nt_process_obj);       /* the process's own ref */
+        leader->nt_process_obj = NULL;
+    }
 }
 
 void proc_nt_thread_exit(process_t *p, uint32 exit_code) {
@@ -816,6 +875,11 @@ void proc_free(process_t *p) {
      * under a running CPU. The reapers skip such a slot and come back. */
     if (p->oncpu) {
         return;
+    }
+    /* A leader's slot going back: its process has ended, if nobody said so
+     * yet (a reaper that ran before the last notice did). */
+    if (p->tgid == p->pid) {
+        proc_group_finished(p);
     }
     /* proc_retire already did this for anything that died normally. Repeated
      * here because this is the function that hands the slot back for reuse,

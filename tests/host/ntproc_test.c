@@ -108,6 +108,10 @@ static void fill(nt_params_desc_t *d) {
     d->std_input  = NT_HANDLE_FROM_INDEX(0);
     d->std_output = NT_HANDLE_FROM_INDEX(1);
     d->std_error  = NT_HANDLE_FROM_INDEX(2);
+    d->command_line = NULL;
+    d->command_line_chars = 0;
+    d->environment = NULL;
+    d->environment_chars = 0;
 }
 
 /* Every build gets a FRESH address space, because nt_process_init maps the
