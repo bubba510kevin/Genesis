@@ -308,6 +308,17 @@ typedef struct fs_ops {
      *
      * Returns 0, or a negative errno. */
     int (*setowner)(fs_volume_t *v, fs_node_t *n, uint32 uid, uint32 gid);
+
+    /* --- open instances ---------------------------------------------------
+     *
+     * An object made from a node now holds it, and lets go when the object
+     * is destroyed. Optional, and only a filesystem whose node can outlive
+     * its NAME needs them: tmpfs keeps an unlinked file's contents until
+     * the last open of it goes, as POSIX says (create, unlink, keep using
+     * is how a temporary file is made). A disk filesystem whose nodes are
+     * re-read from the disk has nothing to keep alive. */
+    void (*node_hold)(fs_volume_t *v, fs_node_t *n);
+    void (*node_release)(fs_volume_t *v, fs_node_t *n);
 } fs_ops_t;
 
 struct fs_volume {

@@ -72,7 +72,13 @@ static int64 file_write(object_t *obj, const void *buf, uint64 n, uint64 *offset
 }
 
 static void file_destroy(object_t *obj) {
-    body_free((fs_node_t *)obj->body);
+    fs_node_t *n = (fs_node_t *)obj->body;
+
+    if (n != NULL && n->vol != NULL && n->vol->ops != NULL &&
+        n->vol->ops->node_release != NULL) {
+        n->vol->ops->node_release(n->vol, n);
+    }
+    body_free(n);
 }
 
 /* Designated initialisers throughout, so that adding a slot to
@@ -133,6 +139,10 @@ static object_t *node_to_object(const fs_node_t *found, int writable,
         body_free(body);
         *err = -23;
         return NULL;
+    }
+    if (body->vol != NULL && body->vol->ops != NULL &&
+        body->vol->ops->node_hold != NULL) {
+        body->vol->ops->node_hold(body->vol, body);
     }
     *err = 0;
     return obj;

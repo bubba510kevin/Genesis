@@ -186,6 +186,12 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **tmpfs at /tmp — DONE 2026-10-03** (16(e), `kernel/fs/tmpfs.c`):
+  systest 738. The VFS has `node_hold`/`node_release` now (fs.h).
+  OBSERVED: `irqbalance: selftest FAILED (1)` once in about a dozen boots -
+  its live check waits 100 ticks for a ping's interrupt from SLIRP; three
+  boots straight after passed. Not caused by this work (irqbalance.c is
+  untouched); a longer wait or a retry there is the fix if it recurs.
 - **Overlapped I/O — DONE 2026-10-03** (16(o), `kernel/fs/iomgr.c`, NT
   calls `0x9D`-`0x9F`): asynchronous file objects, pending reads and pipe
   connects completed by the `iomgr` kernel thread, event/APC/completion
@@ -357,7 +363,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | Suite | `-smp 4` | `GENESIS_SMP=1` |
 |---|---|---|
 | `verification` (`/bin/verif`) | 160 passed | 160 passed |
-| `systest` | 704 passed | 558 passed |
+| `systest` | 738 passed | 558 passed |
 | `thr` (`thr.exe`) | 47 passed | 47 passed |
 | `smp` (`smp.exe`) | 70 passed | |
 | `tls` (`tls.exe`) | 24 passed | 24 passed |

@@ -2,6 +2,7 @@
 #include "registry.h"
 #include "npfs.h"
 #include "iomgr.h"
+#include "tmpfs.h"
 #include "ahci.h"
 #include "ata.h"
 #include "bcache.h"
@@ -1018,6 +1019,7 @@ void flk(void) {
     registry_init();
     npfs_init();         /* \Device\NamedPipe, \??\pipe */
     iomgr_init();        /* the overlapped-I/O completion thread */
+    tmpfs_init();        /* /tmp */
 
     /* After sti, and it has to be: the callout selftest waits on real timer
      * ticks rather than driving the wheel by hand, which is what makes it a

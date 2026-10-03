@@ -608,6 +608,11 @@ it everywhere, including the ACL test fixtures.)
   does.
 - **Limits:** one dataset per volume (no named datasets), no symlinks.
 
+### tmpfs ✅ (/tmp)
+A writable `/tmp` in memory (2026-10-03, ROADMAP 16(e)): files, directories,
+rename, chmod/chown, sparse files, statfs, and an unlinked file that lives
+until it is closed. Gone at reboot; capped at a quarter of RAM.
+
 ### Other file-like objects ✅
 **Pipes** (with SIGPIPE/EPIPE), **eventfd**, **timerfd**, **epoll**,
 **socketpair** (two crossed pipes), **sockets**, `/dev/console`, `/dev/null`,
