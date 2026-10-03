@@ -148,7 +148,10 @@ typedef enum {
      * object signalled for good when the whole process has ended, carrying
      * its 32-bit exit code - what WaitForSingleObject and GetExitCodeProcess
      * on a process handle read. */
-    OBJ_PROCESS
+    OBJ_PROCESS,
+
+    /* A registry key, as a handle sees it (kernel/include/registry.h). */
+    OBJ_KEY
 } obj_class_t;
 
 /* What ob_signal is being asked to do. One slot with an op rather than three

@@ -12,6 +12,8 @@
 #include "section.h"
 #include "ntspawn.h"
 #include "pipe.h"
+#include "kheap.h"
+#include "registry.h"
 #include "acl.h"
 #include "fileobj.h"
 #include "object.h"
@@ -1879,6 +1881,224 @@ static uint64 nt_genesis_create_pipe(uint64 rd_ptr, uint64 wr_ptr,
     return STATUS_SUCCESS;
 }
 
+/* --- the registry (ROADMAP 16(p)) ---------------------------------------------
+ *
+ * The Configuration Manager is kernel/obj/registry.c; this copies names and
+ * buffers across. Key names come as OBJECT_ATTRIBUTES: absolute
+ * ("\Registry\Machine\...") with no RootDirectory, or relative to the key a
+ * RootDirectory handle names - which is how RegOpenKeyEx(HKLM, "Software")
+ * reaches the kernel. */
+
+#define REG_PATH_MAX 4096                /* characters in one name */
+
+/* A UNICODE_STRING from user memory into a kmalloc'd copy. NULL pointer or
+ * zero length is the empty name (the default value). 0 on a bad string. */
+static int reg_ustr(uint64 us_ptr, uint16 **out, uint32 *chars) {
+    nt_unicode_string_t us;
+    uint32 n, i;
+
+    *out = NULL;
+    *chars = 0;
+    if (us_ptr == 0) {
+        return 1;
+    }
+    if (!user_range_ok(us_ptr, sizeof(us))) {
+        return 0;
+    }
+    us = *(const nt_unicode_string_t *)us_ptr;
+    n = us.length / 2;
+    if (n == 0) {
+        return 1;
+    }
+    if (n > REG_PATH_MAX || !user_range_ok(us.buffer, (uint64)n * 2)) {
+        return 0;
+    }
+    *out = kmalloc((uint64)n * 2 + 2);
+    if (*out == NULL) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        (*out)[i] = ((const uint16 *)us.buffer)[i];
+    }
+    *chars = n;
+    return 1;
+}
+
+static struct reg_key *reg_key_of_handle(uint64 handle) {
+    return registry_key_of(nt_object_of(handle));
+}
+
+/* Open or create the key OBJECT_ATTRIBUTES name; a handle on success. */
+static uint64 reg_open(uint64 handle_out, uint64 attrs_ptr, int create,
+                       uint64 class_ptr, uint64 disp_ptr) {
+    nt_object_attributes_t oa;
+    struct reg_key *base = NULL, *k = NULL;
+    uint16 *name = NULL, *klass = NULL;
+    uint32 chars = 0, class_chars = 0, st;
+    object_t *obj;
+    int created = 0;
+
+    if (!user_range_ok(handle_out, 8) ||
+        (disp_ptr != 0 && !user_range_ok(disp_ptr, 4))) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (attrs_ptr == 0 || !user_range_ok(attrs_ptr, sizeof(oa))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    oa = *(const nt_object_attributes_t *)attrs_ptr;
+    if (oa.root_directory != 0) {
+        base = reg_key_of_handle(oa.root_directory);
+        if (base == NULL) {
+            return STATUS_INVALID_HANDLE;
+        }
+    }
+    if (!reg_ustr(oa.object_name, &name, &chars) ||
+        (create && !reg_ustr(class_ptr, &klass, &class_chars))) {
+        if (name != NULL) {
+            kfree(name);
+        }
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (base == NULL && chars == 0) {
+        st = STATUS_OBJECT_PATH_SYNTAX_BAD;
+    } else {
+        st = registry_lookup(base, name, chars, create, klass, class_chars,
+                             &k, &created);
+    }
+    if (name != NULL) {
+        kfree(name);
+    }
+    if (klass != NULL) {
+        kfree(klass);
+    }
+    if (st != STATUS_SUCCESS) {
+        return st;
+    }
+    obj = registry_key_object(k);               /* takes k's reference */
+    if (obj == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    if (disp_ptr != 0) {
+        *(uint32 *)disp_ptr = created ? REG_CREATED_NEW_KEY
+                                      : REG_OPENED_EXISTING_KEY;
+    }
+    return nt_handle_out(obj, handle_out, ACCESS_READ | ACCESS_WRITE);
+}
+
+static uint64 reg_set_value(uint64 handle, uint64 name_ptr, uint64 type,
+                            uint64 data, uint64 size) {
+    struct reg_key *k = reg_key_of_handle(handle);
+    uint16 *name;
+    uint32 chars, st;
+
+    if (k == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if ((uint32)size != 0 && !user_range_ok(data, (uint32)size)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!reg_ustr(name_ptr, &name, &chars)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    st = registry_set_value(k, name, chars, (uint32)type, (const void *)data,
+                            (uint32)size);
+    if (name != NULL) {
+        kfree(name);
+    }
+    return st;
+}
+
+/* The query/enumerate calls share a shape: a user buffer the kernel side
+ * fills within its length, and the full length written back. */
+static uint64 reg_out(uint32 st, uint32 result, uint64 retlen_ptr) {
+    if (retlen_ptr != 0 &&
+        (st == STATUS_SUCCESS || st == 0x80000005u || st == STATUS_BUFFER_TOO_SMALL)) {
+        *(uint32 *)retlen_ptr = result;
+    }
+    return st;
+}
+
+static int reg_bufs_ok(uint64 buf, uint64 len, uint64 retlen_ptr) {
+    return ((uint32)len == 0 || user_range_ok(buf, (uint32)len)) &&
+           (retlen_ptr == 0 || user_range_ok(retlen_ptr, 4));
+}
+
+static uint64 reg_query_value(uint64 handle, uint64 name_ptr, uint64 klass,
+                              uint64 buf, uint64 len, uint64 retlen_ptr) {
+    struct reg_key *k = reg_key_of_handle(handle);
+    uint16 *name;
+    uint32 chars, st, result = 0;
+
+    if (k == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!reg_bufs_ok(buf, len, retlen_ptr)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if (!reg_ustr(name_ptr, &name, &chars)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    st = registry_query_value(k, name, chars, (uint32)klass, (void *)buf,
+                              (uint32)len, &result);
+    if (name != NULL) {
+        kfree(name);
+    }
+    return reg_out(st, result, retlen_ptr);
+}
+
+static uint64 reg_delete_value(uint64 handle, uint64 name_ptr) {
+    struct reg_key *k = reg_key_of_handle(handle);
+    uint16 *name;
+    uint32 chars, st;
+
+    if (k == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!reg_ustr(name_ptr, &name, &chars)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    st = registry_delete_value(k, name, chars);
+    if (name != NULL) {
+        kfree(name);
+    }
+    return st;
+}
+
+static uint64 reg_enumerate(uint64 handle, uint64 index, uint64 klass,
+                            uint64 buf, uint64 len, uint64 retlen_ptr,
+                            int values) {
+    struct reg_key *k = reg_key_of_handle(handle);
+    uint32 st, result = 0;
+
+    if (k == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!reg_bufs_ok(buf, len, retlen_ptr)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = values ? registry_enumerate_value(k, (uint32)index, (uint32)klass,
+                                           (void *)buf, (uint32)len, &result)
+                : registry_enumerate_key(k, (uint32)index, (uint32)klass,
+                                         (void *)buf, (uint32)len, &result);
+    return reg_out(st, result, retlen_ptr);
+}
+
+static uint64 reg_query_key(uint64 handle, uint64 klass, uint64 buf,
+                            uint64 len, uint64 retlen_ptr) {
+    struct reg_key *k = reg_key_of_handle(handle);
+    uint32 st, result = 0;
+
+    if (k == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (!reg_bufs_ok(buf, len, retlen_ptr)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    st = registry_query_key(k, (uint32)klass, (void *)buf, (uint32)len,
+                            &result);
+    return reg_out(st, result, retlen_ptr);
+}
+
 /* --- threads (ROADMAP item 14(a)) -------------------------------------------
  *
  * See NT_SYS_CREATE_THREAD in nt.h for the contract and the one register
@@ -2354,6 +2574,89 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
                             nt_query_object(frame->r10, frame->rdx, frame->r8,
                                             frame->r9, retlen));
         }
+
+        case NT_SYS_CREATE_KEY: {
+            uint64 klass = 0, disp = 0;
+
+            /* TitleIndex (4) and CreateOptions (6) are not used: every key
+             * is volatile until hives are persistent. */
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &klass) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 7, &disp)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            reg_open(frame->r10, frame->r8, 1, klass, disp));
+        }
+
+        case NT_SYS_OPEN_KEY:
+            return nt_trace(frame->rax,
+                            reg_open(frame->r10, frame->r8, 0, 0, 0));
+
+        case NT_SYS_DELETE_KEY: {
+            struct reg_key *k = reg_key_of_handle(frame->r10);
+
+            return nt_trace(frame->rax, k == NULL ? STATUS_INVALID_HANDLE
+                                                  : registry_delete_key(k));
+        }
+
+        case NT_SYS_SET_VALUE_KEY: {
+            uint64 data = 0, size = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &data) ||
+                !nt_stack_arg(syscall_get_user_rsp(), 6, &size)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            return nt_trace(frame->rax,
+                            reg_set_value(frame->r10, frame->rdx, frame->r9,
+                                          data, size));
+        }
+
+        case NT_SYS_QUERY_VALUE_KEY: {
+            uint64 len = 0, ret = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &len)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            (void)nt_stack_arg(syscall_get_user_rsp(), 6, &ret);
+            return nt_trace(frame->rax,
+                            reg_query_value(frame->r10, frame->rdx, frame->r8,
+                                            frame->r9, len, ret));
+        }
+
+        case NT_SYS_DELETE_VALUE_KEY:
+            return nt_trace(frame->rax,
+                            reg_delete_value(frame->r10, frame->rdx));
+
+        case NT_SYS_ENUMERATE_KEY:
+        case NT_SYS_ENUMERATE_VALUE_KEY: {
+            uint64 len = 0, ret = 0;
+
+            if (!nt_stack_arg(syscall_get_user_rsp(), 5, &len)) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            (void)nt_stack_arg(syscall_get_user_rsp(), 6, &ret);
+            return nt_trace(frame->rax,
+                            reg_enumerate(frame->r10, frame->rdx, frame->r8,
+                                          frame->r9, len, ret,
+                                          (frame->rax & NT_SYSCALL_NR_MASK) ==
+                                              NT_SYS_ENUMERATE_VALUE_KEY));
+        }
+
+        case NT_SYS_QUERY_KEY: {
+            uint64 ret = 0;
+
+            (void)nt_stack_arg(syscall_get_user_rsp(), 5, &ret);
+            return nt_trace(frame->rax,
+                            reg_query_key(frame->r10, frame->rdx, frame->r8,
+                                          frame->r9, ret));
+        }
+
+        case NT_SYS_FLUSH_KEY:
+            /* Nothing is persistent yet, so everything is already "on disk"
+             * as much as it ever will be. */
+            return nt_trace(frame->rax,
+                            reg_key_of_handle(frame->r10) == NULL
+                                ? STATUS_INVALID_HANDLE : STATUS_SUCCESS);
 
         case NT_SYS_GENESIS_CREATE_PIPE:
             return nt_trace(frame->rax,

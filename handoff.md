@@ -156,8 +156,8 @@ The pieces already queued from earlier work belong here:
   detail. **The userland half is a separate commit in Genesis-userland**
   (ntdll stubs, kernel32 `CreateMutexW` with names / `OpenMutexW` /
   `OpenEventW` / `OpenSemaphoreW`, sync.exe and wait.exe checks); land it,
-  then add `/bin/sync.exe`, `/bin/ntsync.exe`, `/bin/vm.exe` and
-  `/bin/proc.exe` to `guest_run.py`'s default list (they print tallies only
+  then add `/bin/sync.exe`, `/bin/ntsync.exe`, `/bin/vm.exe`,
+  `/bin/proc.exe` and `/bin/reg.exe` to `guest_run.py`'s default list (they print tallies only
   from that commit on).
 - **Table sizes — DONE 2026-10-03**: `MAX_PROCESSES` 64 -> 256 (kernel
   stacks to match), Windows threads per process 64 -> 128, `MAX_HANDLES`
@@ -185,6 +185,14 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **The in-kernel registry — DONE 2026-10-03** (16(p), `kernel/obj/registry.c`,
+  NT calls `0x86`-`0x8F`): a key tree under `\Registry` built at boot and
+  seeded with the CurrentVersion values, the session-manager environment, the
+  computer name and the processor; it does not persist across reboots yet.
+  Next for it: regf hives loaded from and written to files, then
+  `NtNotifyChangeKey` and key security (with tokens, 16(n)). advapi32's Reg*
+  (14(g)) can now be written over it in userland. reg.exe is in the same
+  Genesis-userland patch.
 
 ### Phase 3 — bash understands Windows (item 17) — started: GNTbash
 The shell is its own repository, **GNTbash**
@@ -272,8 +280,8 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x85`.
-  `0x40`-`0x7F` is the display/input range; the next core call is `0x86`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x8F`.
+  `0x40`-`0x7F` is the display/input range; the next core call is `0x90`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
@@ -331,6 +339,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `ntsync` (`ntsync.exe`) | 34 passed | |
 | `vm` (`vm.exe`) | 68 passed | |
 | `proc` (`proc.exe`) | 40 passed | |
+| `reg` (`reg.exe`) | 31 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
 | `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |

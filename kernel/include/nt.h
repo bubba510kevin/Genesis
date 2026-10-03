@@ -348,6 +348,31 @@ struct syscall_frame;
 #define NT_SYS_QUERY_OBJECT          0x84
 #define NT_SYS_GENESIS_CREATE_PIPE   0x85
 
+/* --- the registry (ROADMAP 16(p), kernel/include/registry.h) ---------------
+ * NtCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG TitleIndex,
+ *             PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
+ * NtOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)
+ * NtDeleteKey(HANDLE)
+ * NtSetValueKey(HANDLE, PUNICODE_STRING Name, ULONG TitleIndex, ULONG Type,
+ *               PVOID Data, ULONG DataSize)
+ * NtQueryValueKey(HANDLE, PUNICODE_STRING Name, ULONG Class, PVOID Buffer,
+ *                 ULONG Length, PULONG ResultLength)
+ * NtDeleteValueKey(HANDLE, PUNICODE_STRING Name)
+ * NtEnumerateKey / NtEnumerateValueKey(HANDLE, ULONG Index, ULONG Class,
+ *                 PVOID Buffer, ULONG Length, PULONG ResultLength)
+ * NtQueryKey(HANDLE, ULONG Class, PVOID Buffer, ULONG Length, PULONG Ret)
+ * NtFlushKey(HANDLE) */
+#define NT_SYS_CREATE_KEY            0x86
+#define NT_SYS_OPEN_KEY              0x87
+#define NT_SYS_DELETE_KEY            0x88
+#define NT_SYS_SET_VALUE_KEY         0x89
+#define NT_SYS_QUERY_VALUE_KEY       0x8A
+#define NT_SYS_DELETE_VALUE_KEY      0x8B
+#define NT_SYS_ENUMERATE_KEY         0x8C
+#define NT_SYS_ENUMERATE_VALUE_KEY   0x8D
+#define NT_SYS_QUERY_KEY             0x8E
+#define NT_SYS_FLUSH_KEY             0x8F
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -431,6 +456,7 @@ typedef struct __attribute__((packed)) {
 #define STATUS_INVALID_PARAMETER  0xC000000Du
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034u
 #define STATUS_OBJECT_PATH_NOT_FOUND 0xC000003Au
+#define STATUS_OBJECT_PATH_SYNTAX_BAD 0xC000003Bu
 #define STATUS_NOT_A_DIRECTORY    0xC0000103u
 #define STATUS_TOO_MANY_OPENED_FILES 0xC000011Fu
 #define STATUS_END_OF_FILE        0xC0000011u

@@ -415,6 +415,14 @@ objects and sections. `DuplicateHandle` (into and out of other processes),
 `OpenProcess`, handle inheritance flags, and `CreatePipe` - a child's output
 read through a pipe until `ERROR_BROKEN_PIPE`.
 
+**The registry ✅ (kernel side)** (2026-10-03, ROADMAP 16(p)): the
+Configuration Manager - `NtCreateKey`, `NtOpenKey`, `NtSetValueKey`,
+`NtQueryValueKey`, `NtEnumerateKey`, `NtEnumerateValueKey`, `NtQueryKey`,
+`NtDeleteKey`, `NtDeleteValueKey`, `NtFlushKey` - over `\Registry\Machine`
+and `\Registry\User`, seeded with the Windows NT `CurrentVersion` values
+programs check. Kept in memory until reboot (no hive files yet); advapi32's
+`Reg*` calls are not written yet.
+
 **NT virtual memory ✅** (2026-10-03, ROADMAP 16(l)/14(d)): reserve, commit,
 decommit, release; `VirtualProtect` with enforced READONLY / NOACCESS /
 EXECUTE (DEP) and one-shot `PAGE_GUARD` (`STATUS_GUARD_PAGE_VIOLATION`);
@@ -719,8 +727,8 @@ build them), **`RtlWaitOnAddress`/`RtlWakeAddressSingle/All`**,
 
 ### Not yet ❌
 GUI (the precompiled user32/gdi32 and the win32k.sys support under them),
-the registry, COM, `NtCreateProcess` (a Windows program can't start another
-one yet), and most of kernel32. See §20.
+advapi32 (registry hives on disk and the `Reg*` API over the kernel's
+registry), COM, and most of kernel32. See §20.
 
 ---
 
@@ -1005,8 +1013,8 @@ Collected in one place so nobody has to discover them the hard way:
   or `ls -l` to run either.
 - **Loading a large binary is slow under emulation**: exec reads the whole
   file through polled ATA PIO, about 25 seconds for bash's 1.4MB under TCG.
-- **Windows**: no registry, COM, child processes, or GUI DLL support yet;
-  kernel32 is a small subset.
+- **Windows**: no advapi32 (the registry exists in the kernel only, in
+  memory), COM, or GUI DLL support yet; kernel32 is a small subset.
 - **Clock resolution is one timer tick.**
 - `exec` doesn't honour setuid/setgid bits.
 - A system call interrupted by a job-control stop returns `-EINTR` after
