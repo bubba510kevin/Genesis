@@ -141,6 +141,26 @@ static object_t *duplex_create(object_t *rd, object_t *wr) {
     return obj;
 }
 
+uint32 socketpair_available(const object_t *end) {
+    const duplex_t *d;
+
+    if (end == NULL || end->type != &socketpair_type) {
+        return 0;
+    }
+    d = (const duplex_t *)end->body;
+    return (d != NULL) ? pipe_available(d->rd) : 0;
+}
+
+unsigned int socketpair_peek(const object_t *end, void *buf, unsigned int n) {
+    const duplex_t *d;
+
+    if (end == NULL || end->type != &socketpair_type) {
+        return 0;
+    }
+    d = (const duplex_t *)end->body;
+    return (d != NULL) ? pipe_peek(d->rd, buf, n) : 0;
+}
+
 int socketpair_create(object_t **end0, object_t **end1) {
     object_t *a_rd = NULL, *a_wr = NULL;
     object_t *b_rd = NULL, *b_wr = NULL;

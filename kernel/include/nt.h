@@ -380,6 +380,10 @@ struct syscall_frame;
 #define NT_SYS_CANCEL_TIMER          0x93
 #define NT_SYS_QUERY_TIMER           0x94
 
+/* Named pipes (ROADMAP 16(q)), kernel/fs/npfs.c. */
+#define NT_SYS_CREATE_NAMED_PIPE     0x95
+#define NT_SYS_FS_CONTROL_FILE       0x96
+
 /* FILE_IO_COMPLETION_INFORMATION, one NtRemoveIoCompletionEx entry. */
 typedef struct __attribute__((packed)) {
     uint64 key_context;
@@ -468,6 +472,18 @@ typedef struct __attribute__((packed)) {
 #define STATUS_TOO_MANY_OPENED_FILES 0xC000011Fu
 #define STATUS_END_OF_FILE        0xC0000011u
 #define STATUS_PIPE_BROKEN        0xC000014Bu
+#define STATUS_INSTANCE_NOT_AVAILABLE 0xC00000ABu
+#define STATUS_PIPE_NOT_AVAILABLE 0xC00000ACu
+#define STATUS_INVALID_PIPE_STATE 0xC00000ADu
+#define STATUS_PIPE_DISCONNECTED  0xC00000B0u
+#define STATUS_PIPE_CLOSING       0xC00000B1u
+#define STATUS_PIPE_CONNECTED     0xC00000B2u
+#define STATUS_PIPE_LISTENING     0xC00000B3u
+#define STATUS_IO_TIMEOUT         0xC00000B5u
+#define STATUS_CANCELLED          0xC0000120u
+#define STATUS_INVALID_DEVICE_REQUEST 0xC0000010u
+#define STATUS_OBJECT_NAME_INVALID 0xC0000033u
+#define STATUS_PIPE_BUFFER_OVERFLOW 0x80000005u   /* STATUS_BUFFER_OVERFLOW */
 #define STATUS_ACCESS_DENIED      0xC0000022u
 #define STATUS_NAME_TOO_LONG      0xC0000106u
 #define STATUS_NO_MEMORY          0xC0000017u

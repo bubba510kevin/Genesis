@@ -1,5 +1,6 @@
 #include "kusd.h"
 #include "registry.h"
+#include "npfs.h"
 #include "ahci.h"
 #include "ata.h"
 #include "bcache.h"
@@ -1014,6 +1015,7 @@ void flk(void) {
     /* The registry (registry.h), seeded with what it reports about the
      * machine - so after SMP bring-up and the TSC calibration too. */
     registry_init();
+    npfs_init();         /* \Device\NamedPipe, \??\pipe */
 
     /* After sti, and it has to be: the callout selftest waits on real timer
      * ticks rather than driving the wheel by hand, which is what makes it a

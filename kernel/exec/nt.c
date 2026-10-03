@@ -3,6 +3,7 @@
 #include "fileobj.h"
 #include "ns.h"
 #include "dispatch.h"
+#include "npfs.h"
 #include "nt.h"
 #include "nt_context.h"
 #include "ntmix.h"
@@ -343,7 +344,10 @@ static uint64 nt_open_file(uint64 handle_out, uint64 access_mask,
 
         rc = dev_open_object(obj, remainder, access, &opened);
         if (rc != 0) {
+            /* -EBUSY: a named pipe whose instances are all taken -
+             * ERROR_PIPE_BUSY, which WaitNamedPipe is for. */
             return rc == -30 ? STATUS_ACCESS_DENIED
+                 : rc == -16 ? STATUS_PIPE_NOT_AVAILABLE
                              : STATUS_OBJECT_NAME_NOT_FOUND;
         }
         obj = opened;
@@ -460,9 +464,18 @@ static uint64 nt_rw_file(uint64 handle, int writing) {
     }
 
     if (done < 0) {
-        iosb->status      = STATUS_ACCESS_DENIED;
+        /* The pipe errors have NT names of their own: a write to a pipe
+         * whose reader has gone is STATUS_PIPE_CLOSING (ERROR_NO_DATA), and
+         * a named-pipe server instance with no client says which state it
+         * is in. Anything else is still ACCESS_DENIED. */
+        uint64 st = done == -32  ? STATUS_PIPE_CLOSING
+                  : done == -107 ? STATUS_PIPE_LISTENING
+                  : done == -108 ? STATUS_PIPE_DISCONNECTED
+                                 : STATUS_ACCESS_DENIED;
+
+        iosb->status      = st;
         iosb->information = 0;
-        return STATUS_ACCESS_DENIED;
+        return st;
     }
     iosb->information = (uint64)done;
 
@@ -1428,6 +1441,241 @@ static uint64 nt_query_timer(uint64 handle, uint64 klass, uint64 buf,
         *(uint32 *)ret_ptr = 16;
     }
     return STATUS_SUCCESS;
+}
+
+/* --- named pipes (ROADMAP 16(q)) ------------------------------------------
+ *
+ * The pipes themselves are kernel/fs/npfs.c; these are the two calls a
+ * server needs beyond NtOpenFile/NtReadFile/NtWriteFile. A client opens
+ * \??\pipe\name with NtOpenFile, which reaches the npfs device's parse. */
+
+#define FILE_CREATE_DISPOSITION  2           /* FILE_FLAG_FIRST_PIPE_INSTANCE */
+#define FSCTL_PIPE_DISCONNECT    0x00110004u
+#define FSCTL_PIPE_LISTEN        0x00110008u
+#define FSCTL_PIPE_PEEK          0x0011400Cu
+#define FSCTL_PIPE_WAIT          0x00110018u
+
+/* NtCreateNamedPipeFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+ *   PIO_STATUS_BLOCK, ShareAccess, CreateDisposition, CreateOptions,
+ *   NamedPipeType, ReadMode, CompletionMode, MaximumInstances,
+ *   InboundQuota, OutboundQuota, DefaultTimeout) - four in registers, ten
+ * on the stack. */
+static uint64 nt_create_named_pipe(uint64 handle_out, uint64 access_mask,
+                                   uint64 attrs_ptr, uint64 iosb_ptr) {
+    uint64 rsp = syscall_get_user_rsp();
+    uint64 disposition = 0, pipe_type = 0, read_mode = 0, completion = 0;
+    uint64 max_inst = 0;
+    nt_object_attributes_t oa;
+    char path[NS_PATH_MAX], remainder[NS_PATH_MAX];
+    const char *name;
+    object_t *obj = NULL;
+    open_file_t *of;
+    uint32 access = 0;
+    int rc, index, root;
+
+    if (!user_ptr_ok(handle_out) || !user_ptr_ok(attrs_ptr)) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    (void)nt_stack_arg(rsp, 6, &disposition);
+    (void)nt_stack_arg(rsp, 8, &pipe_type);
+    (void)nt_stack_arg(rsp, 9, &read_mode);
+    (void)nt_stack_arg(rsp, 10, &completion);
+    (void)nt_stack_arg(rsp, 11, &max_inst);
+    /* Message-type pipes keep message boundaries, and PIPE_NOWAIT makes
+     * every operation non-blocking; neither is implemented, and a pipe that
+     * silently behaved as byte-mode and blocking would corrupt a protocol
+     * a long way from here. */
+    if ((uint32)pipe_type != 0 || (uint32)read_mode != 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if ((uint32)completion != 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    oa = *(const nt_object_attributes_t *)attrs_ptr;
+    if (oa.length < sizeof(nt_object_attributes_t) || oa.root_directory != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!unicode_to_path(oa.object_name, path, sizeof(path))) {
+        return STATUS_OBJECT_NAME_INVALID;
+    }
+    rc = ns_lookup(path, &obj, remainder, sizeof(remainder));
+    if (rc != 0) {
+        return status_from_ns(rc);
+    }
+    root = npfs_is_root(obj);
+    ob_deref(obj);
+    if (!root) {
+        return STATUS_OBJECT_NAME_INVALID;
+    }
+    name = (remainder[0] == '\\') ? remainder + 1 : remainder;
+
+    rc = npfs_create(name, (uint32)max_inst,
+                     (uint32)disposition == FILE_CREATE_DISPOSITION, &obj);
+    if (rc == -17) {
+        return STATUS_ACCESS_DENIED;
+    }
+    if (rc == -16) {
+        return STATUS_INSTANCE_NOT_AVAILABLE;
+    }
+    if (rc != 0) {
+        return rc == -22 ? STATUS_OBJECT_NAME_INVALID
+                         : STATUS_INSUFFICIENT_RESOURCES;
+    }
+    if (access_mask & (GENERIC_READ | FILE_READ_DATA)) {
+        access |= ACCESS_READ;
+    }
+    if (access_mask & (GENERIC_WRITE | FILE_WRITE_DATA)) {
+        access |= ACCESS_WRITE;
+    }
+    of = of_open(obj, access);
+    ob_deref(obj);
+    if (of == NULL) {
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    index = handle_alloc(proc_current()->handles, of,
+                         (oa.attributes & 0x2u /*OBJ_INHERIT*/) ? HANDLE_INHERITABLE
+                                                       : 0);
+    if (index < 0) {
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    *(uint64 *)handle_out = NT_HANDLE_FROM_INDEX(index);
+    if (user_range_ok(iosb_ptr, sizeof(nt_io_status_block_t))) {
+        ((nt_io_status_block_t *)iosb_ptr)->status = STATUS_SUCCESS;
+        ((nt_io_status_block_t *)iosb_ptr)->information = 2;  /* CREATED */
+    }
+    return STATUS_SUCCESS;
+}
+
+/* FSCTL_PIPE_WAIT's input: { LARGE_INTEGER Timeout; ULONG NameLength
+ * (bytes); BOOLEAN TimeoutSpecified; WCHAR Name[] }, the name relative to
+ * the npfs root the handle names. */
+static uint64 np_fsctl_wait(uint64 in, uint64 in_len) {
+    char name[NS_PATH_MAX];
+    int64 timeout;
+    uint32 name_len, i;
+    uint64 deadline;
+    int rc;
+
+    if (in_len < 14 || !user_range_ok(in, in_len)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    timeout = *(const int64 *)in;
+    name_len = *(const uint32 *)(in + 8);
+    if (name_len / 2 + 1 > sizeof(name) || 14 + (uint64)name_len > in_len) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    for (i = 0; i < name_len / 2; i++) {
+        uint16 wc = *(const uint16 *)(in + 14 + i * 2);
+
+        name[i] = (wc != 0 && wc < 0x100) ? (char)wc : '?';
+    }
+    name[i] = '\0';
+    /* No timeout given: the pipe's default, which NT makes 50ms when the
+     * server did not choose one. */
+    if (*(const uint8 *)(in + 12) == 0) {
+        timeout = -500000;
+    }
+    if (timeout < 0) {
+        deadline = timer_ticks_now() +
+                   ((uint64)(-timeout) / 10000ULL * timer_hz() + 999) / 1000 +
+                   1;
+    } else {
+        deadline = 0;                       /* absolute times: forever */
+    }
+    rc = npfs_wait(name[0] == '\\' ? name + 1 : name, deadline);
+    return rc == 0    ? STATUS_SUCCESS
+         : rc == -2   ? STATUS_OBJECT_NAME_NOT_FOUND
+         : rc == -110 ? STATUS_IO_TIMEOUT
+                      : STATUS_CANCELLED;
+}
+
+/* FSCTL_PIPE_PEEK's output: { NamedPipeState, ReadDataAvailable,
+ * NumberOfMessages, MessageLength } then as much data as fits. */
+static uint64 np_fsctl_peek(object_t *obj, uint64 out, uint64 out_len,
+                        uint64 *information) {
+    uint32 avail = 0, state = 0, copied = 0;
+
+    if (npfs_peek(obj, &avail, &state) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (state == NP_STATE_LISTENING) {
+        return STATUS_INVALID_PIPE_STATE;
+    }
+    if (state == NP_STATE_DISCONNECTED) {
+        return STATUS_PIPE_DISCONNECTED;
+    }
+    if (state == NP_STATE_CLOSING && avail == 0) {
+        return STATUS_PIPE_BROKEN;
+    }
+    if (out_len < 16 || !user_range_ok(out, out_len)) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if (out_len > 16) {
+        copied = npfs_peek_data(obj, (void *)(out + 16),
+                                (uint32)(out_len - 16));
+    }
+    *(uint32 *)(out + 0) = state;
+    *(uint32 *)(out + 4) = avail;
+    *(uint32 *)(out + 8) = 0;
+    *(uint32 *)(out + 12) = 0;
+    *information = 16 + copied;
+    return copied < avail ? STATUS_PIPE_BUFFER_OVERFLOW : STATUS_SUCCESS;
+}
+
+/* NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+ *   IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength,
+ *   OutputBuffer, OutputBufferLength). Synchronous: Event and the APC are
+ * accepted and ignored, as NtReadFile does. */
+static uint64 nt_fs_control(uint64 handle) {
+    uint64 rsp = syscall_get_user_rsp();
+    uint64 iosb_ptr = 0, code = 0, in = 0, in_len = 0, out = 0, out_len = 0;
+    uint64 st, info = 0;
+    object_t *obj = nt_object_of(handle);
+    int rc;
+
+    if (obj == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    (void)nt_stack_arg(rsp, 5, &iosb_ptr);
+    (void)nt_stack_arg(rsp, 6, &code);
+    (void)nt_stack_arg(rsp, 7, &in);
+    (void)nt_stack_arg(rsp, 8, &in_len);
+    (void)nt_stack_arg(rsp, 9, &out);
+    (void)nt_stack_arg(rsp, 10, &out_len);
+    in_len &= 0xFFFFFFFFULL;
+    out_len &= 0xFFFFFFFFULL;
+
+    ob_ref(obj);                 /* a listen blocks; the handle may close */
+    switch ((uint32)code) {
+    case FSCTL_PIPE_LISTEN:
+        rc = npfs_listen(obj);
+        st = rc == 0    ? STATUS_SUCCESS
+           : rc == -106 ? STATUS_PIPE_CONNECTED
+           : rc == -32  ? STATUS_PIPE_CLOSING
+           : rc == -4   ? STATUS_CANCELLED
+                        : STATUS_INVALID_PARAMETER;
+        break;
+    case FSCTL_PIPE_DISCONNECT:
+        st = npfs_disconnect(obj) == 0 ? STATUS_SUCCESS
+                                       : STATUS_INVALID_PARAMETER;
+        break;
+    case FSCTL_PIPE_WAIT:
+        st = npfs_is_root(obj) ? np_fsctl_wait(in, in_len)
+                               : STATUS_INVALID_PARAMETER;
+        break;
+    case FSCTL_PIPE_PEEK:
+        st = np_fsctl_peek(obj, out, out_len, &info);
+        break;
+    default:
+        st = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+    ob_deref(obj);
+    if (user_range_ok(iosb_ptr, sizeof(nt_io_status_block_t))) {
+        ((nt_io_status_block_t *)iosb_ptr)->status = st;
+        ((nt_io_status_block_t *)iosb_ptr)->information = info;
+    }
+    return st;
 }
 
 static object_t *make_keyed_event(uint32 unused) {
@@ -2808,6 +3056,14 @@ static uint64 nt_syscall_dispatch_one(struct syscall_frame *frame) {
                             nt_query_timer(frame->r10, frame->rdx, frame->r8,
                                            frame->r9, ret));
         }
+
+        case NT_SYS_CREATE_NAMED_PIPE:
+            return nt_trace(frame->rax,
+                            nt_create_named_pipe(frame->r10, frame->rdx,
+                                                 frame->r8, frame->r9));
+
+        case NT_SYS_FS_CONTROL_FILE:
+            return nt_trace(frame->rax, nt_fs_control(frame->r10));
 
         case NT_SYS_FLUSH_KEY:
             /* Nothing is persistent yet, so everything is already "on disk"

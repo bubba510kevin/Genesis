@@ -446,6 +446,13 @@ ports (`NtCreateIoCompletion`, `NtSetIoCompletion`,
 `GetQueuedCompletionStatus(Ex)`, alertable included). Not yet: a file
 associated with a port (needs overlapped I/O), the concurrency limit.
 
+**Named pipes ✅** (2026-10-03, ROADMAP 16(q)): `\\.\pipe\name` -
+`CreateNamedPipe` (instance limits, `FILE_FLAG_FIRST_PIPE_INSTANCE`),
+clients through `CreateFile`, `ConnectNamedPipe`, `DisconnectNamedPipe`,
+`WaitNamedPipe`, `PeekNamedPipe`, between threads and processes, with NT's
+connection states and errors. Byte-type and blocking only: message pipes,
+`PIPE_NOWAIT` and overlapped pipe I/O are refused for now.
+
 **Waitable timers ✅** (2026-10-03, ROADMAP 16(k)): `NtCreateTimer`,
 `NtOpenTimer`, `NtSetTimer`, `NtCancelTimer`, `NtQueryTimer`; kernel32's
 `CreateWaitableTimer(Ex)`, `OpenWaitableTimer`, `SetWaitableTimer(Ex)`,

@@ -44,4 +44,11 @@ int pipe_create(object_t **read_end, object_t **write_end);
  * out what it is holding. */
 int pipe_is_pipe(const object_t *obj);
 
+/* Bytes buffered in a pipe, readable without blocking, through its READ end
+ * (0 for anything else). PeekNamedPipe's ReadDataAvailable. */
+uint32 pipe_available(const object_t *read_end);
+
+/* Copy up to n buffered bytes WITHOUT consuming them; how many were. */
+uint32 pipe_peek(const object_t *read_end, void *buf, uint32 n);
+
 #endif

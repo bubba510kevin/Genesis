@@ -174,7 +174,17 @@ static int64 pipe_write(object_t *obj, const void *buf, uint64 n,
             if (done > 0) {
                 return (int64)done;
             }
-            signal_send(proc_current(), SIGPIPE);
+            /* A Windows process has no SIGPIPE: NT reports the closed pipe
+             * as a status (STATUS_PIPE_CLOSING, ERROR_NO_DATA) and the
+             * program carries on. Sending it would kill a PE process
+             * whose only mistake was writing to a reader that left. */
+            {
+                process_t *me = proc_current();
+
+                if (me == NULL || me->personality != PERSONALITY_WINDOWS) {
+                    signal_send(me, SIGPIPE);
+                }
+            }
             return -32;                  /* -EPIPE */
         }
 
@@ -347,6 +357,34 @@ int pipe_create(object_t **read_end, object_t **write_end) {
     *read_end  = rd;
     *write_end = wr;
     return 0;
+}
+
+uint32 pipe_available(const object_t *read_end) {
+    const pipe_t *p;
+
+    if (read_end == NULL || read_end->type != &pipe_read_type) {
+        return 0;
+    }
+    p = (const pipe_t *)read_end->body;
+    return (p != NULL) ? p->count : 0;
+}
+
+uint32 pipe_peek(const object_t *read_end, void *buf, uint32 n) {
+    const pipe_t *p;
+    uint8 *out = (uint8 *)buf;
+    uint32 i;
+
+    if (read_end == NULL || read_end->type != &pipe_read_type) {
+        return 0;
+    }
+    p = (const pipe_t *)read_end->body;
+    if (p == NULL) {
+        return 0;
+    }
+    for (i = 0; i < n && i < p->count; i++) {
+        out[i] = p->buf[(p->tail + i) % PIPE_BUF_SIZE];
+    }
+    return i;
 }
 
 int pipe_is_pipe(const object_t *obj) {

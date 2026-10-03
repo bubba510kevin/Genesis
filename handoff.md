@@ -157,7 +157,8 @@ The pieces already queued from earlier work belong here:
   (ntdll stubs, kernel32 `CreateMutexW` with names / `OpenMutexW` /
   `OpenEventW` / `OpenSemaphoreW`, sync.exe and wait.exe checks); land it,
   then add `/bin/sync.exe`, `/bin/ntsync.exe`, `/bin/vm.exe`,
-  `/bin/proc.exe` and `/bin/reg.exe` to `guest_run.py`'s default list (they print tallies only
+  `/bin/proc.exe`, `/bin/reg.exe` and `/bin/npipe.exe` to `guest_run.py`'s
+  default list (they print tallies only
   from that commit on).
 - **Table sizes — DONE 2026-10-03**: `MAX_PROCESSES` 64 -> 256 (kernel
   stacks to match), Windows threads per process 64 -> 128, `MAX_HANDLES`
@@ -185,6 +186,10 @@ guard pages, Section objects / `MapViewOfFile`), then 16(k)-(s): keyed
 events and `NtWaitForAlertByThreadId`, completion ports, `NtCreateUserProcess`,
 tokens, the I/O manager, the in-kernel registry, ALPC, and the ntoskrnl/hal
 export surface precompiled drivers (win32k.sys first) import.
+- **Named pipes — DONE 2026-10-03** (16(q), `kernel/fs/npfs.c`, NT calls
+  `0x95`-`0x96`): byte-mode, blocking; kernel32's named-pipe API and
+  npipe.exe are in the Genesis-userland patch. Next for IPC: message mode,
+  overlapped I/O (with the I/O manager, 16(o)), then ALPC.
 - **statx, close_range, sysinfo, sendfile, copy_file_range, signalfd,
   pidfd — DONE 2026-10-03** (16(a)): and `newfstatat` now resolves its
   path (it described every name as a character device). systest 704.
@@ -292,8 +297,8 @@ shared by every reader, no `O_NONBLOCK` on device reads.
 
 ## Rules learned the hard way
 - **NT syscall numbers** live in `kernel/include/nt.h` (ntdll's copy is
-  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x94`.
-  `0x40`-`0x7F` is the display/input range; the next core call is `0x95`. Parallel work on the display/input
+  generated from it). In use: `0x01`-`0x3F` and `0x80`-`0x96`.
+  `0x40`-`0x7F` is the display/input range; the next core call is `0x97`. Parallel work on the display/input
   side (14(h)/(j)) was asked to start at `0x40` so the two never collide.
   (win32k's own NtUser/NtGdi calls are a separate table, from `0x1000`.)
 - **Never wait for time while holding the big kernel lock.** The PIT tick
@@ -352,6 +357,7 @@ or keeps text mode. Expected as of 2026-10-03 (phase 2's first changes, with the
 | `vm` (`vm.exe`) | 68 passed | |
 | `proc` (`proc.exe`) | 40 passed | |
 | `reg` (`reg.exe`) | 31 passed | |
+| `npipe` (`npipe.exe`) | 31 passed | |
 | `seh` (`seh.exe`) | 17 passed | 17 passed |
 | `fbtest` | 52 passed | 52 passed |
 | `bashtest` (`/bin/bash /usr/tests/bashtest.sh`) | 20 passed | 20 passed |

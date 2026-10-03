@@ -11,4 +11,9 @@ struct object;
  * Returns 0 with both ends stored, or a negative errno. */
 int socketpair_create(struct object **end0, struct object **end1);
 
+/* Bytes waiting to be read at this end (0 for anything that is not one). */
+unsigned int socketpair_available(const struct object *end);
+unsigned int socketpair_peek(const struct object *end, void *buf,
+                             unsigned int n);
+
 #endif
